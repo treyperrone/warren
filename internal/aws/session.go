@@ -2,6 +2,11 @@ package aws
 
 import "fmt"
 
+// Creds returns raw credential fields for direct SDK use.
+func (s *Session) Creds() (accessKey, secretKey, sessionToken, region string) {
+	return s.AccessKeyID, s.SecretAccessKey, s.SessionToken, s.Region
+}
+
 // Env returns the session as AWS environment variable strings for os/exec.
 func (s *Session) Env() []string {
 	return []string{

@@ -1,6 +1,7 @@
 package tunnel
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -10,6 +11,10 @@ import (
 	"sync"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/service/ssm"
 	"github.com/treyp/ssm-tool/internal/plugin"
 )
 
@@ -29,14 +34,23 @@ type Tunnel struct {
 	InstanceName string
 	LocalPort    int
 	AuthLabel    string
+	SSHUser      string
 	cmd          *exec.Cmd
 }
 
 func (t *Tunnel) Label() string {
-	if t.Kind == KindShell {
+	switch t.Kind {
+	case KindShell:
 		return fmt.Sprintf("[%-5s] %-30s %s", t.Kind, t.InstanceName, t.AuthLabel)
+	case KindSSH:
+		user := t.SSHUser
+		if user == "" {
+			user = "?"
+		}
+		return fmt.Sprintf("[%-5s] %-30s localhost:%-6d  ssh -p %d %s@localhost", t.Kind, t.InstanceName, t.LocalPort, t.LocalPort, user)
+	default:
+		return fmt.Sprintf("[%-5s] %-30s localhost:%-6d %s", t.Kind, t.InstanceName, t.LocalPort, t.AuthLabel)
 	}
-	return fmt.Sprintf("[%-5s] %-30s localhost:%-6d %s", t.Kind, t.InstanceName, t.LocalPort, t.AuthLabel)
 }
 
 func (t *Tunnel) Alive() bool {
@@ -75,6 +89,7 @@ type persistEntry struct {
 	InstanceName string `json:"instance_name"`
 	LocalPort    int    `json:"local_port"`
 	AuthLabel    string `json:"auth_label"`
+	SSHUser      string `json:"ssh_user,omitempty"`
 }
 
 func NewManager() *Manager {
@@ -105,6 +120,7 @@ func (m *Manager) load() {
 			InstanceName: e.InstanceName,
 			LocalPort:    e.LocalPort,
 			AuthLabel:    e.AuthLabel,
+			SSHUser:      e.SSHUser,
 		})
 	}
 }
@@ -120,6 +136,7 @@ func (m *Manager) save() {
 				InstanceName: t.InstanceName,
 				LocalPort:    t.LocalPort,
 				AuthLabel:    t.AuthLabel,
+				SSHUser:      t.SSHUser,
 			})
 		}
 	}
@@ -188,38 +205,117 @@ func WaitPort(port int, timeout time.Duration) error {
 	return fmt.Errorf("port %d never opened after %s", port, timeout)
 }
 
-// ssmRequest is the JSON payload the session-manager-plugin expects on stdin.
-type ssmRequest struct {
+// sessionCreds is the minimal interface we need from aws.Session.
+type sessionCreds interface {
+	Env() []string
+	Creds() (accessKey, secretKey, sessionToken, region string)
+}
+
+// pluginResponse is the JSON the session-manager-plugin expects as its first argument.
+type pluginResponse struct {
 	SessionID  string `json:"SessionId"`
 	TokenValue string `json:"TokenValue"`
 	StreamURL  string `json:"StreamUrl"`
 }
 
-// sessionEnv is the minimal interface we need from aws.Session.
-type sessionEnv interface {
-	Env() []string
+// startSSMSession calls the SSM StartSession API and returns the plugin response
+// JSON and the endpoint URL needed to invoke the plugin.
+func startSSMSession(ctx context.Context, instanceID, documentName string, params map[string][]string, sess sessionCreds) (string, string, error) {
+	ak, sk, st, region := sess.Creds()
+	cfg, err := config.LoadDefaultConfig(ctx,
+		config.WithRegion(region),
+		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(ak, sk, st)),
+	)
+	if err != nil {
+		return "", "", err
+	}
+	client := ssm.NewFromConfig(cfg)
+
+	input := &ssm.StartSessionInput{
+		Target: aws.String(instanceID),
+	}
+	if documentName != "" {
+		input.DocumentName = aws.String(documentName)
+	}
+	if len(params) > 0 {
+		input.Parameters = params
+	}
+
+	out, err := client.StartSession(ctx, input)
+	if err != nil {
+		return "", "", fmt.Errorf("StartSession: %w", err)
+	}
+
+	resp := pluginResponse{
+		SessionID:  aws.ToString(out.SessionId),
+		TokenValue: aws.ToString(out.TokenValue),
+		StreamURL:  aws.ToString(out.StreamUrl),
+	}
+	respJSON, err := json.Marshal(resp)
+	if err != nil {
+		return "", "", err
+	}
+
+	endpoint := fmt.Sprintf("https://ssm.%s.amazonaws.com", region)
+	return string(respJSON), endpoint, nil
 }
 
-// StartPortForward launches an SSM port-forwarding session via the embedded plugin.
-func StartPortForward(instanceID string, remotePort, localPort int, sess sessionEnv) (*Tunnel, error) {
+// ShellCmd calls SSM StartSession then returns an exec.Cmd ready to run the
+// plugin interactively. The caller should use tea.ExecProcess.
+func ShellCmd(ctx context.Context, instanceID string, sess sessionCreds) (*exec.Cmd, error) {
 	pluginBin, err := plugin.Path()
 	if err != nil {
 		return nil, fmt.Errorf("plugin: %w", err)
 	}
 
-	params := fmt.Sprintf(`{"portNumber":["%d"],"localPortNumber":["%d"]}`, remotePort, localPort)
+	respJSON, endpoint, err := startSSMSession(ctx, instanceID, "", nil, sess)
+	if err != nil {
+		return nil, err
+	}
 
-	// The plugin is invoked the same way the aws CLI invokes it:
-	// session-manager-plugin <response-json> <region> StartSession <profile> <request-json> <endpoint>
-	// We pass the SSM StartSession API call result as the response JSON.
-	// Since we're calling the API directly via SDK, we build the args the plugin expects.
+	_, _, _, region := sess.Creds()
 	cmd := exec.Command(pluginBin,
-		"", // response JSON — populated by caller via SDK (see StartPortForwardWithToken)
-		"us-east-1",
+		respJSON,
+		region,
 		"StartSession",
 		"",
-		fmt.Sprintf(`{"Target":"%s","DocumentName":"AWS-StartPortForwardingSession","Parameters":%s}`, instanceID, params),
-		"https://ssm.us-east-1.amazonaws.com",
+		fmt.Sprintf(`{"Target":"%s"}`, instanceID),
+		endpoint,
+	)
+	cmd.Env = append(os.Environ(), sess.Env()...)
+	return cmd, nil
+}
+
+// StartPortForward calls SSM StartSession then launches the plugin in the
+// background for port forwarding.
+func StartPortForward(ctx context.Context, instanceID string, remotePort, localPort int, sess sessionCreds) (*Tunnel, error) {
+	pluginBin, err := plugin.Path()
+	if err != nil {
+		return nil, fmt.Errorf("plugin: %w", err)
+	}
+
+	params := map[string][]string{
+		"portNumber":      {fmt.Sprintf("%d", remotePort)},
+		"localPortNumber": {fmt.Sprintf("%d", localPort)},
+	}
+	respJSON, endpoint, err := startSSMSession(ctx, instanceID, "AWS-StartPortForwardingSession", params, sess)
+	if err != nil {
+		return nil, err
+	}
+
+	_, _, _, region := sess.Creds()
+	reqJSON := fmt.Sprintf(
+		`{"Target":"%s","DocumentName":"AWS-StartPortForwardingSession","Parameters":{"portNumber":["%d"],"localPortNumber":["%d"]}}`,
+		instanceID, remotePort, localPort,
+	)
+
+	cmd := exec.Command(pluginBin,
+		respJSON,
+		region,
+		"StartSession",
+		"",
+		reqJSON,
+		endpoint,
 	)
 	cmd.Env = append(os.Environ(), sess.Env()...)
 	cmd.Stdout = nil
@@ -232,24 +328,4 @@ func StartPortForward(instanceID string, remotePort, localPort int, sess session
 		PID: cmd.Process.Pid,
 		cmd: cmd,
 	}, nil
-}
-
-// ShellCmd returns an exec.Cmd for an interactive SSM shell session.
-// The caller should use tea.ExecProcess to run it in the foreground.
-func ShellCmd(instanceID string, sess sessionEnv) (*exec.Cmd, error) {
-	pluginBin, err := plugin.Path()
-	if err != nil {
-		return nil, fmt.Errorf("plugin: %w", err)
-	}
-
-	cmd := exec.Command(pluginBin,
-		"",
-		"us-east-1",
-		"StartSession",
-		"",
-		fmt.Sprintf(`{"Target":"%s"}`, instanceID),
-		"https://ssm.us-east-1.amazonaws.com",
-	)
-	cmd.Env = append(os.Environ(), sess.Env()...)
-	return cmd, nil
 }

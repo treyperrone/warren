@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"runtime"
+	"strings"
 	"time"
 
 	"github.com/charmbracelet/bubbles/list"
@@ -105,6 +107,9 @@ type Model struct {
 	// tunnel manager
 	manager *tunnel.Manager
 
+	// last instance connected to (for banner)
+	lastInstance string
+
 	// list widget (reused across screens)
 	list list.Model
 }
@@ -121,6 +126,19 @@ func New(ctx context.Context) (*Model, error) {
 
 	delegate := list.NewDefaultDelegate()
 	delegate.ShowDescription = true
+	delegate.Styles.SelectedTitle = delegate.Styles.SelectedTitle.
+		Background(lipgloss.Color("63")).
+		Foreground(lipgloss.Color("230")).
+		Bold(true).
+		PaddingRight(100) // forces highlight to fill line width
+	delegate.Styles.SelectedDesc = delegate.Styles.SelectedDesc.
+		Background(lipgloss.Color("63")).
+		Foreground(lipgloss.Color("189")).
+		PaddingRight(100)
+	delegate.Styles.NormalTitle = delegate.Styles.NormalTitle.
+		Foreground(lipgloss.Color("252"))
+	delegate.Styles.NormalDesc = delegate.Styles.NormalDesc.
+		Foreground(lipgloss.Color("240"))
 	l := list.New(nil, delegate, 0, 0)
 	l.SetShowHelp(false)
 	l.SetShowStatusBar(false)
@@ -162,7 +180,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
-		m.list.SetSize(msg.Width, msg.Height-4)
+		m.list.SetSize(msg.Width, msg.Height-5) // -1 for banner, -4 for list chrome
 
 	case tea.KeyMsg:
 		if msg.String() == "ctrl+c" {
@@ -410,25 +428,122 @@ func (m *Model) selectConnType(val string) tea.Cmd {
 type msgShellDone struct{}
 
 func (m *Model) startShell() tea.Cmd {
+	m.lastInstance = m.selInstance.Name
 	return tea.ExecProcess(m.buildShellCmd(), func(err error) tea.Msg {
 		return msgShellDone{}
 	})
 }
 
 func (m *Model) buildShellCmd() *exec.Cmd {
-	cmd, err := tunnel.ShellCmd(m.selInstance.ID, m.awsSess)
+	cmd, err := tunnel.ShellCmd(m.ctx, m.selInstance.ID, m.awsSess)
 	if err != nil {
-		// fallback: will show error when exec'd
 		return exec.Command("echo", "plugin error: "+err.Error())
 	}
-	return cmd
+	return m.wrapWithHeader(cmd, m.selInstance.Name)
+}
+
+// wrapWithHeader tries to wrap cmd in a tmux session with a persistent purple
+// status bar. If tmux is not available it falls back to a plain header print.
+// On Windows it returns cmd unchanged.
+func (m *Model) wrapWithHeader(cmd *exec.Cmd, instanceName string) *exec.Cmd {
+	if runtime.GOOS == "windows" {
+		return cmd
+	}
+
+	authLabel := ""
+	if m.awsSess != nil {
+		authLabel = m.awsSess.Label
+	}
+
+	tmuxBin, err := exec.LookPath("tmux")
+	if err == nil {
+		return m.wrapWithTmux(tmuxBin, cmd, instanceName, authLabel)
+	}
+
+	// tmux not available — print a header line and accept it may scroll
+	const script = `
+printf '\033]0;ssm-tool · %s · %s\007' "$_SSM_INSTANCE" "$_SSM_AUTH"
+printf '\033[1;48;5;63;38;5;230m ▶ ssm-tool  \033[38;5;99m│  \033[38;5;189m%s  \033[38;5;99m│  \033[38;5;189m%s\033[0m\n' "$_SSM_AUTH" "$_SSM_INSTANCE"
+"$_SSM_BIN" "$@"
+`
+	args := append([]string{"/bin/sh", "-c", script, "ssm-tool"}, cmd.Args[1:]...)
+	wrapped := exec.Command(args[0], args[1:]...)
+	wrapped.Env = append(cmd.Env,
+		"_SSM_BIN="+cmd.Path,
+		"_SSM_AUTH="+authLabel,
+		"_SSM_INSTANCE="+instanceName,
+	)
+	return wrapped
+}
+
+// wrapWithTmux creates a named tmux session running cmd and attaches to it.
+// The tmux status bar shows the persistent purple banner, immune to remote
+// shell resets. The session is destroyed on detach/exit.
+func (m *Model) wrapWithTmux(tmuxBin string, cmd *exec.Cmd, instanceName, authLabel string) *exec.Cmd {
+	sessionName := fmt.Sprintf("ssm-%d", os.Getpid())
+
+	// Build the inner command string: set env vars then exec the plugin.
+	// We use env(1) to pass the plugin args cleanly without shell quoting issues.
+	innerEnv := ""
+	for _, e := range cmd.Env {
+		// only pass the SSM-specific vars we set; inherit the rest via tmux
+		if strings.HasPrefix(e, "AWS_") {
+			innerEnv += "export " + e + "; "
+		}
+	}
+	// Build plugin arg list safe for single-quoted shell embedding.
+	// The JSON blobs contain no single-quotes so this is safe.
+	quotedArgs := ""
+	for _, a := range cmd.Args {
+		quotedArgs += "'" + a + "' "
+	}
+	innerCmd := innerEnv + quotedArgs
+
+	statusText := fmt.Sprintf(" ▶ ssm-tool  │  %s  │  %s ", authLabel, instanceName)
+
+	// new-session runs the plugin, then destroy-session on exit so attach returns.
+	newSession := exec.Command(tmuxBin,
+		"new-session", "-d",
+		"-s", sessionName,
+		"-x", fmt.Sprintf("%d", m.width),
+		"-y", fmt.Sprintf("%d", m.height-1), // -1 for status bar
+		innerCmd,
+	)
+	newSession.Env = cmd.Env
+	if err := newSession.Run(); err != nil {
+		// fallback: just run cmd directly
+		return cmd
+	}
+
+	// Configure status bar: bottom, purple, fixed text.
+	for _, args := range [][]string{
+		{"set-option", "-t", sessionName, "status", "on"},
+		{"set-option", "-t", sessionName, "status-position", "bottom"},
+		{"set-option", "-t", sessionName, "status-style", "bg=colour63,fg=colour230,bold"},
+		{"set-option", "-t", sessionName, "status-left", statusText},
+		{"set-option", "-t", sessionName, "status-right", ""},
+		{"set-option", "-t", sessionName, "status-left-length", "200"},
+		// destroy session automatically when the plugin exits
+		{"set-option", "-t", sessionName, "remain-on-exit", "off"},
+	} {
+		_ = exec.Command(tmuxBin, args...).Run()
+	}
+
+	// attach-session is what tea.ExecProcess will run foreground.
+	attach := exec.Command(tmuxBin, "attach-session", "-t", sessionName)
+	attach.Env = os.Environ()
+	return attach
 }
 
 func (m *Model) startSSH(user string) tea.Cmd {
 	m.loading = true
+	m.lastInstance = m.selInstance.Name
 	port := tunnel.FreePort(2222)
+	instID := m.selInstance.ID
+	instName := m.selInstance.Name
+	authLabel := m.awsSess.Label
 	return func() tea.Msg {
-		t, err := tunnel.StartPortForward(m.selInstance.ID, 22, port, m.awsSess)
+		t, err := tunnel.StartPortForward(m.ctx, instID, 22, port, m.awsSess)
 		if err != nil {
 			return msgTunnelReady{err: err}
 		}
@@ -437,33 +552,36 @@ func (m *Model) startSSH(user string) tea.Cmd {
 			return msgTunnelReady{err: err}
 		}
 		t.Kind = tunnel.KindSSH
-		t.InstanceID = m.selInstance.ID
-		t.InstanceName = m.selInstance.Name
+		t.InstanceID = instID
+		t.InstanceName = instName
 		t.LocalPort = port
-		t.AuthLabel = m.awsSess.Label
-		fmt.Fprintf(os.Stderr, "\n[ssh] ready: ssh -o StrictHostKeyChecking=no -p %d %s@localhost\n", port, user)
+		t.AuthLabel = authLabel
+		t.SSHUser = user
 		return msgTunnelReady{t: t}
 	}
 }
 
 func (m *Model) startRDP() tea.Cmd {
 	m.loading = true
+	m.lastInstance = m.selInstance.Name
 	port := tunnel.FreePort(13389)
+	instID := m.selInstance.ID
+	instName := m.selInstance.Name
+	authLabel := m.awsSess.Label
 	return func() tea.Msg {
-		t, err := tunnel.StartPortForward(m.selInstance.ID, 3389, port, m.awsSess)
+		t, err := tunnel.StartPortForward(m.ctx, instID, 3389, port, m.awsSess)
 		if err != nil {
 			return msgTunnelReady{err: err}
 		}
-		// give the SSM session 3s to establish
 		if err := tunnel.WaitPort(port, 10*time.Second); err != nil {
 			t.Kill()
 			return msgTunnelReady{err: err}
 		}
 		t.Kind = tunnel.KindRDP
-		t.InstanceID = m.selInstance.ID
-		t.InstanceName = m.selInstance.Name
+		t.InstanceID = instID
+		t.InstanceName = instName
 		t.LocalPort = port
-		t.AuthLabel = m.awsSess.Label
+		t.AuthLabel = authLabel
 		return msgTunnelReady{t: t}
 	}
 }
@@ -655,18 +773,60 @@ func (m *Model) buildMainList() {
 	m.list.SetItems(items)
 }
 
+// ---- styles for banner -----------------------------------------------------
+
+var (
+	styleBanner     = lipgloss.NewStyle().Background(lipgloss.Color("63")).Foreground(lipgloss.Color("230")).Bold(true).PaddingLeft(1).PaddingRight(1)
+	styleBannerDim  = lipgloss.NewStyle().Background(lipgloss.Color("63")).Foreground(lipgloss.Color("189")).PaddingLeft(1).PaddingRight(1)
+	styleBannerSep  = lipgloss.NewStyle().Background(lipgloss.Color("63")).Foreground(lipgloss.Color("99")).PaddingLeft(1).PaddingRight(1)
+	styleBannerFill = lipgloss.NewStyle().Background(lipgloss.Color("63"))
+)
+
 // ---- view ------------------------------------------------------------------
 
 func (m *Model) View() string {
 	if m.loading {
-		return fmt.Sprintf("\n  %s loading...\n", m.spin.View())
+		return m.banner() + fmt.Sprintf("\n  %s loading...\n", m.spin.View())
 	}
 	if m.err != nil {
-		return fmt.Sprintf("\n  %s\n\n  %s\n",
+		return m.banner() + fmt.Sprintf("\n  %s\n\n  %s\n",
 			styleErr.Render("Error: "+m.err.Error()),
 			styleDim.Render("press any key to continue"),
 		)
 	}
-	header := styleTitle.Render("▶ ssm-tool") + "\n"
-	return header + m.list.View()
+	return m.banner() + m.list.View()
+}
+
+func (m *Model) banner() string {
+	title := styleBanner.Render("▶ ssm-tool")
+	sep := styleBannerSep.Render("│")
+
+	var parts []string
+	parts = append(parts, title)
+
+	if m.awsSess != nil && m.awsSess.Label != "" {
+		parts = append(parts, sep, styleBannerDim.Render(m.awsSess.Label))
+	}
+
+	if m.lastInstance != "" {
+		parts = append(parts, sep, styleBannerDim.Render("last: "+m.lastInstance))
+	}
+
+	active := len(m.manager.Active())
+	if active > 0 {
+		parts = append(parts, sep, styleBannerDim.Render(fmt.Sprintf("%d active", active)))
+	}
+
+	// join all parts and pad to full width
+	row := ""
+	for _, p := range parts {
+		row += p
+	}
+	// fill remaining width with banner background
+	visibleLen := lipgloss.Width(row)
+	if m.width > visibleLen {
+		row += styleBannerFill.Render(strings.Repeat(" ", m.width-visibleLen))
+	}
+
+	return row + "\n"
 }
