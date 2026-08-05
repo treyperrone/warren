@@ -15,7 +15,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/ssm"
-	"github.com/treyp/ssm-tool/internal/plugin"
+	"github.com/treyperrone/ssm-tool/internal/plugin"
 )
 
 type Kind string

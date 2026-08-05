@@ -14,8 +14,8 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
-	awsint "github.com/treyp/ssm-tool/internal/aws"
-	"github.com/treyp/ssm-tool/internal/tunnel"
+	awsint "github.com/treyperrone/ssm-tool/internal/aws"
+	"github.com/treyperrone/ssm-tool/internal/tunnel"
 )
 
 // ---- screens ---------------------------------------------------------------

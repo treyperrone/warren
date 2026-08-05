@@ -7,7 +7,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
-	"github.com/treyp/ssm-tool/internal/tui"
+	"github.com/treyperrone/ssm-tool/internal/tui"
 )
 
 func main() {
