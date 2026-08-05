@@ -33,6 +33,20 @@ type SSOSessionConfig struct {
 	Name     string
 	StartURL string
 	Region   string
+	// Scopes is sso_registration_scopes. Registering the OIDC client WITH scopes is
+	// what makes AWS issue a refresh token, so this is required for silent renewal —
+	// a scopeless registration only ever gets an access token.
+	Scopes []string
+}
+
+// defaultScopes is what the AWS CLI uses when sso_registration_scopes is absent.
+var defaultScopes = []string{"sso:account:access"}
+
+func (s SSOSessionConfig) scopes() []string {
+	if len(s.Scopes) == 0 {
+		return defaultScopes
+	}
+	return s.Scopes
 }
 
 // ProfileConfig is a named [profile] block.
@@ -66,10 +80,17 @@ func ParseConfig() ([]SSOSessionConfig, []ProfileConfig, error) {
 		switch {
 		case strings.HasPrefix(curHeader, "sso-session "):
 			name := strings.TrimPrefix(curHeader, "sso-session ")
+			var scopes []string
+			for _, s := range strings.Split(cur["sso_registration_scopes"], ",") {
+				if s = strings.TrimSpace(s); s != "" {
+					scopes = append(scopes, s)
+				}
+			}
 			sessions = append(sessions, SSOSessionConfig{
 				Name:     name,
 				StartURL: cur["sso_start_url"],
 				Region:   cur["sso_region"],
+				Scopes:   scopes,
 			})
 		case strings.HasPrefix(curHeader, "profile "):
 			name := strings.TrimPrefix(curHeader, "profile ")
@@ -96,41 +117,77 @@ func ParseConfig() ([]SSOSessionConfig, []ProfileConfig, error) {
 	return sessions, profiles, nil
 }
 
-// cachedToken reads the SSO token cache for the given start URL.
-func cachedToken(startURL string) (string, error) {
-	cacheDir := filepath.Join(os.Getenv("HOME"), ".aws", "sso", "cache")
-	entries, err := os.ReadDir(cacheDir)
+// tokenRecord mirrors the AWS CLI v2 SSO token cache schema field-for-field. Reading it
+// means `aws sso login` already satisfies us; writing the same shape keeps the refresh
+// material (client registration + refresh token) alongside the access token, which is the
+// whole reason silent renewal is possible.
+type tokenRecord struct {
+	StartURL              string `json:"startUrl"`
+	Region                string `json:"region,omitempty"`
+	AccessToken           string `json:"accessToken"`
+	ExpiresAt             string `json:"expiresAt"`
+	RefreshToken          string `json:"refreshToken,omitempty"`
+	ClientID              string `json:"clientId,omitempty"`
+	ClientSecret          string `json:"clientSecret,omitempty"`
+	RegistrationExpiresAt string `json:"registrationExpiresAt,omitempty"`
+}
+
+// expirySkew treats a token as dead slightly early, so we never hand out a token that
+// expires mid-request.
+const expirySkew = 60 * time.Second
+
+func ssoCacheDir() string {
+	return filepath.Join(os.Getenv("HOME"), ".aws", "sso", "cache")
+}
+
+// live reports whether an RFC3339 timestamp is still in the future. An unparseable or
+// absent timestamp counts as dead: we would rather re-auth than use a token we can't date.
+func live(ts string) bool {
+	t, err := time.Parse(time.RFC3339, ts)
 	if err != nil {
-		return "", nil
+		return false
 	}
+	return time.Now().Add(expirySkew).Before(t)
+}
+
+// canRefresh reports whether a record carries everything CreateToken needs for the
+// refresh_token grant. The client registration expires independently of the token, and a
+// refresh against a dead registration just fails.
+func (r *tokenRecord) canRefresh() bool {
+	return r != nil && r.RefreshToken != "" && r.ClientID != "" && r.ClientSecret != "" &&
+		live(r.RegistrationExpiresAt)
+}
+
+// cachedRecord returns the best cached record for a start URL: a live access token if one
+// exists, otherwise a refreshable record. Unlike a plain expiry filter, an expired record
+// is still worth returning — its refresh token is what saves us a browser round trip.
+func cachedRecord(startURL string) *tokenRecord {
+	entries, err := os.ReadDir(ssoCacheDir())
+	if err != nil {
+		return nil
+	}
+	var refreshable *tokenRecord
 	for _, e := range entries {
 		if !strings.HasSuffix(e.Name(), ".json") {
 			continue
 		}
-		data, err := os.ReadFile(filepath.Join(cacheDir, e.Name()))
+		data, err := os.ReadFile(filepath.Join(ssoCacheDir(), e.Name()))
 		if err != nil {
 			continue
 		}
-		var obj struct {
-			StartURL    string `json:"startUrl"`
-			AccessToken string `json:"accessToken"`
-			ExpiresAt   string `json:"expiresAt"`
-		}
-		if json.Unmarshal(data, &obj) != nil {
+		var rec tokenRecord
+		if json.Unmarshal(data, &rec) != nil || rec.StartURL != startURL {
 			continue
 		}
-		if obj.StartURL != startURL || obj.AccessToken == "" {
-			continue
+		if rec.AccessToken != "" && live(rec.ExpiresAt) {
+			return &rec // best case, stop looking
 		}
-		// check expiry
-		if t, err := time.Parse(time.RFC3339, obj.ExpiresAt); err == nil {
-			if time.Now().After(t) {
-				continue
-			}
+		if refreshable == nil && rec.canRefresh() {
+			r := rec
+			refreshable = &r
 		}
-		return obj.AccessToken, nil
 	}
-	return "", nil
+	return refreshable
 }
 
 // Login performs the SSO device-auth flow and returns a live access token.
@@ -141,10 +198,25 @@ func Login(ctx context.Context, sess SSOSessionConfig) (string, error) {
 	}
 	oidc := ssooidc.NewFromConfig(cfg)
 
+	// Scopes are load-bearing: AWS only returns a refresh token from CreateToken if the
+	// client was registered with them. Without this the tool re-runs the browser flow on
+	// every expiry, which is what it used to do.
+	//
+	// Scopeless registration is the fallback, not the goal. If an Identity Center instance
+	// rejects the scoped registration, losing silent renewal beats being unable to log in
+	// at all — so warn and retry bare rather than failing outright.
 	reg, err := oidc.RegisterClient(ctx, &ssooidc.RegisterClientInput{
 		ClientName: aws.String("ssm-tool"),
 		ClientType: aws.String("public"),
+		Scopes:     sess.scopes(),
 	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[sso] scoped registration failed (%v); retrying without scopes — sessions will not auto-renew\n", err)
+		reg, err = oidc.RegisterClient(ctx, &ssooidc.RegisterClientInput{
+			ClientName: aws.String("ssm-tool"),
+			ClientType: aws.String("public"),
+		})
+	}
 	if err != nil {
 		return "", fmt.Errorf("register client: %w", err)
 	}
@@ -186,26 +258,71 @@ func Login(ctx context.Context, sess SSOSessionConfig) (string, error) {
 			}
 			return "", fmt.Errorf("create token: %w", err)
 		}
-		// write to cache
-		writeTokenCache(sess.StartURL, aws.ToString(tok.AccessToken), int(tok.ExpiresIn))
+		// Persist the refresh material, not just the access token — that is what lets the
+		// next run renew silently instead of reopening the browser.
+		writeRecord(&tokenRecord{
+			StartURL:              sess.StartURL,
+			Region:                sess.Region,
+			AccessToken:           aws.ToString(tok.AccessToken),
+			ExpiresAt:             expiryStamp(int(tok.ExpiresIn)),
+			RefreshToken:          aws.ToString(tok.RefreshToken),
+			ClientID:              aws.ToString(reg.ClientId),
+			ClientSecret:          aws.ToString(reg.ClientSecret),
+			RegistrationExpiresAt: time.Unix(reg.ClientSecretExpiresAt, 0).UTC().Format(time.RFC3339),
+		})
 		return aws.ToString(tok.AccessToken), nil
 	}
 	return "", fmt.Errorf("login timed out")
 }
 
-func writeTokenCache(startURL, token string, expiresIn int) {
-	cacheDir := filepath.Join(os.Getenv("HOME"), ".aws", "sso", "cache")
-	_ = os.MkdirAll(cacheDir, 0700)
-	exp := time.Now().Add(time.Duration(expiresIn) * time.Second).UTC().Format(time.RFC3339)
-	obj := map[string]string{
-		"startUrl":    startURL,
-		"accessToken": token,
-		"expiresAt":   exp,
+func expiryStamp(expiresIn int) string {
+	return time.Now().Add(time.Duration(expiresIn) * time.Second).UTC().Format(time.RFC3339)
+}
+
+// refresh exchanges a refresh token for a new access token — no browser, no user action.
+func refresh(ctx context.Context, sess SSOSessionConfig, rec *tokenRecord) (string, error) {
+	cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(sess.Region))
+	if err != nil {
+		return "", err
 	}
-	data, _ := json.Marshal(obj)
-	// use a hash of the start URL as filename, matching AWS CLI convention
-	name := fmt.Sprintf("ssm-tool-%x.json", hashString(startURL))
-	_ = os.WriteFile(filepath.Join(cacheDir, name), data, 0600)
+	out, err := ssooidc.NewFromConfig(cfg).CreateToken(ctx, &ssooidc.CreateTokenInput{
+		ClientId:     aws.String(rec.ClientID),
+		ClientSecret: aws.String(rec.ClientSecret),
+		GrantType:    aws.String("refresh_token"),
+		RefreshToken: aws.String(rec.RefreshToken),
+	})
+	if err != nil {
+		return "", fmt.Errorf("refresh token: %w", err)
+	}
+
+	next := *rec
+	next.AccessToken = aws.ToString(out.AccessToken)
+	next.ExpiresAt = expiryStamp(int(out.ExpiresIn))
+	// AWS may rotate the refresh token; if it doesn't, the old one stays valid.
+	if rt := aws.ToString(out.RefreshToken); rt != "" {
+		next.RefreshToken = rt
+	}
+	writeRecord(&next)
+	return next.AccessToken, nil
+}
+
+// writeRecord stores a token record under our own filename.
+//
+// We deliberately never overwrite a cache file the AWS CLI wrote. The CLI derives its
+// filename itself and owns that file's full schema; clobbering it risks dropping a field we
+// don't model. The cost is that after we refresh a CLI-issued token, the CLI's copy still
+// holds the pre-rotation refresh token — if AWS rotated it, the CLI falls back to a normal
+// `aws sso login`. Losing a silent renewal on the CLI side beats corrupting its cache.
+func writeRecord(rec *tokenRecord) {
+	dir := ssoCacheDir()
+	_ = os.MkdirAll(dir, 0700)
+	data, err := json.Marshal(rec)
+	if err != nil {
+		return
+	}
+	// hash of the start URL as filename, mirroring the AWS CLI convention
+	name := fmt.Sprintf("ssm-tool-%x.json", hashString(rec.StartURL))
+	_ = os.WriteFile(filepath.Join(dir, name), data, 0600)
 }
 
 func hashString(s string) uint32 {
@@ -217,25 +334,45 @@ func hashString(s string) uint32 {
 	return h
 }
 
-// LiveToken returns a cached token if valid, otherwise runs the login flow.
+// LiveToken returns a usable access token, escalating only as far as it must:
+//
+//  1. a cached token that is unexpired AND still accepted by the SSO API
+//  2. a silent refresh_token exchange — no browser
+//  3. the full device-auth login
+//
+// Step 1 revalidates rather than trusting the clock alone: a token can be revoked
+// server-side (logout elsewhere, session policy change) while its expiry still looks fine.
 func LiveToken(ctx context.Context, sess SSOSessionConfig) (string, error) {
-	token, err := cachedToken(sess.StartURL)
-	if err != nil {
-		return "", err
-	}
-	if token != "" {
-		// quick validation
-		cfg, _ := config.LoadDefaultConfig(ctx, config.WithRegion(sess.Region))
-		client := sso.NewFromConfig(cfg)
-		_, err := client.ListAccounts(ctx, &sso.ListAccountsInput{
-			AccessToken: aws.String(token),
-			MaxResults:  aws.Int32(1),
-		})
-		if err == nil {
-			return token, nil
+	rec := cachedRecord(sess.StartURL)
+
+	if rec != nil && rec.AccessToken != "" && live(rec.ExpiresAt) {
+		if err := validate(ctx, sess, rec.AccessToken); err == nil {
+			return rec.AccessToken, nil
 		}
 	}
+
+	if rec.canRefresh() {
+		if token, err := refresh(ctx, sess, rec); err == nil {
+			return token, nil
+		}
+		// Refresh failed — revoked, rotated out from under us, or registration dead.
+		// Nothing to salvage; fall through to a full login.
+	}
+
 	return Login(ctx, sess)
+}
+
+// validate makes the cheapest authenticated call available to prove a token still works.
+func validate(ctx context.Context, sess SSOSessionConfig, token string) error {
+	cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(sess.Region))
+	if err != nil {
+		return err
+	}
+	_, err = sso.NewFromConfig(cfg).ListAccounts(ctx, &sso.ListAccountsInput{
+		AccessToken: aws.String(token),
+		MaxResults:  aws.Int32(1),
+	})
+	return err
 }
 
 // ListAccounts returns all SSO accounts for the given token.
