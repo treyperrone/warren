@@ -1,0 +1,68 @@
+name: release
+
+# Pushing a v* tag publishes the release. Nothing to run by hand.
+#
+# History: v0.1.1 and v0.1.2 had to be built and uploaded manually, because cross-compiling
+# five ~20 MB archives (the embedded session-manager-plugin is most of that weight) takes
+# longer than a local run tends to survive. GitHub's runners have no such limit.
+on:
+  push:
+    tags: ["v*"]
+  # Lets you rehearse the whole build on a branch without tagging. Skips publishing.
+  workflow_dispatch:
+
+permissions:
+  contents: write # required to create the release and upload assets
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # goreleaser derives the version and changelog from git history; a shallow clone
+          # makes it guess wrong or fail.
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          # Read the version from go.mod rather than pinning it here, so the toolchain can
+          # never drift below the `go` directive.
+          go-version-file: go.mod
+          cache: true
+
+      # Don't publish a tag that doesn't build or pass its tests. The e2e test skips itself
+      # without SSM_TOOL_E2E, so this stays offline.
+      - name: Test
+        run: go test ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      # Runs through the action so it uses the same pinned goreleaser as the release step.
+      # `release` only warns about deprecated config; `check` fails on it, which is what
+      # keeps the config from rotting until a goreleaser major removes something.
+      - uses: goreleaser/goreleaser-action@v6
+        with:
+          version: "~> v2"
+          args: check
+
+      - uses: goreleaser/goreleaser-action@v6
+        with:
+          version: "~> v2"
+          # On a tag: build and publish. On manual dispatch: build only, so a dry run
+          # never creates a release.
+          args: ${{ startsWith(github.ref, 'refs/tags/') && 'release --clean' || 'release --clean --snapshot' }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # Keeps the artifacts reachable for dispatch runs, which publish nothing.
+      - uses: actions/upload-artifact@v4
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        with:
+          name: snapshot-archives
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/checksums.txt
+          retention-days: 7

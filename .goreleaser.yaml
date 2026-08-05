@@ -23,10 +23,14 @@ builds:
       - -s -w
 
 archives:
-  - format: tar.gz
+  # `formats` (plural), not the deprecated `format` — `goreleaser check` fails on the old
+  # spelling and a future major removes it outright.
+  - formats: [tar.gz]
     format_overrides:
       - goos: windows
-        format: zip
+        formats: [zip]
+    # Keep this template stable: these names are what the v0.1.0/v0.1.2 assets already use,
+    # so install instructions and checksums stay valid across releases.
     name_template: "{{ .ProjectName }}_{{ .Os }}_{{ .Arch }}"
 
 checksum:
