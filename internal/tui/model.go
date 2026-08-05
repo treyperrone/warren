@@ -42,7 +42,16 @@ type item struct {
 
 func (i item) Title() string       { return i.title }
 func (i item) Description() string { return i.desc }
-func (i item) FilterValue() string { return i.title }
+
+// FilterValue is what "/" searches. It spans the description as well as the title so
+// every field on screen is searchable: an account by name *or* ID, an instance by name,
+// instance ID, private IP, or type. Matching only the title — which is all the account
+// name, or all the instance name — meant the IDs you can plainly see were unsearchable.
+//
+// Match highlighting still only paints the title (bubbles maps the match indices onto it),
+// so a description-only hit filters correctly but highlights nothing. Out-of-range indices
+// are ignored rather than fatal, so this is cosmetic.
+func (i item) FilterValue() string { return i.title + " " + i.desc }
 
 // ---- messages --------------------------------------------------------------
 
@@ -141,7 +150,10 @@ func New(ctx context.Context) (*Model, error) {
 		Foreground(lipgloss.Color("240"))
 	l := list.New(nil, delegate, 0, 0)
 	l.SetShowHelp(false)
-	l.SetShowStatusBar(false)
+	// The status bar carries the "x/y items" count and the active filter term. With 50
+	// accounts, knowing a search narrowed to 3 is the difference between trusting the
+	// list and re-reading it.
+	l.SetShowStatusBar(true)
 
 	m := &Model{
 		ctx:         ctx,
@@ -186,12 +198,30 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.String() == "ctrl+c" {
 			return m, tea.Quit
 		}
+		// The error view promises "press any key"; make that true. Only esc and enter
+		// cleared it before, so every other key looked like a hang.
+		if m.err != nil {
+			m.err = nil
+			return m, nil
+		}
+		// While the search input has focus, every keystroke belongs to it. Without this
+		// guard the shortcuts below eat them: "esc" navigates back instead of cancelling
+		// the search, "enter" selects whatever is highlighted mid-typing rather than
+		// applying the filter, and on the main screen "n"/"p"/"q" fire their commands
+		// instead of appearing in the box.
+		if m.list.SettingFilter() {
+			var cmd tea.Cmd
+			m.list, cmd = m.list.Update(msg)
+			return m, cmd
+		}
 		// screen-specific key handling
 		switch m.screen {
 		case screenMain:
 			return m.updateMain(msg)
 		default:
-			if msg.String() == "esc" {
+			// With a search applied, esc clears it (the list's own binding) before it
+			// means "go back a screen".
+			if msg.String() == "esc" && !m.list.IsFiltered() {
 				return m, m.goBack()
 			}
 		}
@@ -589,6 +619,13 @@ func (m *Model) startRDP() tea.Cmd {
 // ---- main screen -----------------------------------------------------------
 
 func (m *Model) updateMain(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	// With a search applied, esc clears it rather than quitting the tool — losing your
+	// active tunnels to a stray keystroke meant for the search box would be rude.
+	if m.list.IsFiltered() && msg.String() == "esc" {
+		var cmd tea.Cmd
+		m.list, cmd = m.list.Update(msg)
+		return m, cmd
+	}
 	switch msg.String() {
 	case "n":
 		// new connection — go to instance picker
@@ -691,6 +728,7 @@ func (m *Model) buildMethodList() {
 		})
 	}
 	m.list.Title = "Select authentication method"
+	m.list.SetStatusBarItemName("method", "methods")
 	m.list.SetItems(items)
 }
 
@@ -703,7 +741,8 @@ func (m *Model) buildAccountList() {
 			value: a.ID,
 		})
 	}
-	m.list.Title = "Select AWS account  •  Esc=back"
+	m.list.Title = "Select AWS account  •  /=search name or ID  •  Esc=back"
+	m.list.SetStatusBarItemName("account", "accounts")
 	m.list.SetItems(items)
 }
 
@@ -713,6 +752,7 @@ func (m *Model) buildRoleList() {
 		items = append(items, item{title: r, value: r})
 	}
 	m.list.Title = fmt.Sprintf("Select role for %s  •  Esc=back", m.selAccount.Name)
+	m.list.SetStatusBarItemName("role", "roles")
 	m.list.SetItems(items)
 }
 
@@ -725,7 +765,8 @@ func (m *Model) buildInstanceList() {
 			value: i.ID,
 		})
 	}
-	m.list.Title = "Select instance  •  Esc=back"
+	m.list.Title = "Select instance  •  /=search name, ID, or IP  •  Esc=back"
+	m.list.SetStatusBarItemName("instance", "instances")
 	m.list.SetItems(items)
 }
 
@@ -789,10 +830,18 @@ func (m *Model) View() string {
 		return m.banner() + fmt.Sprintf("\n  %s loading...\n", m.spin.View())
 	}
 	if m.err != nil {
-		return m.banner() + fmt.Sprintf("\n  %s\n\n  %s\n",
-			styleErr.Render("Error: "+m.err.Error()),
-			styleDim.Render("press any key to continue"),
-		)
+		// AWS SDK errors are long single-line strings. Unwrapped, the terminal hard-truncates
+		// them at the right edge, so the useful half is never seen — and bubbletea, which
+		// counts logical lines rather than rendered rows, then leaves stale rows on screen
+		// (the duplicated "press any key"). Giving the style an explicit Width makes lipgloss
+		// word-wrap, which fixes both.
+		width := m.width - 4
+		if width < 20 {
+			width = 76 // no WindowSizeMsg yet
+		}
+		return m.banner() + "\n" +
+			styleErr.Width(width).MarginLeft(2).Render("Error: "+m.err.Error()) + "\n\n" +
+			styleDim.MarginLeft(2).Render("press any key to continue") + "\n"
 	}
 	return m.banner() + m.list.View()
 }
