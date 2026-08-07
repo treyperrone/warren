@@ -21,13 +21,24 @@ Download a prebuilt binary from the [Releases](https://github.com/treyperrone/ss
 go install github.com/treyperrone/ssm-tool@latest
 ```
 
+`go install` drops the binary in `$(go env GOPATH)/bin` (usually `~/go/bin`), which is not on `PATH` by default — so `ssm-tool` right after installing gives `command not found`. Run it once as `~/go/bin/ssm-tool` and it prints the exact line to add for your shell, then stops mentioning it once the directory is on `PATH`.
+
 ## Usage
 
 ```sh
-ssm-tool
+ssm-tool            # launch the interactive picker
+ssm-tool setup      # add an [sso-session] block to ~/.aws/config
+ssm-tool version    # print the version
+ssm-tool help       # print usage
 ```
 
-Requires an `sso-session` block configured in `~/.aws/config` (standard AWS SSO setup). The TUI walks you through picking an SSO session, account, role, target instance, and connection type.
+Authentication comes from an `sso-session` block or a named profile in `~/.aws/config` (standard AWS SSO setup). The TUI walks you through picking an SSO session, account, role, target instance, and connection type.
+
+If no SSO session or profile is configured, ssm-tool offers to create one on startup. To add another later — a prod range alongside a lab one — either run `ssm-tool setup`, or pick **+ Add SSO session** on the authentication screen (press `esc` from the account list to get there).
+
+`~/.aws/config` is only ever appended to, never rewritten: it is shared with the `aws` CLI, Terraform, and every SDK on the machine. A `config.ssm-tool.bak` copy is taken before each append.
+
+The running version is also shown in the TUI's header bar, next to the name.
 
 ### Keys
 
