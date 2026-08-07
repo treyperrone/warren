@@ -15,6 +15,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	awsint "github.com/treyperrone/ssm-tool/internal/aws"
+	"github.com/treyperrone/ssm-tool/internal/buildinfo"
 	"github.com/treyperrone/ssm-tool/internal/tunnel"
 )
 
@@ -30,6 +31,10 @@ const (
 	screenConnType               // pick connection type
 	screenSSHUser                // pick SSH username
 	screenMain                   // main tunnel manager
+	// screenSetup is last so that screenMethod stays the zero value: a Model that somehow
+	// reaches Update without New() should fall into the normal picker, not the config writer.
+	screenSetup  // first run — no sso-session and no profile in ~/.aws/config
+	screenRegion // region picker, opened from the setup form
 )
 
 // ---- list item -------------------------------------------------------------
@@ -121,6 +126,9 @@ type Model struct {
 
 	// list widget (reused across screens)
 	list list.Model
+
+	// first-run SSO config form
+	setup setupForm
 }
 
 func New(ctx context.Context) (*Model, error) {
@@ -164,14 +172,21 @@ func New(ctx context.Context) (*Model, error) {
 		list:        l,
 	}
 
-	// if only one SSO session and no profiles, skip method screen
-	if len(ssoSessions) == 1 && len(profiles) == 0 {
-		m.selSession = &ssoSessions[0]
-		m.screen = screenAccount
-	} else {
-		m.screen = screenMethod
-		m.buildMethodList()
+	// Nothing configured at all. Previously this was a dead end — a missing ~/.aws/config
+	// aborted before the TUI started, and a config with no sso-session or profile left an
+	// empty picker with nothing to select. Offer to write the block instead.
+	if len(ssoSessions) == 0 && len(profiles) == 0 {
+		m.screen = screenSetup
+		m.setup = newSetupForm()
+		return m, nil
 	}
+
+	// The method screen always comes first, including for a single SSO session. Skipping it
+	// saved one keystroke and cost the user any view of which identity they were about to
+	// use, and hid "+ Add SSO session" from exactly the person with one session who wants a
+	// second.
+	m.screen = screenMethod
+	m.buildMethodList()
 
 	return m, nil
 }
@@ -179,8 +194,12 @@ func New(ctx context.Context) (*Model, error) {
 func (m *Model) Init() tea.Cmd {
 	cmds := []tea.Cmd{m.spin.Tick}
 	switch m.screen {
+	// Startup no longer opens on the account list — the method screen always comes first —
+	// but goBack and StartSetup can still land here, so the fetch stays wired up.
 	case screenAccount:
 		cmds = append(cmds, m.fetchToken())
+	case screenSetup:
+		cmds = append(cmds, m.setup.init())
 	}
 	return tea.Batch(cmds...)
 }
@@ -197,6 +216,11 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyMsg:
 		if msg.String() == "ctrl+c" {
 			return m, tea.Quit
+		}
+		// The setup form owns the keyboard outright: every keystroke is text entry, and
+		// the list shortcuts below (including "/" and "q") would eat characters.
+		if m.screen == screenSetup {
+			return m.updateSetup(msg)
 		}
 		// The error view promises "press any key"; make that true. Only esc and enter
 		// cleared it before, so every other key looked like a hang.
@@ -299,6 +323,14 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.err = msg.err
 	}
 
+	// Non-key messages on the setup screen — cursor blink, in particular — belong to the
+	// focused input, not the list. Keys already returned above.
+	if m.screen == screenSetup {
+		var cmd tea.Cmd
+		m.setup.inputs[m.setup.focus], cmd = m.setup.inputs[m.setup.focus].Update(msg)
+		return m, cmd
+	}
+
 	// delegate to list widget
 	if !m.loading {
 		if km, ok := msg.(tea.KeyMsg); ok && km.String() == "enter" {
@@ -316,10 +348,11 @@ func (m *Model) goBack() tea.Cmd {
 	m.err = nil
 	switch m.screen {
 	case screenAccount:
-		if len(m.ssoSessions) > 1 || len(m.profiles) > 0 {
-			m.screen = screenMethod
-			m.buildMethodList()
-		}
+		// Always go back, even with a single session and no profiles. This used to be a
+		// one-way door in that case: the method list is where "+ Add SSO session" lives,
+		// so it was unreachable for precisely the single-session user wanting a second.
+		m.screen = screenMethod
+		m.buildMethodList()
 	case screenRole:
 		m.buildAccountList()
 		m.screen = screenAccount
@@ -332,6 +365,11 @@ func (m *Model) goBack() tea.Cmd {
 	case screenConnType:
 		m.buildInstanceList()
 		m.screen = screenInstance
+	case screenRegion:
+		// Backing out of the picker leaves the region field as it was. Restart the blink:
+		// the form's cursor is still focused, but nothing is driving it after the detour.
+		m.screen = screenSetup
+		return m.setup.init()
 	}
 	return nil
 }
@@ -358,6 +396,8 @@ func (m *Model) handleSelect() tea.Cmd {
 		return m.startSSH(selected.value)
 	case screenMain:
 		return m.handleMainSelect(selected.value)
+	case screenRegion:
+		return m.selectRegion(selected.value)
 	}
 	return nil
 }
@@ -367,6 +407,9 @@ func (m *Model) handleSelect() tea.Cmd {
 func (m *Model) selectMethod(val string) tea.Cmd {
 	if val == "" {
 		return tea.Quit
+	}
+	if val == methodAddSession {
+		return m.StartSetup()
 	}
 	// profile
 	for _, p := range m.profiles {
@@ -727,6 +770,16 @@ func (m *Model) buildMethodList() {
 			value: "profile:" + p.Name,
 		})
 	}
+	// Adding a second SSO session — a prod range alongside the lab one — has to be
+	// reachable without hand-editing ~/.aws/config, so the form lives here as well as on
+	// first run. See goBack: this screen is always reachable from the account list, or
+	// this entry would be invisible to exactly the person most likely to need it.
+	items = append(items, item{
+		title: "+ Add SSO session",
+		desc:  "append a new [sso-session] block to ~/.aws/config",
+		value: methodAddSession,
+	})
+
 	m.list.Title = "Select authentication method"
 	m.list.SetStatusBarItemName("method", "methods")
 	m.list.SetItems(items)
@@ -821,11 +874,15 @@ var (
 	styleBannerDim  = lipgloss.NewStyle().Background(lipgloss.Color("63")).Foreground(lipgloss.Color("189")).PaddingLeft(1).PaddingRight(1)
 	styleBannerSep  = lipgloss.NewStyle().Background(lipgloss.Color("63")).Foreground(lipgloss.Color("99")).PaddingLeft(1).PaddingRight(1)
 	styleBannerFill = lipgloss.NewStyle().Background(lipgloss.Color("63"))
+	styleBannerVer  = lipgloss.NewStyle().Background(lipgloss.Color("63")).Foreground(lipgloss.Color("104")).PaddingRight(1)
 )
 
 // ---- view ------------------------------------------------------------------
 
 func (m *Model) View() string {
+	if m.screen == screenSetup {
+		return m.banner() + m.setup.view(m.width)
+	}
 	if m.loading {
 		return m.banner() + fmt.Sprintf("\n  %s loading...\n", m.spin.View())
 	}
@@ -846,12 +903,36 @@ func (m *Model) View() string {
 	return m.banner() + m.list.View()
 }
 
+// banner renders the purple header row. withVersion is false only on the retry when the
+// terminal is too narrow to hold everything — see the caller.
 func (m *Model) banner() string {
+	row := m.bannerRow(true)
+	// Too narrow for the version: drop it rather than let the row overflow into a second
+	// line. A half-printed version number is worse than none.
+	if lipgloss.Width(row) > m.width {
+		row = m.bannerRow(false)
+	}
+
+	// fill remaining width with banner background
+	if visibleLen := lipgloss.Width(row); m.width > visibleLen {
+		row += styleBannerFill.Render(strings.Repeat(" ", m.width-visibleLen))
+	}
+
+	return row + "\n"
+}
+
+func (m *Model) bannerRow(withVersion bool) string {
 	title := styleBanner.Render("▶ ssm-tool")
 	sep := styleBannerSep.Render("│")
 
 	var parts []string
 	parts = append(parts, title)
+
+	// The version belongs next to the name it qualifies — that is where anyone looks for
+	// it, and at the right edge it read as decoration.
+	if withVersion {
+		parts = append(parts, styleBannerVer.Render(buildinfo.Version()))
+	}
 
 	if m.awsSess != nil && m.awsSess.Label != "" {
 		parts = append(parts, sep, styleBannerDim.Render(m.awsSess.Label))
@@ -866,16 +947,9 @@ func (m *Model) banner() string {
 		parts = append(parts, sep, styleBannerDim.Render(fmt.Sprintf("%d active", active)))
 	}
 
-	// join all parts and pad to full width
 	row := ""
 	for _, p := range parts {
 		row += p
 	}
-	// fill remaining width with banner background
-	visibleLen := lipgloss.Width(row)
-	if m.width > visibleLen {
-		row += styleBannerFill.Render(strings.Repeat(" ", m.width-visibleLen))
-	}
-
-	return row + "\n"
+	return row
 }
