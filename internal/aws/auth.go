@@ -3,7 +3,10 @@ package aws
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -60,11 +63,23 @@ type Account struct {
 	Name string
 }
 
+// ConfigPath is the shared AWS config file. It belongs to the `aws` CLI, Terraform, and
+// every SDK on the machine — this package reads it freely but only ever appends to it.
+func ConfigPath() string {
+	return filepath.Join(os.Getenv("HOME"), ".aws", "config")
+}
+
 // ParseConfig reads ~/.aws/config and returns all sso-session blocks and named profiles.
+//
+// A missing file is not an error: it is the ordinary state of a machine that has never run
+// `aws configure`, and the caller offers to create one. An unreadable file still is — that
+// means a permissions or I/O problem the user needs told about, not an empty config.
 func ParseConfig() ([]SSOSessionConfig, []ProfileConfig, error) {
-	path := filepath.Join(os.Getenv("HOME"), ".aws", "config")
-	data, err := os.ReadFile(path)
+	data, err := os.ReadFile(ConfigPath())
 	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil, nil, nil
+		}
 		return nil, nil, fmt.Errorf("reading ~/.aws/config: %w", err)
 	}
 
@@ -115,6 +130,84 @@ func ParseConfig() ([]SSOSessionConfig, []ProfileConfig, error) {
 	}
 	flush()
 	return sessions, profiles, nil
+}
+
+// ValidateSSOSession checks a proposed sso-session block before it is written. The cost of
+// a typo here is a confusing OIDC failure several screens later, so it is worth catching
+// the obvious cases at the point of entry.
+func ValidateSSOSession(s SSOSessionConfig) error {
+	switch {
+	case s.Name == "":
+		return errors.New("name is required")
+	// The name becomes the text inside [sso-session <name>], so anything that would break
+	// the header — whitespace or a bracket — has to be rejected rather than escaped.
+	case strings.ContainsAny(s.Name, " \t[]"):
+		return errors.New("name cannot contain spaces or brackets")
+	case s.StartURL == "":
+		return errors.New("start URL is required")
+	case s.Region == "":
+		return errors.New("region is required")
+	}
+
+	u, err := url.Parse(s.StartURL)
+	if err != nil {
+		return fmt.Errorf("start URL is not a URL: %w", err)
+	}
+	if u.Scheme != "https" || u.Host == "" {
+		return errors.New("start URL must be a full https:// URL, e.g. https://my-org.awsapps.com/start")
+	}
+	return nil
+}
+
+// AddSSOSession appends an [sso-session] block to ~/.aws/config.
+//
+// It appends rather than rewriting, deliberately. ParseConfig is lossy — it discards
+// comments, ordering, and every key it does not model — so serialising its output back to
+// disk would silently destroy config belonging to the AWS CLI, Terraform, and every SDK
+// that shares this file. Appending touches nothing that is already there, and a backup is
+// taken first so even a botched append is recoverable.
+func AddSSOSession(s SSOSessionConfig) error {
+	if err := ValidateSSOSession(s); err != nil {
+		return err
+	}
+
+	existing, _, err := ParseConfig()
+	if err != nil {
+		return err
+	}
+	for _, e := range existing {
+		if e.Name == s.Name {
+			return fmt.Errorf("an sso-session named %q already exists in ~/.aws/config", s.Name)
+		}
+	}
+
+	path := ConfigPath()
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return fmt.Errorf("creating ~/.aws: %w", err)
+	}
+
+	// Back up whatever is already there before touching it. A missing file needs no backup.
+	if prev, err := os.ReadFile(path); err == nil {
+		if err := os.WriteFile(path+".ssm-tool.bak", prev, 0o600); err != nil {
+			return fmt.Errorf("backing up ~/.aws/config: %w", err)
+		}
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("reading ~/.aws/config: %w", err)
+	}
+
+	scopes := strings.Join(s.scopes(), ",")
+	block := fmt.Sprintf("\n# added by ssm-tool\n[sso-session %s]\nsso_start_url = %s\nsso_region = %s\nsso_registration_scopes = %s\n",
+		s.Name, s.StartURL, s.Region, scopes)
+
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		return fmt.Errorf("opening ~/.aws/config: %w", err)
+	}
+	defer f.Close()
+	if _, err := f.WriteString(block); err != nil {
+		return fmt.Errorf("writing ~/.aws/config: %w", err)
+	}
+	return nil
 }
 
 // tokenRecord mirrors the AWS CLI v2 SSO token cache schema field-for-field. Reading it
