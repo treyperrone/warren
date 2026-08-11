@@ -18,6 +18,22 @@ type Instance struct {
 	Name      string
 	PrivateIP string
 	Type      string
+	// Tags is every tag on the instance, not just Name. DescribeInstances already returns
+	// them all, so keeping them costs no extra call and no extra permission — and which tag
+	// is the useful one to search varies by account (client, env, owner, scenario), so
+	// picking a subset here would be guessing on the user's behalf.
+	Tags map[string]string
+}
+
+// TagPairs returns the tags as "key=value" strings, sorted so the result is stable enough
+// to test and to render. Used to fold tags into the picker's search text.
+func (i Instance) TagPairs() []string {
+	pairs := make([]string, 0, len(i.Tags))
+	for k, v := range i.Tags {
+		pairs = append(pairs, k+"="+v)
+	}
+	sort.Strings(pairs)
+	return pairs
 }
 
 // ListInstances returns all running EC2 instances using the given session creds.
@@ -57,11 +73,18 @@ func ListInstances(ctx context.Context, sess *Session) ([]Instance, error) {
 					PrivateIP: aws.ToString(i.PrivateIpAddress),
 					Type:      string(i.InstanceType),
 					Name:      "(no name)",
+					Tags:      make(map[string]string, len(i.Tags)),
 				}
 				for _, tag := range i.Tags {
-					if aws.ToString(tag.Key) == "Name" {
-						inst.Name = aws.ToString(tag.Value)
-						break
+					k, v := aws.ToString(tag.Key), aws.ToString(tag.Value)
+					if k == "" {
+						continue
+					}
+					inst.Tags[k] = v
+					// An empty Name tag is no better than no Name tag; keep the placeholder
+					// so the row does not render as a blank title.
+					if k == "Name" && v != "" {
+						inst.Name = v
 					}
 				}
 				instances = append(instances, inst)

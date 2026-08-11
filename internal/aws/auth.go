@@ -29,6 +29,12 @@ type Session struct {
 	AccountName     string
 	RoleName        string
 	Label           string // display label for TUI
+	// ProfileName is set only for sessions resolved from a named [profile] block, so a
+	// consumer can name the profile instead of passing keys. Empty for SSO sessions.
+	ProfileName string
+	// Expires is when the credentials stop working, zero if not known — a profile backed by
+	// long-lived IAM keys has no expiry to report.
+	Expires time.Time
 }
 
 // SSOSessionConfig is a parsed [sso-session] block from ~/.aws/config.
@@ -188,7 +194,7 @@ func AddSSOSession(s SSOSessionConfig) error {
 
 	// Back up whatever is already there before touching it. A missing file needs no backup.
 	if prev, err := os.ReadFile(path); err == nil {
-		if err := os.WriteFile(path+".ssm-tool.bak", prev, 0o600); err != nil {
+		if err := os.WriteFile(path+".postern.bak", prev, 0o600); err != nil {
 			return fmt.Errorf("backing up ~/.aws/config: %w", err)
 		}
 	} else if !errors.Is(err, fs.ErrNotExist) {
@@ -196,7 +202,7 @@ func AddSSOSession(s SSOSessionConfig) error {
 	}
 
 	scopes := strings.Join(s.scopes(), ",")
-	block := fmt.Sprintf("\n# added by ssm-tool\n[sso-session %s]\nsso_start_url = %s\nsso_region = %s\nsso_registration_scopes = %s\n",
+	block := fmt.Sprintf("\n# added by postern\n[sso-session %s]\nsso_start_url = %s\nsso_region = %s\nsso_registration_scopes = %s\n",
 		s.Name, s.StartURL, s.Region, scopes)
 
 	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
@@ -299,14 +305,14 @@ func Login(ctx context.Context, sess SSOSessionConfig) (string, error) {
 	// rejects the scoped registration, losing silent renewal beats being unable to log in
 	// at all — so warn and retry bare rather than failing outright.
 	reg, err := oidc.RegisterClient(ctx, &ssooidc.RegisterClientInput{
-		ClientName: aws.String("ssm-tool"),
+		ClientName: aws.String("postern"),
 		ClientType: aws.String("public"),
 		Scopes:     sess.scopes(),
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[sso] scoped registration failed (%v); retrying without scopes — sessions will not auto-renew\n", err)
 		reg, err = oidc.RegisterClient(ctx, &ssooidc.RegisterClientInput{
-			ClientName: aws.String("ssm-tool"),
+			ClientName: aws.String("postern"),
 			ClientType: aws.String("public"),
 		})
 	}
@@ -414,7 +420,7 @@ func writeRecord(rec *tokenRecord) {
 		return
 	}
 	// hash of the start URL as filename, mirroring the AWS CLI convention
-	name := fmt.Sprintf("ssm-tool-%x.json", hashString(rec.StartURL))
+	name := fmt.Sprintf("postern-%x.json", hashString(rec.StartURL))
 	_ = os.WriteFile(filepath.Join(dir, name), data, 0600)
 }
 
@@ -427,15 +433,20 @@ func hashString(s string) uint32 {
 	return h
 }
 
-// LiveToken returns a usable access token, escalating only as far as it must:
+// ErrLoginRequired means the session cannot be renewed without the user completing the
+// device-auth flow. It exists so a caller that must not block — anything running in the
+// background — can tell "needs a browser" apart from a real failure and say so instead.
+var ErrLoginRequired = errors.New("SSO login required")
+
+// SilentToken returns a usable access token without ever starting the device-auth flow,
+// returning ErrLoginRequired when that is the only remaining option.
 //
 //  1. a cached token that is unexpired AND still accepted by the SSO API
 //  2. a silent refresh_token exchange — no browser
-//  3. the full device-auth login
 //
 // Step 1 revalidates rather than trusting the clock alone: a token can be revoked
 // server-side (logout elsewhere, session policy change) while its expiry still looks fine.
-func LiveToken(ctx context.Context, sess SSOSessionConfig) (string, error) {
+func SilentToken(ctx context.Context, sess SSOSessionConfig) (string, error) {
 	rec := cachedRecord(sess.StartURL)
 
 	if rec != nil && rec.AccessToken != "" && live(rec.ExpiresAt) {
@@ -449,9 +460,23 @@ func LiveToken(ctx context.Context, sess SSOSessionConfig) (string, error) {
 			return token, nil
 		}
 		// Refresh failed — revoked, rotated out from under us, or registration dead.
-		// Nothing to salvage; fall through to a full login.
+		// Nothing left to salvage silently.
 	}
 
+	return "", ErrLoginRequired
+}
+
+// LiveToken returns a usable access token, escalating as far as it must — including the full
+// device-auth login, which prints a user code and opens a browser.
+//
+// Only call this where blocking on the user is acceptable. A background refresh must use
+// SilentToken: device auth polls for as long as the code is valid, and from a background task
+// inside the TUI that means the prompt is painted behind the alt screen while the tool appears
+// to hang.
+func LiveToken(ctx context.Context, sess SSOSessionConfig) (string, error) {
+	if token, err := SilentToken(ctx, sess); err == nil {
+		return token, nil
+	}
 	return Login(ctx, sess)
 }
 
@@ -550,10 +575,60 @@ func GetRoleCredentials(ctx context.Context, sess SSOSessionConfig, token, accou
 	if err != nil {
 		return nil, fmt.Errorf("get role credentials: %w", err)
 	}
-	return &Session{
+	s := &Session{
 		AccessKeyID:     aws.ToString(out.RoleCredentials.AccessKeyId),
 		SecretAccessKey: aws.ToString(out.RoleCredentials.SecretAccessKey),
 		SessionToken:    aws.ToString(out.RoleCredentials.SessionToken),
 		Region:          sess.Region,
-	}, nil
+	}
+	// Expiration is epoch milliseconds, and 0 means the API did not say. Left zero in that
+	// case rather than becoming 1970, which would render as "expired".
+	if out.RoleCredentials.Expiration != 0 {
+		s.Expires = time.UnixMilli(out.RoleCredentials.Expiration)
+	}
+	return s, nil
+}
+
+// defaultProfileRegion is used when a named profile sets no region of its own. It matches
+// what the picker assumed before profiles resolved their own region.
+const defaultProfileRegion = "us-east-1"
+
+// ProfileSession resolves credentials for a named [profile] block by running the SDK's own
+// chain for that profile, so static keys, SSO-backed, and assume-role profiles all work.
+//
+// The profile path used to fabricate a Session with empty credential fields and rely on
+// setting AWS_PROFILE in this process. That could not work: every consumer feeds those
+// fields to credentials.NewStaticCredentialsProvider, which rejects empty values outright
+// ("static credentials are empty"), so listing instances or opening a session under a named
+// profile failed at the first API call. Resolving real credentials here fixes every caller
+// at once and keeps profiles and SSO sessions interchangeable from that point on.
+func ProfileSession(ctx context.Context, name string) (*Session, error) {
+	cfg, err := config.LoadDefaultConfig(ctx, config.WithSharedConfigProfile(name))
+	if err != nil {
+		return nil, fmt.Errorf("loading profile %s: %w", name, err)
+	}
+
+	creds, err := cfg.Credentials.Retrieve(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("resolving credentials for profile %s: %w", name, err)
+	}
+
+	region := cfg.Region
+	if region == "" {
+		region = defaultProfileRegion
+	}
+
+	s := &Session{
+		AccessKeyID:     creds.AccessKeyID,
+		SecretAccessKey: creds.SecretAccessKey,
+		SessionToken:    creds.SessionToken,
+		Region:          region,
+		ProfileName:     name,
+		Label:           "profile:" + name,
+	}
+	// Long-lived IAM keys never expire; only report a deadline the provider actually set.
+	if creds.CanExpire {
+		s.Expires = creds.Expires
+	}
+	return s, nil
 }

@@ -107,7 +107,7 @@ func TestAddSSOSessionBacksUpExistingConfig(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	backup, err := os.ReadFile(path + ".ssm-tool.bak")
+	backup, err := os.ReadFile(path + ".postern.bak")
 	if err != nil {
 		t.Fatalf("no backup written: %v", err)
 	}
@@ -134,7 +134,7 @@ func TestAddSSOSessionCreatesConfigWhenMissing(t *testing.T) {
 		t.Errorf("got %+v, want one session in us-west-2", sessions)
 	}
 	// No prior file means nothing to back up.
-	if _, err := os.Stat(filepath.Join(home, ".aws", "config.ssm-tool.bak")); err == nil {
+	if _, err := os.Stat(filepath.Join(home, ".aws", "config.postern.bak")); err == nil {
 		t.Error("wrote a backup for a config that did not exist")
 	}
 }

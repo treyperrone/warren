@@ -5,7 +5,7 @@ import "runtime/debug"
 
 // version is stamped at release time by goreleaser via -ldflags -X. It is
 // deliberately empty by default rather than something like "dev": the common
-// install path is `go install github.com/treyperrone/ssm-tool@v0.1.3`, which
+// install path is `go install github.com/treyperrone/postern@v0.1.3`, which
 // applies no ldflags at all, and a non-empty default would shadow the real
 // module version that the Go toolchain embeds for exactly that case.
 var version string

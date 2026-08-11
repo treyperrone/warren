@@ -11,12 +11,13 @@ import (
 
 	"github.com/charmbracelet/bubbles/list"
 	"github.com/charmbracelet/bubbles/spinner"
+	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
-	awsint "github.com/treyperrone/ssm-tool/internal/aws"
-	"github.com/treyperrone/ssm-tool/internal/buildinfo"
-	"github.com/treyperrone/ssm-tool/internal/tunnel"
+	awsint "github.com/treyperrone/postern/internal/aws"
+	"github.com/treyperrone/postern/internal/buildinfo"
+	"github.com/treyperrone/postern/internal/tunnel"
 )
 
 // ---- screens ---------------------------------------------------------------
@@ -33,9 +34,34 @@ const (
 	screenMain                   // main tunnel manager
 	// screenSetup is last so that screenMethod stays the zero value: a Model that somehow
 	// reaches Update without New() should fall into the normal picker, not the config writer.
-	screenSetup  // first run — no sso-session and no profile in ~/.aws/config
-	screenRegion // region picker, opened from the setup form
+	screenSetup        // first run — no sso-session and no profile in ~/.aws/config
+	screenRegion       // region picker, opened from the setup form
+	screenAction       // what to do with the credentials just resolved
+	screenBuildService // command builder: pick a service
+	screenBuildTask    // command builder: pick a task within that service
+	screenBuildParams  // command builder: fill in parameters and run
 )
+
+// ---- list plumbing ---------------------------------------------------------
+
+// setListItems installs a screen's rows, clearing any search left over from the previous one.
+//
+// One list widget is shared by every screen, and its filter was shared too: SetItems re-applies
+// the existing term to whatever it is handed (see bubbles/list.SetItems). So searching "globo"
+// to find an account left that term filtering the *next* screen, which hid every row and read
+// as a broken menu rather than as a search still being active. Resetting first leaves SetItems
+// nothing to re-apply.
+//
+// The cursor is only moved when a search was actually active, because resetting the filter
+// renumbers the rows and a cursor from the filtered view would land on an unrelated entry.
+// With no filter it is left alone, so backing out to a screen keeps your place in it.
+func (m *Model) setListItems(items []list.Item) {
+	if m.list.FilterState() != list.Unfiltered {
+		m.list.ResetFilter()
+		m.list.Select(0)
+	}
+	m.list.SetItems(items)
+}
 
 // ---- list item -------------------------------------------------------------
 
@@ -43,6 +69,10 @@ type item struct {
 	title string
 	desc  string
 	value string
+	// search is extra text "/" matches but the row does not display. Instance tags go here:
+	// an instance can easily carry a dozen CloudFormation-managed tags, which would bury the
+	// ID and IP if rendered, but are exactly what you want to search by.
+	search string
 }
 
 func (i item) Title() string       { return i.title }
@@ -52,11 +82,20 @@ func (i item) Description() string { return i.desc }
 // every field on screen is searchable: an account by name *or* ID, an instance by name,
 // instance ID, private IP, or type. Matching only the title — which is all the account
 // name, or all the instance name — meant the IDs you can plainly see were unsearchable.
+// It also spans the hidden search text, so instances match on any tag.
 //
 // Match highlighting still only paints the title (bubbles maps the match indices onto it),
 // so a description-only hit filters correctly but highlights nothing. Out-of-range indices
 // are ignored rather than fatal, so this is cosmetic.
-func (i item) FilterValue() string { return i.title + " " + i.desc }
+func (i item) FilterValue() string {
+	// Appended only when present, so rows without hidden text are byte-for-byte what they
+	// were before search text existed — a trailing space would be harmless to the fuzzy
+	// matcher but makes the value awkward to assert on.
+	if i.search == "" {
+		return i.title + " " + i.desc
+	}
+	return i.title + " " + i.desc + " " + i.search
+}
 
 // ---- messages --------------------------------------------------------------
 
@@ -95,13 +134,13 @@ var (
 // ---- model -----------------------------------------------------------------
 
 type Model struct {
-	ctx      context.Context
-	width    int
-	height   int
-	screen   screen
-	err      error
-	loading  bool
-	spin     spinner.Model
+	ctx     context.Context
+	width   int
+	height  int
+	screen  screen
+	err     error
+	loading bool
+	spin    spinner.Model
 
 	// auth state
 	ssoSessions []awsint.SSOSessionConfig
@@ -129,6 +168,22 @@ type Model struct {
 
 	// first-run SSO config form
 	setup setupForm
+
+	// AWS CLI command builder
+	builder builder
+
+	// credsOnly stops the flow once credentials are resolved, instead of going on to list
+	// instances. `postern exec` and `postern shell` want an account and a role and nothing
+	// after that — API access has no instance to pick.
+	credsOnly bool
+
+	// background credential renewal
+	refreshingCreds bool
+	credRefreshErr  error
+
+	// splashDone is one-way: the wordmark is a greeting, so once dismissed it stays dismissed
+	// even if you navigate back to the opening screen.
+	splashDone bool
 }
 
 func New(ctx context.Context) (*Model, error) {
@@ -192,7 +247,9 @@ func New(ctx context.Context) (*Model, error) {
 }
 
 func (m *Model) Init() tea.Cmd {
-	cmds := []tea.Cmd{m.spin.Tick}
+	// credTick re-arms itself for the life of the program, which is what keeps credentials
+	// fresh for as long as the TUI is open. It no-ops until there are credentials to renew.
+	cmds := []tea.Cmd{m.spin.Tick, credTick()}
 	switch m.screen {
 	// Startup no longer opens on the account list — the method screen always comes first —
 	// but goBack and StartSetup can still land here, so the fetch stays wired up.
@@ -211,7 +268,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
-		m.list.SetSize(msg.Width, msg.Height-5) // -1 for banner, -4 for list chrome
+		m.resizeList()
 
 	case tea.KeyMsg:
 		if msg.String() == "ctrl+c" {
@@ -221,6 +278,11 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// the list shortcuts below (including "/" and "q") would eat characters.
 		if m.screen == screenSetup {
 			return m.updateSetup(msg)
+		}
+		// Same for the builder's parameter screen: it is text entry, and the list shortcuts
+		// below would eat the characters.
+		if m.screen == screenBuildParams {
+			return m.updateBuildParams(msg)
 		}
 		// The error view promises "press any key"; make that true. Only esc and enter
 		// cleared it before, so every other key looked like a hang.
@@ -254,6 +316,18 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		var cmd tea.Cmd
 		m.spin, cmd = m.spin.Update(msg)
 		return m, cmd
+
+	case msgCredTick:
+		// Always re-arm, whether or not a renewal is due, or the clock stops after the first
+		// check and nothing renews for the rest of the session.
+		if m.needsCredRefresh(time.Time(msg)) {
+			return m, tea.Batch(m.refreshCreds(), credTick())
+		}
+		return m, credTick()
+
+	case msgCredsRefreshed:
+		m.applyCredRefresh(msg)
+		return m, nil
 
 	case msgToken:
 		m.loading = false
@@ -290,8 +364,35 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.screen = screenRole
 
 	case msgCredsReady:
-		m.loading = true
-		return m, m.fetchInstances()
+		// Credentials are the whole point in creds-only mode; quitting here hands control
+		// back to main, which runs the command with them.
+		if m.credsOnly {
+			return m, tea.Quit
+		}
+		m.loading = false
+		m.buildActionList()
+		m.screen = screenAction
+
+	case msgProfileReady:
+		m.awsSess = msg.sess
+		if m.credsOnly {
+			return m, tea.Quit
+		}
+		m.loading = false
+		m.buildActionList()
+		m.screen = screenAction
+
+	case msgCredsShellDone:
+		// Back to the action list, not the tunnel manager: you were doing API work, and the
+		// likely next step is another command, not a connection.
+		m.buildActionList()
+		m.screen = screenAction
+		return m, nil
+
+	case msgBuildDone:
+		// Stay on the parameter screen: the usual next step is the same query with a
+		// different value, or the same command with an edit.
+		return m, textinput.Blink
 
 	case msgInstances:
 		m.loading = false
@@ -304,8 +405,18 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.screen = screenInstance
 
 	case msgShellDone:
-		m.buildMainList()
-		m.screen = screenMain
+		// Back to the instance list rather than the tunnel manager. A foreground shell
+		// registers no tunnel, so the manager has nothing new to show, and the likely next
+		// step is another host. It is also the safer landing: unlike the manager, no single
+		// keystroke there ends the program, which matters when a terminal handed back from a
+		// raw-mode child can emit escape sequences that read as keypresses.
+		if len(m.instances) > 0 {
+			m.buildInstanceList()
+			m.screen = screenInstance
+		} else {
+			m.buildMainList()
+			m.screen = screenMain
+		}
 		return m, nil
 
 	case msgTunnelReady:
@@ -328,6 +439,15 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	if m.screen == screenSetup {
 		var cmd tea.Cmd
 		m.setup.inputs[m.setup.focus], cmd = m.setup.inputs[m.setup.focus].Update(msg)
+		return m, cmd
+	}
+	if m.screen == screenBuildParams {
+		var cmd tea.Cmd
+		if m.builder.editing {
+			m.builder.edit, cmd = m.builder.edit.Update(msg)
+		} else if len(m.builder.inputs) > 0 {
+			m.builder.inputs[m.builder.focus], cmd = m.builder.inputs[m.builder.focus].Update(msg)
+		}
 		return m, cmd
 	}
 
@@ -356,9 +476,26 @@ func (m *Model) goBack() tea.Cmd {
 	case screenRole:
 		m.buildAccountList()
 		m.screen = screenAccount
+	case screenAction:
+		// Back to wherever the credentials came from. A profile is picked on the method
+		// screen and has no account or role step, and a single-role account skips the role
+		// screen (see msgRoles), so neither is a safe unconditional target.
+		switch {
+		case m.selSession == nil:
+			m.screen = screenMethod
+			m.buildMethodList()
+		case len(m.roles) > 1:
+			m.buildRoleList()
+			m.screen = screenRole
+		default:
+			m.buildAccountList()
+			m.screen = screenAccount
+		}
 	case screenInstance:
-		m.screen = screenMain
-		m.buildMainList()
+		// The action list, not the tunnel manager — that is the screen this one was reached
+		// from, and it is where "Run AWS CLI commands" lives.
+		m.buildActionList()
+		m.screen = screenAction
 	case screenSSHUser:
 		m.buildInstanceList()
 		m.screen = screenInstance
@@ -370,6 +507,19 @@ func (m *Model) goBack() tea.Cmd {
 		// the form's cursor is still focused, but nothing is driving it after the detour.
 		m.screen = screenSetup
 		return m.setup.init()
+	case screenBuildService:
+		m.buildActionList()
+		m.screen = screenAction
+	case screenBuildTask:
+		m.buildServiceList()
+		m.screen = screenBuildService
+	case screenMain:
+		// The tunnel manager is reached by connecting, so "back" is the hub it was reached
+		// from. With no credentials there is nowhere to go, and staying put beats quitting.
+		if m.awsSess != nil {
+			m.buildActionList()
+			m.screen = screenAction
+		}
 	}
 	return nil
 }
@@ -388,6 +538,12 @@ func (m *Model) handleSelect() tea.Cmd {
 		return m.selectAccount(selected.value)
 	case screenRole:
 		return m.selectRole(selected.value)
+	case screenAction:
+		return m.selectAction(selected.value)
+	case screenBuildService:
+		return m.selectBuildService(selected.value)
+	case screenBuildTask:
+		return m.selectBuildTask(selected.value)
 	case screenInstance:
 		return m.selectInstance(selected.value)
 	case screenConnType:
@@ -414,16 +570,20 @@ func (m *Model) selectMethod(val string) tea.Cmd {
 	// profile
 	for _, p := range m.profiles {
 		if "profile:"+p.Name == val {
-			_ = os.Setenv("AWS_PROFILE", p.Name)
-			_ = os.Unsetenv("AWS_ACCESS_KEY_ID")
-			_ = os.Unsetenv("AWS_SECRET_ACCESS_KEY")
-			_ = os.Unsetenv("AWS_SESSION_TOKEN")
-			m.awsSess = &awsint.Session{
-				Region: "us-east-1",
-				Label:  "profile:" + p.Name,
-			}
+			// Resolve real credentials rather than setting AWS_PROFILE in this process and
+			// carrying an empty Session. Every consumer passes the Session's fields to a
+			// static credentials provider, which rejects empty values, so the old shape
+			// failed at the first API call. Async because an SSO-backed or assume-role
+			// profile can reach the network here.
+			name := p.Name
 			m.loading = true
-			return m.fetchInstances()
+			return func() tea.Msg {
+				sess, err := awsint.ProfileSession(m.ctx, name)
+				if err != nil {
+					return msgError{err}
+				}
+				return msgProfileReady{sess: sess}
+			}
 		}
 	}
 	// SSO session
@@ -449,6 +609,19 @@ func (m *Model) selectAccount(val string) tea.Cmd {
 }
 
 type msgCredsReady struct{}
+
+type msgProfileReady struct{ sess *awsint.Session }
+
+// StartCredsMode stops the flow at the point credentials exist, for `exec` and `shell`.
+func (m *Model) StartCredsMode() {
+	m.credsOnly = true
+}
+
+// Session returns the resolved credentials, or nil if the user quit before choosing. A nil
+// return is an ordinary cancellation, not a failure.
+func (m *Model) Session() *awsint.Session {
+	return m.awsSess
+}
 
 func (m *Model) selectRole(role string) tea.Cmd {
 	m.loading = true
@@ -535,16 +708,16 @@ func (m *Model) wrapWithHeader(cmd *exec.Cmd, instanceName string) *exec.Cmd {
 
 	// tmux not available — print a header line and accept it may scroll
 	const script = `
-printf '\033]0;ssm-tool · %s · %s\007' "$_SSM_INSTANCE" "$_SSM_AUTH"
-printf '\033[1;48;5;63;38;5;230m ▶ ssm-tool  \033[38;5;99m│  \033[38;5;189m%s  \033[38;5;99m│  \033[38;5;189m%s\033[0m\n' "$_SSM_AUTH" "$_SSM_INSTANCE"
-"$_SSM_BIN" "$@"
+printf '\033]0;postern · %s · %s\007' "$_POSTERN_INSTANCE" "$_POSTERN_AUTH"
+printf '\033[1;48;5;63;38;5;230m ▶ postern  \033[38;5;99m│  \033[38;5;189m%s  \033[38;5;99m│  \033[38;5;189m%s\033[0m\n' "$_POSTERN_AUTH" "$_POSTERN_INSTANCE"
+"$_POSTERN_BIN" "$@"
 `
-	args := append([]string{"/bin/sh", "-c", script, "ssm-tool"}, cmd.Args[1:]...)
+	args := append([]string{"/bin/sh", "-c", script, "postern"}, cmd.Args[1:]...)
 	wrapped := exec.Command(args[0], args[1:]...)
 	wrapped.Env = append(cmd.Env,
-		"_SSM_BIN="+cmd.Path,
-		"_SSM_AUTH="+authLabel,
-		"_SSM_INSTANCE="+instanceName,
+		"_POSTERN_BIN="+cmd.Path,
+		"_POSTERN_AUTH="+authLabel,
+		"_POSTERN_INSTANCE="+instanceName,
 	)
 	return wrapped
 }
@@ -553,14 +726,17 @@ printf '\033[1;48;5;63;38;5;230m ▶ ssm-tool  \033[38;5;99m│  \033[38;5;189m%
 // The tmux status bar shows the persistent purple banner, immune to remote
 // shell resets. The session is destroyed on detach/exit.
 func (m *Model) wrapWithTmux(tmuxBin string, cmd *exec.Cmd, instanceName, authLabel string) *exec.Cmd {
-	sessionName := fmt.Sprintf("ssm-%d", os.Getpid())
+	sessionName := fmt.Sprintf("postern-%d", os.Getpid())
 
 	// Build the inner command string: set env vars then exec the plugin.
 	// We use env(1) to pass the plugin args cleanly without shell quoting issues.
 	innerEnv := ""
 	for _, e := range cmd.Env {
-		// only pass the SSM-specific vars we set; inherit the rest via tmux
-		if strings.HasPrefix(e, "AWS_") {
+		// only pass the SSM-specific vars we set; inherit the rest via tmux.
+		// POSTERN_ is included so a credentialed shell can still name its own session in a
+		// prompt — the attach command below replaces the environment wholesale, so anything
+		// not exported here is lost.
+		if strings.HasPrefix(e, "AWS_") || strings.HasPrefix(e, "POSTERN_") {
 			innerEnv += "export " + e + "; "
 		}
 	}
@@ -572,7 +748,7 @@ func (m *Model) wrapWithTmux(tmuxBin string, cmd *exec.Cmd, instanceName, authLa
 	}
 	innerCmd := innerEnv + quotedArgs
 
-	statusText := fmt.Sprintf(" ▶ ssm-tool  │  %s  │  %s ", authLabel, instanceName)
+	statusText := fmt.Sprintf(" ▶ postern  │  %s  │  %s ", authLabel, instanceName)
 
 	// new-session runs the plugin, then destroy-session on exit so attach returns.
 	newSession := exec.Command(tmuxBin,
@@ -679,8 +855,17 @@ func (m *Model) updateMain(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.screen = screenMethod
 		m.buildMethodList()
 		return m, nil
-	case "q", "esc":
+	case "q":
 		return m, tea.Quit
+	case "esc":
+		// esc goes back, as it does on every other screen — it must not quit.
+		//
+		// This screen is where an interactive session returns to, and a terminal being handed
+		// back from a raw-mode child emits escape sequences as it is restored. Read as a
+		// keypress, a single one of those used to end the program, which looks exactly like
+		// "exiting the remote shell killed the tool". q and ctrl+c still quit, and the README
+		// always described esc as going back.
+		return m, m.goBack()
 	}
 	var cmd tea.Cmd
 	m.list, cmd = m.list.Update(msg)
@@ -782,7 +967,7 @@ func (m *Model) buildMethodList() {
 
 	m.list.Title = "Select authentication method"
 	m.list.SetStatusBarItemName("method", "methods")
-	m.list.SetItems(items)
+	m.setListItems(items)
 }
 
 func (m *Model) buildAccountList() {
@@ -796,7 +981,7 @@ func (m *Model) buildAccountList() {
 	}
 	m.list.Title = "Select AWS account  •  /=search name or ID  •  Esc=back"
 	m.list.SetStatusBarItemName("account", "accounts")
-	m.list.SetItems(items)
+	m.setListItems(items)
 }
 
 func (m *Model) buildRoleList() {
@@ -806,7 +991,7 @@ func (m *Model) buildRoleList() {
 	}
 	m.list.Title = fmt.Sprintf("Select role for %s  •  Esc=back", m.selAccount.Name)
 	m.list.SetStatusBarItemName("role", "roles")
-	m.list.SetItems(items)
+	m.setListItems(items)
 }
 
 func (m *Model) buildInstanceList() {
@@ -816,11 +1001,15 @@ func (m *Model) buildInstanceList() {
 			title: i.Name,
 			desc:  fmt.Sprintf("%s  %s  %s", i.ID, i.PrivateIP, i.Type),
 			value: i.ID,
+			// Tags are searchable but not shown — see item.search. "key=value" means a search
+			// for "prod" hits any tag whose value contains it, and "env=prod" narrows to the
+			// one tag, without needing a query syntax of our own.
+			search: strings.Join(i.TagPairs(), " "),
 		})
 	}
-	m.list.Title = "Select instance  •  /=search name, ID, or IP  •  Esc=back"
+	m.list.Title = "Select instance  •  /=search name, ID, IP, or any tag  •  Esc=back"
 	m.list.SetStatusBarItemName("instance", "instances")
-	m.list.SetItems(items)
+	m.setListItems(items)
 }
 
 func (m *Model) buildConnTypeList() {
@@ -831,7 +1020,7 @@ func (m *Model) buildConnTypeList() {
 		item{title: "Quit", desc: "", value: "quit"},
 	}
 	m.list.Title = fmt.Sprintf("Connect to %s  •  Esc=back", m.selInstance.Name)
-	m.list.SetItems(items)
+	m.setListItems(items)
 }
 
 func (m *Model) buildSSHUserList() {
@@ -843,7 +1032,7 @@ func (m *Model) buildSSHUserList() {
 		item{title: "root", desc: "root access", value: "root"},
 	}
 	m.list.Title = "Select SSH username  •  Esc=back"
-	m.list.SetItems(items)
+	m.setListItems(items)
 }
 
 func (m *Model) buildMainList() {
@@ -864,7 +1053,7 @@ func (m *Model) buildMainList() {
 		auth = m.awsSess.Label
 	}
 	m.list.Title = fmt.Sprintf("SSM  •  %s  •  n=new  p=switch auth  q=quit", auth)
-	m.list.SetItems(items)
+	m.setListItems(items)
 }
 
 // ---- styles for banner -----------------------------------------------------
@@ -880,8 +1069,19 @@ var (
 // ---- view ------------------------------------------------------------------
 
 func (m *Model) View() string {
+	// Retire the wordmark the first time something other than the opening screen is drawn, and
+	// give the list back the rows it was holding. Done here rather than at each screen
+	// transition because there are a dozen of those and every one of them ends in a draw.
+	if !m.splashDone && m.screen != screenMethod && m.screen != screenSetup {
+		m.splashDone = true
+		m.resizeList()
+	}
+
 	if m.screen == screenSetup {
-		return m.banner() + m.setup.view(m.width)
+		return m.banner() + m.splash() + m.setup.view(m.width)
+	}
+	if m.screen == screenBuildParams {
+		return m.banner() + m.builder.view(m.width)
 	}
 	if m.loading {
 		return m.banner() + fmt.Sprintf("\n  %s loading...\n", m.spin.View())
@@ -900,7 +1100,7 @@ func (m *Model) View() string {
 			styleErr.Width(width).MarginLeft(2).Render("Error: "+m.err.Error()) + "\n\n" +
 			styleDim.MarginLeft(2).Render("press any key to continue") + "\n"
 	}
-	return m.banner() + m.list.View()
+	return m.banner() + m.splash() + m.list.View()
 }
 
 // banner renders the purple header row. withVersion is false only on the retry when the
@@ -922,7 +1122,7 @@ func (m *Model) banner() string {
 }
 
 func (m *Model) bannerRow(withVersion bool) string {
-	title := styleBanner.Render("▶ ssm-tool")
+	title := styleBanner.Render("▶ postern")
 	sep := styleBannerSep.Render("│")
 
 	var parts []string

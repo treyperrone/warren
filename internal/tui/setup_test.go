@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	awsint "github.com/treyperrone/ssm-tool/internal/aws"
+	awsint "github.com/treyperrone/postern/internal/aws"
 )
 
 // A machine with no ~/.aws/config used to be a hard stop: ParseConfig returned an error and

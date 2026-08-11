@@ -1,4 +1,4 @@
-module github.com/treyperrone/ssm-tool
+module github.com/treyperrone/postern
 
 go 1.26.5
 
