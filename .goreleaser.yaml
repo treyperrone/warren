@@ -1,6 +1,6 @@
 version: 2
 
-project_name: ssm-tool
+project_name: postern
 
 before:
   hooks:
@@ -21,9 +21,9 @@ builds:
         goarch: arm64
     ldflags:
       # .Tag, not .Version — .Version strips the leading "v", and the version
-      # `ssm-tool version` prints should match what `go install ...@v0.1.4`
+      # `postern version` prints should match what `go install ...@v0.1.4`
       # asks for and what the release page lists.
-      - -s -w -X github.com/treyperrone/ssm-tool/internal/buildinfo.version={{ .Tag }}
+      - -s -w -X github.com/treyperrone/postern/internal/buildinfo.version={{ .Tag }}
 
 archives:
   # `formats` (plural), not the deprecated `format` — `goreleaser check` fails on the old

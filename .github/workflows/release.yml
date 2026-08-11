@@ -32,7 +32,7 @@ jobs:
           cache: true
 
       # Don't publish a tag that doesn't build or pass its tests. The e2e test skips itself
-      # without SSM_TOOL_E2E, so this stays offline.
+      # without POSTERN_E2E, so this stays offline.
       - name: Test
         run: go test ./...
 
