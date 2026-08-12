@@ -165,15 +165,40 @@ host up simultaneously — both appear on the manager screen with the port to po
 `SSH` is a forward only: warren hands you the `ssh -p <port> user@localhost` line and you run it
 wherever you like.
 
-An SSM shell is different, because it is interactive: it needs the terminal, and the TUI hands the
-whole terminal over for as long as the session lasts. One at a time, from the TUI.
+An SSM shell is different, because it is interactive: it needs a terminal for as long as the session
+lasts. warren opens it in a **new window** where it can, and the TUI stays usable, so several
+sessions can be open at once. What counts as a window depends on where warren is running:
 
-`warren ssm-shell <target>` is the way around that. It picks an account and role exactly as the TUI
-does, then opens a session on one target and gets out of the way — no tmux wrapper, no banner, no
-attempt to own your layout. You decide where each session lives:
+| where warren runs | what happens |
+| --- | --- |
+| `$WARREN_TERMINAL` set | that command opens the window |
+| inside tmux | a new tmux window |
+| macOS | a new Terminal (or iTerm) window |
+| Linux/BSD with a display | the first of `x-terminal-emulator`, `gnome-terminal`, `konsole`, `xfce4-terminal`, `alacritty`, `kitty`, `wezterm`, `xterm` |
+| **anything headless** | the session runs in place, as before |
+
+That last row is the important one, and it isn't a shortcoming to work around. A window is created by
+a terminal emulator, which needs a display server to draw into. Over SSH to a headless box there is
+none, so *no* process running there can make a window — warren included. It runs the session in place
+and the `?` screen says why, rather than appearing to do nothing.
+
+Detection can't be exhaustive, so `WARREN_TERMINAL` overrides all of it. The value is an argv prefix
+and the script path is appended last:
 
 ```sh
-# a tmux window per box
+export WARREN_TERMINAL="wezterm start --"
+export WARREN_TERMINAL="kitty --hold"
+```
+
+warren launches the window and forgets it. It doesn't track the session, because knowing when the
+session ended would mean holding the pty — which is to say writing a small tmux, badly.
+
+`warren ssm-shell <target>` is the same thing without the picker: it takes an account and role
+exactly as the TUI does, opens a session on one target, and gets out of the way. Use it when you
+want to choose the layout yourself, or when there's no window to open:
+
+```sh
+# a tmux window per box, on a headless host
 tmux new-window warren ssm-shell i-0123456789abcdef0
 tmux new-window warren ssm-shell i-abcdef0123456789a
 
@@ -181,15 +206,18 @@ tmux new-window warren ssm-shell i-abcdef0123456789a
 warren ssm-shell i-0123456789abcdef0
 ```
 
-This is deliberately not a multiplexer built into warren. Detaching a live session and re-attaching
-to it later means holding a PTY, pumping it in raw mode, handling resize, and keeping a scrollback
-buffer — which is to say, writing a small tmux, badly. Exposing the session as a command instead
-composes with whatever you already use, and works over a plain SSH connection with no display.
-
 It also makes SSM shells scriptable, which they weren't when the only way in was the picker.
 
 Each concurrent shell is a real Session Manager session: it counts against your account's
 concurrent-session limit and appears in Session Manager history.
+
+To open the window, warren writes a short shell script to `~/.cache/warren/launch` (or the platform
+equivalent) and hands the path to the terminal, because every emulator disagrees about how to accept
+a command and the plugin's arguments are JSON that a second layer of quoting mangles. That script
+carries the session token, so it is written `0600` and removed two minutes later; anything a crash
+leaves behind is swept by the next launch. The same token is already visible in `ps` for the running
+plugin, so this doesn't create an exposure that didn't exist — it does extend it to the filesystem
+briefly, which is the cost of the feature.
 
 ## Running AWS CLI commands
 

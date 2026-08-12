@@ -20,6 +20,7 @@ import (
 	awsint "github.com/treyperrone/warren/internal/aws"
 	"github.com/treyperrone/warren/internal/buildinfo"
 	"github.com/treyperrone/warren/internal/credserver"
+	"github.com/treyperrone/warren/internal/termwin"
 	"github.com/treyperrone/warren/internal/tunnel"
 )
 
@@ -132,6 +133,9 @@ var (
 	styleTitle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("6"))
 	styleErr   = lipgloss.NewStyle().Foreground(lipgloss.Color("1"))
 	styleDim   = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
+	// Green rather than the banner's purple: this reports that something succeeded elsewhere,
+	// and it must not read as part of the chrome the way a dim grey line would.
+	styleNotice = lipgloss.NewStyle().Foreground(lipgloss.Color("2"))
 )
 
 // ---- model -----------------------------------------------------------------
@@ -165,6 +169,11 @@ type Model struct {
 
 	// last instance connected to (for banner)
 	lastInstance string
+
+	// notice is a one-line transient confirmation, cleared by the next keypress. It exists for
+	// actions whose result happens somewhere the user is not looking — a session opening in
+	// another window is otherwise indistinguishable from nothing having happened.
+	notice string
 
 	// list widget (reused across screens)
 	list list.Model
@@ -322,6 +331,11 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.screen == screenBuildParams {
 			return m.updateBuildParams(msg)
 		}
+		// A notice has been read by the time the next key arrives; leaving it up would make it
+		// look like it applied to whatever happens next. Cleared without consuming the key,
+		// unlike an error, because it is a confirmation rather than something to acknowledge.
+		m.notice = ""
+
 		// The error view promises "press any key"; make that true. Only esc and enter
 		// cleared it before, so every other key looked like a hang.
 		if m.err != nil {
@@ -469,6 +483,21 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.instances = msg.instances
 		m.buildInstanceList()
 		m.screen = screenInstance
+
+	case msgShellWindowed:
+		// The terminal was never handed over, so there is nothing to restore — just say where the
+		// session went and stay put. Landing back on the instance list is what makes opening a
+		// second one a single keypress, which is the whole reason for the window.
+		m.loading = false
+		m.notice = fmt.Sprintf("%s opened in a new %s window", msg.name, msg.where)
+		if len(m.instances) > 0 {
+			m.buildInstanceList()
+			m.screen = screenInstance
+		} else {
+			m.buildMainList()
+			m.screen = screenMain
+		}
+		return m, nil
 
 	case msgShellDone:
 		// Back to the instance list rather than the tunnel manager. A foreground shell
@@ -741,19 +770,55 @@ func (m *Model) selectConnType(val string) tea.Cmd {
 
 type msgShellDone struct{}
 
-func (m *Model) startShell() tea.Cmd {
-	m.lastInstance = m.selInstance.Name
-	return tea.ExecProcess(m.buildShellCmd(), func(err error) tea.Msg {
-		return msgShellDone{}
-	})
+// msgShellWindowed reports that the session opened in its own window and warren kept the terminal.
+type msgShellWindowed struct {
+	where string
+	name  string
 }
 
-func (m *Model) buildShellCmd() *exec.Cmd {
+func (m *Model) startShell() tea.Cmd {
+	m.lastInstance = m.selInstance.Name
+	name := m.selInstance.Name
+
+	// StartSession is called exactly once, here, and the resulting command is used by whichever
+	// path follows. Building it separately per path would open a second SSM session and orphan
+	// the first — the session is created by the API call, not by running the plugin.
 	cmd, err := tunnel.ShellCmd(m.ctx, m.selInstance.ID, m.awsSess)
 	if err != nil {
-		return exec.Command("echo", "plugin error: "+err.Error())
+		m.err = err
+		return nil
 	}
-	return m.wrapWithHeader(cmd, m.selInstance.Name)
+
+	// A window first, where the platform can make one. An SSM shell is interactive, so running it
+	// in place means handing over the whole terminal and freezing warren for the duration — which
+	// is why only one could ever be open at a time. In its own window, several can be.
+	//
+	// The windowed session is not wrapped in tmux the way an in-place one is. The wrapper exists
+	// to stop the banner scrolling away, and a window carries its own persistent title instead,
+	// which does the same job without a dependency. warren also does not track the window: doing
+	// so would mean holding the pty to learn when it exits, which is the multiplexer that
+	// `warren ssm-shell` exists precisely to avoid writing.
+	auth := ""
+	if m.awsSess != nil {
+		auth = m.awsSess.Label
+	}
+	title := "warren · " + name
+	if auth != "" {
+		title += " · " + auth
+	}
+	if ok, lerr := termwin.Launch(termwin.OSEnv(), cmd, title); ok {
+		where := termwin.Choose(termwin.OSEnv()).Name
+		return func() tea.Msg { return msgShellWindowed{where: where, name: name} }
+	} else if lerr != nil {
+		// A window was possible but could not be opened. Report it rather than silently running
+		// in place, because "it opened somewhere I cannot see" is the confusing outcome — then
+		// connect in place anyway, since the session is already open.
+		m.err = lerr
+	}
+
+	return tea.ExecProcess(m.wrapWithHeader(cmd, name), func(err error) tea.Msg {
+		return msgShellDone{}
+	})
 }
 
 // TmuxVar controls whether SSM sessions run inside tmux, which is what keeps the banner pinned
@@ -1252,7 +1317,15 @@ func (m *Model) View() string {
 			styleErr.Width(width).MarginLeft(2).Render("Error: "+m.err.Error()) + "\n\n" +
 			styleDim.MarginLeft(2).Render("press any key to continue") + "\n"
 	}
-	return m.banner() + m.splash() + m.list.View()
+	return m.banner() + m.splash() + m.noticeLine() + m.list.View()
+}
+
+// noticeLine renders the transient confirmation, or nothing when there is none.
+func (m *Model) noticeLine() string {
+	if m.notice == "" {
+		return ""
+	}
+	return styleNotice.MarginLeft(2).Render("✓ "+m.notice) + "\n\n"
 }
 
 // banner renders the purple header row. withVersion is false only on the retry when the

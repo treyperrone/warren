@@ -12,6 +12,7 @@ import (
 	"github.com/treyperrone/warren/internal/awscli"
 	"github.com/treyperrone/warren/internal/buildinfo"
 	"github.com/treyperrone/warren/internal/plugin"
+	"github.com/treyperrone/warren/internal/termwin"
 )
 
 const (
@@ -76,6 +77,7 @@ func aboutFacts() []aboutSection {
 		{"found on this machine — not bundled", [][2]string{
 			{"aws cli", awsCLIStatus()},
 			{"tmux", tmuxStatus()},
+			{"new windows", windowStatus()},
 		}},
 	}
 }
@@ -88,6 +90,18 @@ func awsCLIStatus() string {
 		return info.Display() + "  (only the AWS CLI features need it)"
 	}
 	return info.Display() + "  " + info.Path
+}
+
+// windowStatus answers "why did my session not open in a new window?", which is not guessable:
+// it depends on whether there is a display server to draw one on, and over SSH to a headless host
+// there is none — so no process running there can make a window at all. Naming the mechanism that
+// will be used, or why none can be, turns a silent difference in behaviour into a stated one.
+func windowStatus() string {
+	s := termwin.Choose(termwin.OSEnv())
+	if !s.Available() {
+		return "unavailable  (no display here — sessions open in this terminal)"
+	}
+	return s.Name + "  (sessions open in a new window)"
 }
 
 // tmuxStatus answers "why is the banner not pinned?" without anyone having to ask, since that
