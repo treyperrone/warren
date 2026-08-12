@@ -3,6 +3,7 @@ package pathhint
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -31,8 +32,14 @@ func TestHintWhenNotOnPath(t *testing.T) {
 	if !strings.Contains(got, dir) {
 		t.Errorf("hint does not name the install directory %q:\n%s", dir, got)
 	}
-	if !strings.Contains(got, ".zshrc") {
-		t.Errorf("zsh hint does not mention ~/.zshrc:\n%s", got)
+	// Which advice is correct depends on the platform, and shellAdvice is covered per-branch by
+	// TestShellAdvice; here it only has to be the advice this host would really give.
+	wantAdvice := ".zshrc"
+	if runtime.GOOS == "windows" {
+		wantAdvice = "SetEnvironmentVariable"
+	}
+	if !strings.Contains(got, wantAdvice) {
+		t.Errorf("hint does not mention %s:\n%s", wantAdvice, got)
 	}
 }
 
@@ -84,18 +91,23 @@ func TestShellAdvice(t *testing.T) {
 		shell    string
 		wantLine string
 		wantRun  string
+		goos     string
 	}{
-		{"/bin/zsh", ".zshrc", "exec zsh"},
-		{"/usr/bin/fish", "fish_add_path", "exec fish"},
-		{"/bin/bash", ".bash_profile", "exec bash -l"},
-		{"/bin/ksh", "export PATH=", "startup file"},
-		{"", "export PATH=", "startup file"},
+		{"/bin/zsh", ".zshrc", "exec zsh", "linux"},
+		{"/usr/bin/fish", "fish_add_path", "exec fish", "linux"},
+		{"/bin/bash", ".bash_profile", "exec bash -l", "darwin"},
+		{"/bin/ksh", "export PATH=", "startup file", "linux"},
+		{"", "export PATH=", "startup file", "linux"},
+		// Windows ignores $SHELL, which is normally unset there. Both cases run on every host:
+		// keying off runtime.GOOS meant each branch was only exercised on its own OS, which is
+		// how the Windows branch shipped handing out `export PATH=...`.
+		{"", "SetEnvironmentVariable", "open a new terminal", "windows"},
+		{"/bin/zsh", "SetEnvironmentVariable", "open a new terminal", "windows"},
 	}
 
 	for _, tt := range tests {
-		t.Run(tt.shell, func(t *testing.T) {
-			t.Setenv("SHELL", tt.shell)
-			line, reload := shellAdvice("/home/someone/go/bin")
+		t.Run(tt.goos+tt.shell, func(t *testing.T) {
+			line, reload := adviceFor(tt.goos, tt.shell, "/home/someone/go/bin")
 
 			if !strings.Contains(line, tt.wantLine) {
 				t.Errorf("line = %q, want it to contain %q", line, tt.wantLine)

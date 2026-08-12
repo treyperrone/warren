@@ -79,17 +79,26 @@ func onPath(dir string) bool {
 // syntax differs enough between fish and the POSIX shells that a single generic line would
 // be wrong for someone.
 func shellAdvice(dir string) (line, reload string) {
-	// Windows first: $SHELL is normally unset there, so this used to fall through to the POSIX
-	// default and tell a Windows user to run `export PATH=...`, which is advice they cannot use.
-	// SetEnvironmentVariable at User scope is the persistent equivalent, and unlike setx it does
-	// not silently truncate a long PATH at 1024 characters.
-	if runtime.GOOS == "windows" {
+	return adviceFor(runtime.GOOS, os.Getenv("SHELL"), dir)
+}
+
+// adviceFor is shellAdvice with the platform and shell passed in rather than read from the
+// environment, so both branches can be tested from any host. Reading runtime.GOOS directly meant
+// the Windows advice was only ever exercised on a Windows runner and the POSIX advice only on
+// Unix — half the function untested on any single run, which is how the Windows branch shipped
+// telling people to run `export PATH=...`.
+func adviceFor(goos, shell, dir string) (line, reload string) {
+	// Windows first: $SHELL is normally unset there, so keying off it alone falls through to the
+	// POSIX default and gives advice a Windows user cannot run. SetEnvironmentVariable at User
+	// scope is the persistent equivalent, and unlike setx it does not silently truncate a long
+	// PATH at 1024 characters.
+	if goos == "windows" {
 		return fmt.Sprintf(`[Environment]::SetEnvironmentVariable("Path", $env:Path + ";%s", "User")`, dir),
 			"(then open a new terminal)"
 	}
 
 	// Quote the directory, since a home directory can contain spaces.
-	switch filepath.Base(os.Getenv("SHELL")) {
+	switch filepath.Base(shell) {
 	case "zsh":
 		return fmt.Sprintf("echo 'export PATH=\"$PATH:%s\"' >> ~/.zshrc", dir), "exec zsh"
 	case "fish":
