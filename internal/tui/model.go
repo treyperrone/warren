@@ -297,6 +297,21 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.String() == "ctrl+c" {
 			return m, tea.Quit
 		}
+		// Nothing but ctrl+c while a request is in flight.
+		//
+		// m.loading was set in nineteen places and read only by View, so keys kept being handled
+		// during an async fetch — and a second Enter on an SSO session started a *second* device
+		// authorization. That opens a second browser tab and prints a second user code, so the
+		// code on screen and the code the browser is asking about belong to different
+		// authorizations: they visibly do not match, and neither one can be confirmed. Easy to
+		// trigger by pressing Enter again when the first call is slow.
+		//
+		// Device auth polls until the code expires, so this can hold the keyboard for a while.
+		// That is the right trade: ctrl+c always works, and the alternative is two live
+		// authorizations racing each other.
+		if m.loading {
+			return m, nil
+		}
 		// The setup form owns the keyboard outright: every keystroke is text entry, and
 		// the list shortcuts below (including "/" and "q") would eat characters.
 		if m.screen == screenSetup {
