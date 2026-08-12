@@ -19,6 +19,7 @@ Which is the job. SSM reaches an instance with **no public IP, no bastion host, 
 - AWS IAM Identity Center (SSO) auth via direct SDK calls — no CLI wrapper
 - bubbletea TUI (alt-screen, no terminal ghosting) for picking account → role → instance
 - Shell sessions (foreground), SSH tunnels, and RDP tunnels (backgrounded)
+- `warren ssm-shell <id>` for a session on one instance, so several can run at once in your own tmux windows or terminals
 - Hand the account and role you pick to any command — `warren exec`, `warren shell`, or from the TUI
 - A guided builder for read-only AWS CLI commands, with the command always on screen and editable
 - Fuzzy search across everything on the row, including **any EC2 tag**
@@ -53,12 +54,13 @@ go install github.com/treyperrone/warren@latest
 ## Usage
 
 ```sh
-warren                  # launch the interactive picker
-warren exec -- <cmd>    # pick an account and role, then run <cmd> with its credentials
-warren shell            # pick an account and role, then open a shell with its credentials
-warren setup            # add an [sso-session] block to ~/.aws/config
-warren version          # print warren's version and the embedded plugin's
-warren help             # print usage
+warren                     # launch the interactive picker
+warren exec -- <cmd>       # pick an account and role, then run <cmd> with its credentials
+warren shell               # pick an account and role, then open a shell with its credentials
+warren ssm-shell <target>  # pick an account and role, then open an SSM shell on <target>
+warren setup               # add an [sso-session] block to ~/.aws/config
+warren version             # print warren's version and the embedded plugin's
+warren help                # print usage
 ```
 
 Authentication comes from an `sso-session` block or a named profile in `~/.aws/config` (standard AWS SSO setup). The TUI walks you through picking an SSO session, account, role, target instance, and connection type.
@@ -129,6 +131,40 @@ it did not own — so exiting the remote shell destroyed the session and took th
 
 tmux is skipped when `$TMUX` is already set: it refuses to nest, and you already have a status line
 of your own.
+
+### Several sessions at once
+
+Port forwards already multiplex. `RDP` and `SSH` run the plugin as a background process and warren
+keeps the terminal, so you can have an RDP forward to a Windows box and an SSH forward to another
+host up simultaneously — both appear on the manager screen with the port to point a client at.
+`SSH` is a forward only: warren hands you the `ssh -p <port> user@localhost` line and you run it
+wherever you like.
+
+An SSM shell is different, because it is interactive: it needs the terminal, and the TUI hands the
+whole terminal over for as long as the session lasts. One at a time, from the TUI.
+
+`warren ssm-shell <target>` is the way around that. It picks an account and role exactly as the TUI
+does, then opens a session on one target and gets out of the way — no tmux wrapper, no banner, no
+attempt to own your layout. You decide where each session lives:
+
+```sh
+# a tmux window per box
+tmux new-window warren ssm-shell i-0123456789abcdef0
+tmux new-window warren ssm-shell i-abcdef0123456789a
+
+# or just a second terminal, or a second SSH connection to the same host
+warren ssm-shell i-0123456789abcdef0
+```
+
+This is deliberately not a multiplexer built into warren. Detaching a live session and re-attaching
+to it later means holding a PTY, pumping it in raw mode, handling resize, and keeping a scrollback
+buffer — which is to say, writing a small tmux, badly. Exposing the session as a command instead
+composes with whatever you already use, and works over a plain SSH connection with no display.
+
+It also makes SSM shells scriptable, which they weren't when the only way in was the picker.
+
+Each concurrent shell is a real Session Manager session: it counts against your account's
+concurrent-session limit and appears in Session Manager history.
 
 ## Running AWS CLI commands
 

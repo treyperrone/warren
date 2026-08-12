@@ -2,42 +2,51 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
+	"os/exec"
+	"strings"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 
+	awsint "github.com/treyperrone/warren/internal/aws"
 	"github.com/treyperrone/warren/internal/awsexec"
 	"github.com/treyperrone/warren/internal/buildinfo"
 	"github.com/treyperrone/warren/internal/pathhint"
 	"github.com/treyperrone/warren/internal/plugin"
 	"github.com/treyperrone/warren/internal/tui"
+	"github.com/treyperrone/warren/internal/tunnel"
 )
 
 const usage = `warren — browse AWS accounts and connect to EC2 instances over SSM.
 
 usage:
-  warren                  launch the interactive picker
-  warren exec -- <cmd>    pick an account and role, then run <cmd> with its credentials
-  warren shell            pick an account and role, then open a shell with its credentials
-  warren setup            add an [sso-session] block to ~/.aws/config
-  warren version          print the version and exit
-  warren help             print this message and exit
+  warren                     launch the interactive picker
+  warren exec -- <cmd>       pick an account and role, then run <cmd> with its credentials
+  warren shell               pick an account and role, then open a shell with its credentials
+  warren ssm-shell <target>  pick an account and role, then open an SSM shell on <target>
+  warren setup               add an [sso-session] block to ~/.aws/config
+  warren version             print the version and exit
+  warren help                print this message and exit
 
 examples:
   warren exec -- aws s3 ls
   warren exec -- aws ec2 describe-instances --query 'Reservations[].Instances[].Tags'
   warren shell
+  warren ssm-shell i-0123456789abcdef0
+  tmux new-window warren ssm-shell i-0123456789abcdef0
 `
 
 // mode is what to do once the picker has produced credentials.
 type mode int
 
 const (
-	modeTUI   mode = iota // the normal interactive tool
-	modeExec              // run one command, then exit with its status
-	modeShell             // run $SHELL
+	modeTUI      mode = iota // the normal interactive tool
+	modeExec                 // run one command, then exit with its status
+	modeShell                // run $SHELL
+	modeSSMShell             // open an interactive SSM session on one instance
 )
 
 func main() {
@@ -73,7 +82,7 @@ func main() {
 	}
 
 	if run.mode != modeTUI {
-		os.Exit(runWithCreds(m, run))
+		os.Exit(runWithCreds(ctx, m, run))
 	}
 
 	// The alt-screen is torn down on exit, taking the TUI's own confirmation with it. If a
@@ -91,6 +100,7 @@ func main() {
 type invocation struct {
 	mode         mode
 	argv         []string // command to run, for modeExec
+	target       string   // SSM target, for modeSSMShell
 	startInSetup bool
 }
 
@@ -123,6 +133,14 @@ func parseArgs() invocation {
 	case "shell":
 		return invocation{mode: modeShell, argv: awsexec.ShellArgv()}
 
+	case "ssm-shell":
+		target, err := parseTarget(os.Args[2:])
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "%v\n\n%s", err, usage)
+			os.Exit(2)
+		}
+		return invocation{mode: modeSSMShell, target: target}
+
 	case "exec":
 		argv := os.Args[2:]
 		// The `--` is conventional and worth accepting, but not worth requiring: it exists to
@@ -145,8 +163,83 @@ func parseArgs() invocation {
 	panic("unreachable")
 }
 
+// parseTarget validates the SSM target for `warren ssm-shell`.
+//
+// Checked before the picker runs rather than after, because the picker involves an SSO round-trip.
+// Learning about a bad argument on the far side of that is the difference between correcting it
+// immediately and sitting through a device authorization to be told.
+//
+// The shape check is deliberately loose. It rejects the one mistake a client can actually catch —
+// passing the instance *name*, which is what the TUI displays, where an id is required — and
+// otherwise gets out of the way. StartSession also accepts targets that are not instance ids at
+// all, such as the ecs:cluster_task_container form used for ECS exec, so an allowlist of i-/mi-
+// would reject valid targets the moment warren grows to cover them. AWS is the authority on
+// whether a target exists; this only catches arguments that cannot be targets at all.
+func parseTarget(args []string) (string, error) {
+	if len(args) == 0 {
+		return "", errors.New("ssm-shell needs a target, e.g. warren ssm-shell i-0123456789abcdef0")
+	}
+	if len(args) > 1 {
+		return "", fmt.Errorf("ssm-shell takes one target, got %d: %s", len(args), strings.Join(args, " "))
+	}
+
+	target := args[0]
+	switch {
+	case strings.HasPrefix(target, "-"):
+		// Otherwise a mistyped flag becomes an instance id and the error arrives from AWS.
+		return "", fmt.Errorf("%q looks like a flag, not a target; ssm-shell takes no flags", target)
+	case strings.HasPrefix(target, "i-"), strings.HasPrefix(target, "mi-"):
+		return target, nil
+	case strings.Contains(target, ":"):
+		// A document-style target, e.g. ecs:my-cluster_taskid_runtimeid. Passed through.
+		return target, nil
+	default:
+		return "", fmt.Errorf("%q is not an instance id — ssm-shell takes the id (i-0123456789abcdef0), "+
+			"not the name shown in the picker", target)
+	}
+}
+
+// runSSMShell opens an interactive Session Manager shell on one target.
+//
+// Nothing here wraps the session in tmux, unlike the TUI's own shell action. That wrapper exists
+// to keep warren's banner pinned while a session has the screen; this command hands the terminal
+// over and stays out of the way, which is the whole reason it exists — the caller decides whether
+// this lands in a tmux window, a new tab, or a separate SSH connection, and warren imposing its
+// own multiplexer would take that choice back.
+//
+// There is also no credential endpoint, unlike exec and shell. Those hand credentials to a child
+// that may keep calling AWS for hours, so a static copy goes stale at the one-hour mark. An SSM
+// shell spends its credentials once, on StartSession; after that the plugin holds a stream token
+// and never authenticates again, so a renewing endpoint would have nothing to renew.
+func runSSMShell(ctx context.Context, sess *awsint.Session, target string) int {
+	// Printed before StartSession, which is a network round-trip: otherwise the first thing the
+	// user sees is a pause with no indication of what is being waited on.
+	fmt.Fprintf(os.Stderr, "opening an SSM session on %s\n", target)
+
+	cmd, err := tunnel.ShellCmd(ctx, target, sess)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		return 1
+	}
+
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	if err := cmd.Run(); err != nil {
+		// The plugin exiting non-zero is its status to report, not an warren error to wrap.
+		var ee *exec.ExitError
+		if errors.As(err, &ee) {
+			return ee.ExitCode()
+		}
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		return 1
+	}
+	return 0
+}
+
 // runWithCreds runs the requested command with the picked session and returns its exit code.
-func runWithCreds(m *tui.Model, run invocation) int {
+func runWithCreds(ctx context.Context, m *tui.Model, run invocation) int {
 	sess := m.Session()
 	if sess == nil {
 		// Quitting the picker before choosing is a cancellation, not an error: say nothing
@@ -160,6 +253,10 @@ func runWithCreds(m *tui.Model, run invocation) int {
 		who += "  •  credentials expire in " + left
 	}
 	fmt.Fprintf(os.Stderr, "%s\n", who)
+
+	if run.mode == modeSSMShell {
+		return runSSMShell(ctx, sess, run.target)
+	}
 	if run.mode == modeShell {
 		fmt.Fprintf(os.Stderr, "%s is set; exit the shell to return.\n", awsexec.SessionLabelVar)
 	}
