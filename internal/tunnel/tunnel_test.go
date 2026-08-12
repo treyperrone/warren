@@ -160,3 +160,57 @@ func TestHintSaysWhatToDoWithTheTunnel(t *testing.T) {
 		t.Errorf("shell hint %q loses the pid", got)
 	}
 }
+
+// The bug this guards: load() checked liveness with proc.Signal(os.Signal(nil)), the same mistake
+// Alive() had. That call returns "unsupported signal type" for every process, so every persisted
+// tunnel was dropped and a restarted warren showed an empty manager while the forwarders were still
+// running and still holding their ports. The fix routes both paths through Alive().
+func TestManagerRestoresLiveTunnelsFromDisk(t *testing.T) {
+	home := t.TempDir()
+	testenv.SetHome(t, home)
+
+	pid := sleeper(t)
+	entries := fmt.Sprintf(`[{"pid":%d,"kind":"RDP","instance_id":"i-0abc",`+
+		`"instance_name":"goad-dc01","local_port":13389,"auth_label":"acct/Role"}]`, pid)
+	if err := os.WriteFile(filepath.Join(home, ".warren_sessions.json"), []byte(entries), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	m := NewManager()
+
+	live := m.Active()
+	if len(live) != 1 {
+		t.Fatalf("restored %d tunnels from disk, want 1 — a restarted warren loses track of running forwarders", len(live))
+	}
+	if live[0].LocalPort != 13389 {
+		t.Errorf("local port = %d, want 13389", live[0].LocalPort)
+	}
+	if live[0].Kind != KindRDP {
+		t.Errorf("kind = %q, want RDP", live[0].Kind)
+	}
+}
+
+// A tunnel whose process is gone must not be restored, or the manager shows ports that nothing is
+// listening on.
+func TestManagerDropsDeadTunnelsFromDisk(t *testing.T) {
+	home := t.TempDir()
+	testenv.SetHome(t, home)
+
+	entries := `[{"pid":0,"kind":"RDP","instance_id":"i-0abc","local_port":13389}]`
+	if err := os.WriteFile(filepath.Join(home, ".warren_sessions.json"), []byte(entries), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if live := NewManager().Active(); len(live) != 0 {
+		t.Errorf("restored %d dead tunnels", len(live))
+	}
+}
+
+// Tunnels must outlive warren, which is what the Quit row promises. ctrl-c sends SIGINT to the whole
+// foreground process group, so a plugin sharing warren's group died with it — see internal/procgroup.
+func TestBackgroundPluginIsDetachedFromWarrensProcessGroup(t *testing.T) {
+	cmd := backgroundPluginCmd("/bin/sh", []string{"-c", ":"}, nil)
+	if cmd.SysProcAttr == nil {
+		t.Fatal("background plugin shares warren's process group, so ctrl-c would kill every tunnel")
+	}
+}

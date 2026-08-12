@@ -17,6 +17,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/ssm"
 	"github.com/treyperrone/warren/internal/homedir"
 	"github.com/treyperrone/warren/internal/plugin"
+	"github.com/treyperrone/warren/internal/procgroup"
 )
 
 type Kind string
@@ -127,8 +128,11 @@ func (m *Manager) load() {
 		return
 	}
 	for _, e := range entries {
-		proc, err := os.FindProcess(e.PID)
-		if err != nil || proc.Signal(os.Signal(nil)) != nil {
+		// aliveByPID, not proc.Signal(os.Signal(nil)) — that returns "unsupported signal type"
+		// for every process, so this loop discarded every persisted tunnel and warren came back
+		// up believing it had none. The same mistake was fixed in Alive(); this copy survived it,
+		// which is why both now go through one function.
+		if !(&Tunnel{PID: e.PID}).Alive() {
 			continue
 		}
 		m.tunnels = append(m.tunnels, &Tunnel{
@@ -304,6 +308,25 @@ func ShellCmd(ctx context.Context, instanceID string, sess sessionCreds) (*exec.
 	return cmd, nil
 }
 
+// backgroundPluginCmd builds the plugin command for a tunnel that has to outlive warren.
+//
+// The process group is the point. The screen says "active tunnels keep running" beside Quit, and
+// with `q` they did — but ctrl-c does not signal warren, it sends SIGINT to the whole foreground
+// process group, and a child of exec.Command inherits that group. So ctrl-c silently killed every
+// tunnel, and so did an SSH disconnect via SIGHUP. Detaching the child is what makes the promise on
+// screen true for both ways of quitting.
+//
+// Stdout and Stderr stay nil: this runs unattended, and its output would otherwise land on top of
+// the TUI. Killing it still works by pid, which is what Tunnel.Kill does.
+func backgroundPluginCmd(bin string, args, env []string) *exec.Cmd {
+	cmd := exec.Command(bin, args...)
+	cmd.Env = env
+	cmd.Stdout = nil
+	cmd.Stderr = nil
+	cmd.SysProcAttr = procgroup.Detached()
+	return cmd
+}
+
 // StartPortForward calls SSM StartSession then launches the plugin in the
 // background for port forwarding.
 func StartPortForward(ctx context.Context, instanceID string, remotePort, localPort int, sess sessionCreds) (*Tunnel, error) {
@@ -327,17 +350,17 @@ func StartPortForward(ctx context.Context, instanceID string, remotePort, localP
 		instanceID, remotePort, localPort,
 	)
 
-	cmd := exec.Command(pluginBin,
-		respJSON,
-		region,
-		"StartSession",
-		"",
-		reqJSON,
-		endpoint,
+	cmd := backgroundPluginCmd(pluginBin,
+		[]string{
+			respJSON,
+			region,
+			"StartSession",
+			"",
+			reqJSON,
+			endpoint,
+		},
+		append(os.Environ(), sess.Env()...),
 	)
-	cmd.Env = append(os.Environ(), sess.Env()...)
-	cmd.Stdout = nil
-	cmd.Stderr = nil
 
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("start plugin: %w", err)

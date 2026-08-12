@@ -17,6 +17,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/treyperrone/warren/internal/procgroup"
 )
 
 // Var lets the user name the command that opens a window, overriding detection. The command is run
@@ -155,6 +157,11 @@ func Launch(e Env, cmd *exec.Cmd, title string) (bool, error) {
 	// The launcher exits immediately, having handed off to the terminal; its own stdio must not
 	// be wired to warren's, or its output would land on top of the TUI.
 	open.Stdout, open.Stderr, open.Stdin = nil, nil, nil
+	// Its own process group, for the same reason a tunnel gets one: ctrl-c in warren sends SIGINT
+	// to the whole foreground group, and a window the user opened deliberately must not be
+	// collateral. Matters for the emulators that stay in the foreground; harmless for `open`,
+	// which hands off to launchd and exits.
+	open.SysProcAttr = procgroup.Detached()
 	if err := open.Start(); err != nil {
 		_ = os.Remove(path)
 		return false, fmt.Errorf("opening a window with %s: %w", s.Name, err)
