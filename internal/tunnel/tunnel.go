@@ -54,15 +54,32 @@ func (t *Tunnel) Label() string {
 	}
 }
 
+// Hint is the second line of a manager row: what to do with this tunnel now it is up.
+//
+// The row used to read "PID 12345", which answers a question nobody has. A forwarded port is only
+// useful once you know what to point at it, and for RDP in particular "localhost:13389" in the
+// title is not obviously the thing to paste into a client. The pid stays for killing something by
+// hand if it ever comes to that.
+func (t *Tunnel) Hint() string {
+	switch t.Kind {
+	case KindRDP:
+		return fmt.Sprintf("point your RDP client at localhost:%d  •  PID %d", t.LocalPort, t.PID)
+	case KindSSH:
+		user := t.SSHUser
+		if user == "" {
+			user = "<user>"
+		}
+		return fmt.Sprintf("ssh -p %d %s@localhost  •  PID %d", t.LocalPort, user, t.PID)
+	default:
+		return fmt.Sprintf("PID %d", t.PID)
+	}
+}
+
 func (t *Tunnel) Alive() bool {
 	if t.PID == 0 {
 		return false
 	}
-	proc, err := os.FindProcess(t.PID)
-	if err != nil {
-		return false
-	}
-	return proc.Signal(os.Signal(nil)) == nil
+	return aliveByPID(t.PID)
 }
 
 func (t *Tunnel) Kill() error {

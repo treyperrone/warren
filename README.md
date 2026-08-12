@@ -200,7 +200,9 @@ warren exec -- aws sts get-caller-identity && echo "worked"
 
 ## Status
 
-Functional but early — see the AWS SDK's own docs for SSO/Identity Center setup if you haven't configured it yet. Known gap: Windows tunnel liveness checks are not fully implemented.
+Functional but early — see the AWS SDK's own docs for SSO/Identity Center setup if you haven't configured it yet.
+
+One known rough edge: on Windows, tunnel liveness is inferred from whether the process handle can still be opened, so a tunnel can show as active slightly longer than it really is. A stale row, not a lost one.
 
 ## Development
 

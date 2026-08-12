@@ -1151,7 +1151,7 @@ func (m *Model) buildMainList() {
 	for _, t := range m.manager.Active() {
 		items = append(items, item{
 			title: t.Label(),
-			desc:  fmt.Sprintf("PID %d", t.PID),
+			desc:  t.Hint(),
 			value: fmt.Sprintf("%d", t.PID),
 		})
 	}
