@@ -6,7 +6,7 @@ import (
 
 	"github.com/charmbracelet/bubbles/list"
 
-	awsint "github.com/treyperrone/postern/internal/aws"
+	awsint "github.com/treyperrone/warren/internal/aws"
 )
 
 // instanceListModel builds the instance picker over a fixed set of tagged instances, going

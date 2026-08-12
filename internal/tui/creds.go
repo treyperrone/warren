@@ -1,12 +1,14 @@
 package tui
 
 import (
+	"context"
 	"errors"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 
-	awsint "github.com/treyperrone/postern/internal/aws"
+	awsint "github.com/treyperrone/warren/internal/aws"
+	"github.com/treyperrone/warren/internal/credserver"
 )
 
 const (
@@ -50,51 +52,69 @@ func (m *Model) needsCredRefresh(now time.Time) bool {
 	return m.awsSess.Expires.Sub(now) < credRefreshLead
 }
 
-// refreshCreds renews the credentials for the account and role already in use.
-//
-// Everything it needs is read here, on the main goroutine, and passed into the closure by value.
-// Reading m.awsSess from inside the command instead would race with View, which reads it on every
+// renewal carries everything a renewal needs, captured by value so it can run on a goroutine
+// without reading Model fields the event loop may be changing — View reads the session on every
 // frame to draw the banner.
-func (m *Model) refreshCreds() tea.Cmd {
-	sess := m.awsSess
-	var (
-		ctx         = m.ctx
-		profile     = sess.ProfileName
-		accountID   = sess.AccountID
-		accountName = sess.AccountName
-		role        = sess.RoleName
-		ssoCfg      = m.selSession
-	)
+type renewal struct {
+	ssoCfg      *awsint.SSOSessionConfig
+	profile     string
+	accountID   string
+	accountName string
+	role        string
+}
 
+func (m *Model) renewal() renewal {
+	r := renewal{ssoCfg: m.selSession}
+	if m.awsSess != nil {
+		r.profile = m.awsSess.ProfileName
+		r.accountID = m.awsSess.AccountID
+		r.accountName = m.awsSess.AccountName
+		r.role = m.awsSess.RoleName
+	}
+	return r
+}
+
+// run renews the credentials, returning the SSO token alongside them when one was used.
+//
+// Shared by the event-loop tick and the credential endpoint's own goroutine, so there is one
+// definition of what renewal means rather than two that can drift.
+func (r renewal) run(ctx context.Context) (*awsint.Session, string, error) {
+	// A profile resolves through the SDK's own chain, which covers static keys, SSO-backed and
+	// assume-role profiles alike.
+	if r.profile != "" {
+		fresh, err := awsint.ProfileSession(ctx, r.profile)
+		return fresh, "", err
+	}
+
+	if r.ssoCfg == nil || r.accountID == "" || r.role == "" {
+		return nil, "", errors.New("cannot renew: no account and role recorded")
+	}
+
+	// SilentToken, never LiveToken: the SSO token may have expired too, and renewing it is fine,
+	// but falling through to device auth from here would open a browser behind the alt screen and
+	// block. ErrLoginRequired comes back instead and is reported.
+	token, err := awsint.SilentToken(ctx, *r.ssoCfg)
+	if err != nil {
+		return nil, "", err
+	}
+
+	fresh, err := awsint.GetRoleCredentials(ctx, *r.ssoCfg, token, r.accountID, r.role)
+	if err != nil {
+		return nil, "", err
+	}
+	fresh.AccountID = r.accountID
+	fresh.BuildLabel(r.accountName, r.role)
+	return fresh, token, nil
+}
+
+func (m *Model) refreshCreds() tea.Cmd {
+	r := m.renewal()
+	ctx := m.ctx
 	m.refreshingCreds = true
 
 	return func() tea.Msg {
-		// A profile resolves through the SDK's own chain, which covers static keys, SSO-backed
-		// and assume-role profiles alike.
-		if profile != "" {
-			fresh, err := awsint.ProfileSession(ctx, profile)
-			return msgCredsRefreshed{sess: fresh, err: err}
-		}
-
-		if ssoCfg == nil || accountID == "" || role == "" {
-			return msgCredsRefreshed{err: errors.New("cannot renew: no account and role recorded")}
-		}
-
-		// SilentToken, never LiveToken: the SSO token may have expired too, and renewing it is
-		// fine, but falling through to device auth from here would open a browser behind the
-		// alt screen and block. ErrLoginRequired comes back instead and is reported.
-		token, err := awsint.SilentToken(ctx, *ssoCfg)
-		if err != nil {
-			return msgCredsRefreshed{err: err}
-		}
-
-		fresh, err := awsint.GetRoleCredentials(ctx, *ssoCfg, token, accountID, role)
-		if err != nil {
-			return msgCredsRefreshed{err: err}
-		}
-		fresh.AccountID = accountID
-		fresh.BuildLabel(accountName, role)
-		return msgCredsRefreshed{sess: fresh, token: token}
+		fresh, token, err := r.run(ctx)
+		return msgCredsRefreshed{sess: fresh, token: token, err: err}
 	}
 }
 
@@ -136,4 +156,77 @@ func (m *Model) credRefreshNote() string {
 		return "renewal failed"
 	}
 	return ""
+}
+
+// ---- credential endpoint ---------------------------------------------------
+
+// credentialEnv starts the loopback credential endpoint if it is not already running, points it at
+// the current session, and returns the variables a child needs to use it.
+//
+// This replaces handing the child a copy of the keys. A copy cannot be updated once the process has
+// started, which is why a shell opened from warren used to stop working after an hour; the child
+// asking an endpoint each time has no such limit.
+func (m *Model) credentialEnv() ([]string, error) {
+	if m.awsSess == nil {
+		return nil, errors.New("no credentials selected")
+	}
+	if m.credSrv == nil {
+		srv, err := credserver.Start()
+		if err != nil {
+			return nil, err
+		}
+		m.credSrv = srv
+	}
+	m.credSrv.Set(m.awsSess)
+	return m.credSrv.Env(), nil
+}
+
+// beginCredRefresh keeps the endpoint's credentials current while a child process holds the
+// terminal — the one window where the event loop is blocked and its own tick cannot fire, and
+// therefore exactly when a long-lived shell would otherwise cross its expiry.
+func (m *Model) beginCredRefresh() {
+	if m.credSrv == nil || m.credRefreshStop != nil {
+		return
+	}
+	// Captured on this goroutine; the renewal must not read Model fields concurrently.
+	r := m.renewal()
+	ctx, cancel := context.WithCancel(m.ctx)
+	m.credRefreshStop = cancel
+
+	go m.credSrv.KeepFresh(ctx, credCheckEvery, credRefreshLead,
+		func(ctx context.Context) (*awsint.Session, error) {
+			fresh, _, err := r.run(ctx)
+			return fresh, err
+		})
+}
+
+// endCredRefresh stops that renewal and adopts anything it produced, so the header reflects
+// renewals that happened while the screen was someone else's.
+func (m *Model) endCredRefresh() {
+	if m.credRefreshStop != nil {
+		m.credRefreshStop()
+		m.credRefreshStop = nil
+	}
+	if m.credSrv != nil {
+		if latest := m.credSrv.Session(); latest != nil {
+			m.awsSess = latest
+		}
+	}
+}
+
+// CredentialEndpoint hands the endpoint to a caller outside the TUI — `warren exec` and
+// `warren shell`, which run their command after the picker has quit. The returned stop function
+// halts renewal and closes the listener.
+func (m *Model) CredentialEndpoint() (env []string, stop func(), err error) {
+	env, err = m.credentialEnv()
+	if err != nil {
+		return nil, func() {}, err
+	}
+	m.beginCredRefresh()
+	return env, func() {
+		m.endCredRefresh()
+		if m.credSrv != nil {
+			_ = m.credSrv.Close()
+		}
+	}, nil
 }

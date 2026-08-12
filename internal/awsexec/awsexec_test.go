@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	awsint "github.com/treyperrone/postern/internal/aws"
+	awsint "github.com/treyperrone/warren/internal/aws"
 )
 
 func envMap(t *testing.T, pairs []string) map[string]string {
@@ -64,7 +64,7 @@ func TestEnvStripsInheritedAWSVariables(t *testing.T) {
 	}
 }
 
-// A stale label from an outer postern shell must not survive into a nested one, or the prompt
+// A stale label from an outer warren shell must not survive into a nested one, or the prompt
 // names the wrong account.
 func TestEnvReplacesStaleSessionLabel(t *testing.T) {
 	parent := []string{SessionLabelVar + "=old-account/OldRole"}
@@ -253,7 +253,7 @@ func TestCommandLineReportsFailure(t *testing.T) {
 }
 
 // AWS's own message is the authoritative explanation, so it has to arrive byte for byte —
-// error code, wording and all. Anything postern adds goes below it, never instead of it.
+// error code, wording and all. Anything warren adds goes below it, never instead of it.
 func TestCommandLineReportsAWSErrorVerbatim(t *testing.T) {
 	const awsErr = "An error occurred (InvalidAccessKeyId) when calling the ListBuckets " +
 		"operation: The AWS Access Key Id you provided does not exist in our records."
@@ -353,7 +353,7 @@ func TestRunRejectsEmptyArgv(t *testing.T) {
 func TestRunReportsMissingCommand(t *testing.T) {
 	// 127 is the shell convention for "command not found", which is what a caller chaining
 	// this in a script will expect.
-	code, err := Run(&awsint.Session{}, []string{"postern-no-such-binary-xyz"})
+	code, err := Run(&awsint.Session{}, []string{"warren-no-such-binary-xyz"})
 	if err == nil {
 		t.Error("missing command returned nil error")
 	}
@@ -363,7 +363,7 @@ func TestRunReportsMissingCommand(t *testing.T) {
 }
 
 // The wrapped command's exit code is its own to report: collapsing it to 0/1 would break
-// `postern exec -- aws ... && next`.
+// `warren exec -- aws ... && next`.
 func TestRunPropagatesExitCode(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("POSIX shell not available")
@@ -395,5 +395,53 @@ func TestRunInjectsCredentialsIntoChild(t *testing.T) {
 	}
 	if code != 0 {
 		t.Errorf("child did not see the injected credentials (exit %d)", code)
+	}
+}
+
+// The endpoint only works if the child is NOT also handed a copy of the keys: the SDK's
+// environment provider is consulted before the container provider, so a copy would win and pin the
+// child to credentials that can never be updated.
+func TestCredOverrideReplacesTheStaticKeys(t *testing.T) {
+	sess := &awsint.Session{
+		AccessKeyID: "AKIASTATIC", SecretAccessKey: "s", SessionToken: "t",
+		Region: "eu-west-2", Label: "crlab/AdminRole",
+	}
+	override := []string{
+		"AWS_CONTAINER_CREDENTIALS_FULL_URI=http://127.0.0.1:9/credentials",
+		"AWS_CONTAINER_AUTHORIZATION_TOKEN=tok",
+	}
+
+	got := envMap(t, Env([]string{"PATH=/usr/bin"}, sess, override...))
+
+	for _, banned := range []string{"AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN"} {
+		if _, ok := got[banned]; ok {
+			t.Errorf("%s survived alongside the endpoint and would take precedence", banned)
+		}
+	}
+	if got["AWS_CONTAINER_CREDENTIALS_FULL_URI"] == "" || got["AWS_CONTAINER_AUTHORIZATION_TOKEN"] != "tok" {
+		t.Errorf("endpoint variables missing: %v", got)
+	}
+	// Region and label are still needed either way.
+	if got["AWS_REGION"] != "eu-west-2" {
+		t.Errorf("AWS_REGION = %q, want eu-west-2", got["AWS_REGION"])
+	}
+	if got[SessionLabelVar] != "crlab/AdminRole" {
+		t.Errorf("%s = %q", SessionLabelVar, got[SessionLabelVar])
+	}
+}
+
+// A stale endpoint inherited from an outer warren must not compete with this one's.
+func TestEnvStripsInheritedEndpointVariables(t *testing.T) {
+	parent := []string{
+		"AWS_CONTAINER_CREDENTIALS_FULL_URI=http://127.0.0.1:1/old",
+		"AWS_CONTAINER_AUTHORIZATION_TOKEN=old-token",
+		"AWS_CONTAINER_CREDENTIALS_RELATIVE_URI=/old",
+	}
+	got := envMap(t, Env(parent, &awsint.Session{AccessKeyID: "AKIA", SecretAccessKey: "s"}))
+
+	for k := range got {
+		if strings.HasPrefix(k, "AWS_CONTAINER_") {
+			t.Errorf("inherited %s survived: %q", k, got[k])
+		}
 	}
 }

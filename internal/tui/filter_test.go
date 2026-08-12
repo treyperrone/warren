@@ -5,7 +5,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
-	awsint "github.com/treyperrone/postern/internal/aws"
+	awsint "github.com/treyperrone/warren/internal/aws"
 )
 
 // applySearch puts the list in the state "/term" plus enter leaves it in.

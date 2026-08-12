@@ -1,15 +1,15 @@
 package aws
 
 // End-to-end SSO checks against a REAL Identity Center instance. Skipped unless
-// POSTERN_E2E=1, because they need network, a browser (on whatever machine can reach one),
+// WARREN_E2E=1, because they need network, a browser (on whatever machine can reach one),
 // and a human to approve the device code.
 //
-//	POSTERN_E2E=1 go test ./internal/aws/ -run TestE2E -v -count=1 -timeout 15m
+//	WARREN_E2E=1 go test ./internal/aws/ -run TestE2E -v -count=1 -timeout 15m
 //
-// Optional: POSTERN_SSO=<session-name> to pick a specific [sso-session]; defaults to the
+// Optional: WARREN_SSO=<session-name> to pick a specific [sso-session]; defaults to the
 // first one in ~/.aws/config.
 //
-// These use your real HOME. They only ever write postern-*.json in the SSO cache, never a
+// These use your real HOME. They only ever write warren-*.json in the SSO cache, never a
 // file the AWS CLI owns.
 
 import (
@@ -34,12 +34,12 @@ func redact(s string) string {
 
 // ourCachePath is where writeRecord puts things, recomputed so the test can age a token.
 func ourCachePath(startURL string) string {
-	return filepath.Join(ssoCacheDir(), fmt.Sprintf("postern-%x.json", hashString(startURL)))
+	return filepath.Join(ssoCacheDir(), fmt.Sprintf("warren-%x.json", hashString(startURL)))
 }
 
 func TestE2E(t *testing.T) {
-	if os.Getenv("POSTERN_E2E") == "" {
-		t.Skip("set POSTERN_E2E=1 to run (needs a real Identity Center instance + browser)")
+	if os.Getenv("WARREN_E2E") == "" {
+		t.Skip("set WARREN_E2E=1 to run (needs a real Identity Center instance + browser)")
 	}
 
 	sessions, profiles, err := ParseConfig()
@@ -52,7 +52,7 @@ func TestE2E(t *testing.T) {
 	}
 
 	sess := sessions[0]
-	if want := os.Getenv("POSTERN_SSO"); want != "" {
+	if want := os.Getenv("WARREN_SSO"); want != "" {
 		found := false
 		for _, s := range sessions {
 			if s.Name == want {
@@ -126,7 +126,7 @@ func TestE2E(t *testing.T) {
 		path := ourCachePath(sess.StartURL)
 		raw, err := os.ReadFile(path)
 		if err != nil {
-			t.Skipf("no postern cache file yet (%v) — run the login subtest first", err)
+			t.Skipf("no warren cache file yet (%v) — run the login subtest first", err)
 		}
 		var rec tokenRecord
 		if err := json.Unmarshal(raw, &rec); err != nil {

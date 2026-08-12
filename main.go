@@ -8,26 +8,27 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
-	"github.com/treyperrone/postern/internal/awsexec"
-	"github.com/treyperrone/postern/internal/buildinfo"
-	"github.com/treyperrone/postern/internal/pathhint"
-	"github.com/treyperrone/postern/internal/tui"
+	"github.com/treyperrone/warren/internal/awsexec"
+	"github.com/treyperrone/warren/internal/buildinfo"
+	"github.com/treyperrone/warren/internal/pathhint"
+	"github.com/treyperrone/warren/internal/plugin"
+	"github.com/treyperrone/warren/internal/tui"
 )
 
-const usage = `postern — browse AWS accounts and connect to EC2 instances over SSM.
+const usage = `warren — browse AWS accounts and connect to EC2 instances over SSM.
 
 usage:
-  postern                  launch the interactive picker
-  postern exec -- <cmd>    pick an account and role, then run <cmd> with its credentials
-  postern shell            pick an account and role, then open a shell with its credentials
-  postern setup            add an [sso-session] block to ~/.aws/config
-  postern version          print the version and exit
-  postern help             print this message and exit
+  warren                  launch the interactive picker
+  warren exec -- <cmd>    pick an account and role, then run <cmd> with its credentials
+  warren shell            pick an account and role, then open a shell with its credentials
+  warren setup            add an [sso-session] block to ~/.aws/config
+  warren version          print the version and exit
+  warren help             print this message and exit
 
 examples:
-  postern exec -- aws s3 ls
-  postern exec -- aws ec2 describe-instances --query 'Reservations[].Instances[].Tags'
-  postern shell
+  warren exec -- aws s3 ls
+  warren exec -- aws ec2 describe-instances --query 'Reservations[].Instances[].Tags'
+  warren shell
 `
 
 // mode is what to do once the picker has produced credentials.
@@ -59,7 +60,7 @@ func main() {
 	opts := []tea.ProgramOption{tea.WithAltScreen()}
 	if run.mode != modeTUI {
 		// The picker must not write to stdout in these modes: stdout belongs to the command
-		// being wrapped, so `postern exec -- aws s3 ls | grep foo` would otherwise pipe
+		// being wrapped, so `warren exec -- aws s3 ls | grep foo` would otherwise pipe
 		// terminal control sequences into grep.
 		m.StartCredsMode()
 		opts = append(opts, tea.WithOutput(os.Stderr))
@@ -103,9 +104,12 @@ func parseArgs() invocation {
 
 	switch os.Args[1] {
 	case "version", "--version", "-v":
-		// No PATH hint here: version output should stay a single parseable line for
-		// anything scripting against it.
+		// warren's own version stays alone on the first line, so `warren version | head -1` and
+		// anything scraping it keep working. The plugin version belongs here too: it is half of
+		// what identifies a session's behaviour, and "which plugin version?" is the first thing
+		// asked about an SSM problem. No PATH hint — that would be a third line of noise.
 		fmt.Println(buildinfo.Version())
+		fmt.Printf("session-manager-plugin %s (built from source)\n", plugin.Version())
 		os.Exit(0)
 
 	case "help", "--help", "-h":
@@ -128,7 +132,7 @@ func parseArgs() invocation {
 			argv = argv[1:]
 		}
 		if len(argv) == 0 {
-			fmt.Fprintf(os.Stderr, "exec needs a command to run, e.g. postern exec -- aws s3 ls\n\n%s", usage)
+			fmt.Fprintf(os.Stderr, "exec needs a command to run, e.g. warren exec -- aws s3 ls\n\n%s", usage)
 			os.Exit(2)
 		}
 		return invocation{mode: modeExec, argv: argv}
@@ -160,7 +164,19 @@ func runWithCreds(m *tui.Model, run invocation) int {
 		fmt.Fprintf(os.Stderr, "%s is set; exit the shell to return.\n", awsexec.SessionLabelVar)
 	}
 
-	code, err := awsexec.Run(sess, run.argv)
+	// Serve credentials over loopback rather than handing the child a copy, so a shell that
+	// outlives its credentials keeps working instead of failing at the one-hour mark. If the
+	// endpoint cannot start, fall back to the copy: a frozen hour beats not running at all.
+	var credEnv []string
+	if env, stop, err := m.CredentialEndpoint(); err == nil {
+		credEnv = env
+		defer stop()
+	} else {
+		fmt.Fprintf(os.Stderr, "note: credential endpoint unavailable (%v); "+
+			"credentials will not renew inside this process\n", err)
+	}
+
+	code, err := awsexec.Run(sess, run.argv, credEnv...)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 	}

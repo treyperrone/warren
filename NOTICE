@@ -1,0 +1,19 @@
+warren
+Copyright 2026 Trey Perrone
+
+Licensed under the Apache License, Version 2.0 (the "License"); see the LICENSE
+file in this distribution, or http://www.apache.org/licenses/LICENSE-2.0
+
+--------------------------------------------------------------------------------
+
+This product embeds the AWS Session Manager Plugin:
+
+    Session Manager Plugin
+    Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+
+The Session Manager Plugin is licensed under the Apache License, Version 2.0.
+Its source is at https://github.com/aws/session-manager-plugin, and the binaries
+embedded here are built from that source, unmodified, at a tagged release.
+
+See THIRD-PARTY-NOTICES.md for the embedded version and for the notices of the
+third-party software the plugin itself includes.

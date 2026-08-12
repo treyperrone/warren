@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"time"
@@ -12,12 +13,14 @@ import (
 	"github.com/charmbracelet/bubbles/list"
 	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/textinput"
+	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
-	awsint "github.com/treyperrone/postern/internal/aws"
-	"github.com/treyperrone/postern/internal/buildinfo"
-	"github.com/treyperrone/postern/internal/tunnel"
+	awsint "github.com/treyperrone/warren/internal/aws"
+	"github.com/treyperrone/warren/internal/buildinfo"
+	"github.com/treyperrone/warren/internal/credserver"
+	"github.com/treyperrone/warren/internal/tunnel"
 )
 
 // ---- screens ---------------------------------------------------------------
@@ -40,6 +43,7 @@ const (
 	screenBuildService // command builder: pick a service
 	screenBuildTask    // command builder: pick a task within that service
 	screenBuildParams  // command builder: fill in parameters and run
+	screenAbout        // version, keys, and where to report a problem
 )
 
 // ---- list plumbing ---------------------------------------------------------
@@ -125,10 +129,9 @@ type msgError struct{ err error }
 // ---- styles ----------------------------------------------------------------
 
 var (
-	styleTitle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("6"))
-	styleErr    = lipgloss.NewStyle().Foreground(lipgloss.Color("1"))
-	stylePrompt = lipgloss.NewStyle().Foreground(lipgloss.Color("3"))
-	styleDim    = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
+	styleTitle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("6"))
+	styleErr   = lipgloss.NewStyle().Foreground(lipgloss.Color("1"))
+	styleDim   = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
 )
 
 // ---- model -----------------------------------------------------------------
@@ -173,7 +176,7 @@ type Model struct {
 	builder builder
 
 	// credsOnly stops the flow once credentials are resolved, instead of going on to list
-	// instances. `postern exec` and `postern shell` want an account and a role and nothing
+	// instances. `warren exec` and `warren shell` want an account and a role and nothing
 	// after that — API access has no instance to pick.
 	credsOnly bool
 
@@ -181,9 +184,20 @@ type Model struct {
 	refreshingCreds bool
 	credRefreshErr  error
 
-	// splashDone is one-way: the wordmark is a greeting, so once dismissed it stays dismissed
-	// even if you navigate back to the opening screen.
-	splashDone bool
+	// credSrv serves credentials to child processes over loopback, so a shell is not stuck with
+	// the copy it started with. Started on first use, not at launch.
+	credSrv *credserver.Server
+	// credRefreshStop halts the endpoint's own renewal goroutine, which covers the window where
+	// a child holds the terminal and the event loop cannot tick.
+	credRefreshStop context.CancelFunc
+
+	// aboutReturn is the screen "?" was pressed on, so esc goes back to it rather than to a
+	// fixed screen. Reachable from anywhere means there is no single sensible place to return to.
+	aboutReturn screen
+	// aboutVP scrolls the about screen. Its content is taller than a 24-row terminal, and without
+	// this the top — including the warren version, the single most useful line on it — scrolled
+	// off the screen with no way to get it back.
+	aboutVP viewport.Model
 }
 
 func New(ctx context.Context) (*Model, error) {
@@ -270,6 +284,15 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width, m.height = msg.Width, msg.Height
 		m.resizeList()
 
+	case tea.MouseMsg:
+		// Only the about screen scrolls, and mouse reporting is only enabled while it is up.
+		if m.screen == screenAbout {
+			var cmd tea.Cmd
+			m.aboutVP, cmd = m.aboutVP.Update(msg)
+			return m, cmd
+		}
+		return m, nil
+
 	case tea.KeyMsg:
 		if msg.String() == "ctrl+c" {
 			return m, tea.Quit
@@ -289,6 +312,32 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.err != nil {
 			m.err = nil
 			return m, nil
+		}
+		// The about screen is a dead end by design: it takes no action, so anything that means
+		// "I am done here" should leave it.
+		if m.screen == screenAbout {
+			switch msg.String() {
+			case "esc", "q", AboutKey, "enter":
+				m.screen = m.aboutReturn
+				return m, tea.DisableMouse
+			}
+			// Everything else goes to the viewport, which owns up/down/pgup/pgdn/home/end.
+			var cmd tea.Cmd
+			m.aboutVP, cmd = m.aboutVP.Update(msg)
+			return m, cmd
+		}
+		// Open it from any list screen. Checked before the list gets the key because bubbles
+		// binds "?" to its own full-help toggle, which would swallow it.
+		if msg.String() == AboutKey && !m.list.SettingFilter() {
+			m.aboutReturn = m.screen
+			m.screen = screenAbout
+			m.resizeAbout()
+			m.aboutVP.GotoTop()
+			// Mouse reporting is turned on for this screen alone, and off again on the way out.
+			// Enabling it for the whole program would take click-drag text selection away from
+			// the terminal everywhere — and copying an account ID, an instance ID or a built
+			// command out of a list is worth more than wheel scrolling on a reference screen.
+			return m, tea.EnableMouseCellMotion
 		}
 		// While the search input has focus, every keystroke belongs to it. Without this
 		// guard the shortcuts below eat them: "esc" navigates back instead of cancelling
@@ -385,6 +434,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case msgCredsShellDone:
 		// Back to the action list, not the tunnel manager: you were doing API work, and the
 		// likely next step is another command, not a connection.
+		m.endCredRefresh()
 		m.buildActionList()
 		m.screen = screenAction
 		return m, nil
@@ -392,6 +442,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case msgBuildDone:
 		// Stay on the parameter screen: the usual next step is the same query with a
 		// different value, or the same command with an edit.
+		m.endCredRefresh()
 		return m, textinput.Blink
 
 	case msgInstances:
@@ -688,9 +739,21 @@ func (m *Model) buildShellCmd() *exec.Cmd {
 	return m.wrapWithHeader(cmd, m.selInstance.Name)
 }
 
-// wrapWithHeader tries to wrap cmd in a tmux session with a persistent purple
-// status bar. If tmux is not available it falls back to a plain header print.
-// On Windows it returns cmd unchanged.
+// TmuxVar controls whether SSM sessions run inside tmux, which is what keeps the banner pinned
+// instead of scrolling away when the remote shell clears the screen. Set it to "0" to disable.
+//
+// Enabled by default where tmux is available, having briefly not been. The reason it was disabled
+// was not tmux but how it was invoked: the session was created detached and `tmux attach-session`
+// was run as the foreground command, so the terminal became a client whose lifetime was tied to a
+// session it did not own. Exiting the remote shell destroyed the session and took the client with
+// it, which on an SSH login reads as the terminal being killed. Running new-session in the
+// foreground on a private socket fixes that properly, so the banner does not have to be given up
+// to keep exits well behaved.
+const TmuxVar = "WARREN_TMUX"
+
+// wrapWithHeader runs the session inside tmux so the banner stays pinned as a status bar, falling
+// back to printing a header line when tmux is unavailable, disabled, or cannot be set up. On
+// Windows it returns cmd unchanged.
 func (m *Model) wrapWithHeader(cmd *exec.Cmd, instanceName string) *exec.Cmd {
 	if runtime.GOOS == "windows" {
 		return cmd
@@ -701,87 +764,135 @@ func (m *Model) wrapWithHeader(cmd *exec.Cmd, instanceName string) *exec.Cmd {
 		authLabel = m.awsSess.Label
 	}
 
-	tmuxBin, err := exec.LookPath("tmux")
-	if err == nil {
-		return m.wrapWithTmux(tmuxBin, cmd, instanceName, authLabel)
+	// Never nest. A foreground new-session has to attach a client, and tmux refuses while $TMUX
+	// is set ("sessions should be nested with care, unset $TMUX to force"). Inside tmux the user
+	// already has a status line of their own, so there is nothing to add.
+	if os.Getenv(TmuxVar) != "0" && os.Getenv("TMUX") == "" {
+		if tmuxBin, err := exec.LookPath("tmux"); err == nil {
+			if wrapped := m.wrapWithTmux(tmuxBin, cmd, instanceName, authLabel); wrapped != nil {
+				return wrapped
+			}
+		}
 	}
 
-	// tmux not available — print a header line and accept it may scroll
+	// Print a header line and accept it may scroll.
 	const script = `
-printf '\033]0;postern · %s · %s\007' "$_POSTERN_INSTANCE" "$_POSTERN_AUTH"
-printf '\033[1;48;5;63;38;5;230m ▶ postern  \033[38;5;99m│  \033[38;5;189m%s  \033[38;5;99m│  \033[38;5;189m%s\033[0m\n' "$_POSTERN_AUTH" "$_POSTERN_INSTANCE"
-"$_POSTERN_BIN" "$@"
+printf '\033]0;warren · %s · %s\007' "$_WARREN_INSTANCE" "$_WARREN_AUTH"
+printf '\033[1;48;5;63;38;5;230m ▶ warren  \033[38;5;99m│  \033[38;5;189m%s  \033[38;5;99m│  \033[38;5;189m%s\033[0m\n' "$_WARREN_AUTH" "$_WARREN_INSTANCE"
+"$_WARREN_BIN" "$@"
 `
-	args := append([]string{"/bin/sh", "-c", script, "postern"}, cmd.Args[1:]...)
+	args := append([]string{"/bin/sh", "-c", script, "warren"}, cmd.Args[1:]...)
 	wrapped := exec.Command(args[0], args[1:]...)
 	wrapped.Env = append(cmd.Env,
-		"_POSTERN_BIN="+cmd.Path,
-		"_POSTERN_AUTH="+authLabel,
-		"_POSTERN_INSTANCE="+instanceName,
+		"_WARREN_BIN="+cmd.Path,
+		"_WARREN_AUTH="+authLabel,
+		"_WARREN_INSTANCE="+instanceName,
 	)
 	return wrapped
 }
 
-// wrapWithTmux creates a named tmux session running cmd and attaches to it.
-// The tmux status bar shows the persistent purple banner, immune to remote
-// shell resets. The session is destroyed on detach/exit.
-func (m *Model) wrapWithTmux(tmuxBin string, cmd *exec.Cmd, instanceName, authLabel string) *exec.Cmd {
-	sessionName := fmt.Sprintf("postern-%d", os.Getpid())
+// tmuxSocketName is the private tmux socket warren runs its sessions on.
+//
+// A socket of our own (-L) rather than the user's default server, for three reasons: warren's
+// session never appears in their `tmux ls`, killing it can never touch their work, and -f is
+// honoured — tmux only reads a config file when it actually starts a server, so on a shared server
+// the status bar settings would be silently ignored.
+func tmuxSocketName() string { return fmt.Sprintf("warren-%d", os.Getpid()) }
 
-	// Build the inner command string: set env vars then exec the plugin.
-	// We use env(1) to pass the plugin args cleanly without shell quoting issues.
-	innerEnv := ""
-	for _, e := range cmd.Env {
-		// only pass the SSM-specific vars we set; inherit the rest via tmux.
-		// POSTERN_ is included so a credentialed shell can still name its own session in a
-		// prompt — the attach command below replaces the environment wholesale, so anything
-		// not exported here is lost.
-		if strings.HasPrefix(e, "AWS_") || strings.HasPrefix(e, "POSTERN_") {
-			innerEnv += "export " + e + "; "
+// tmuxNewSessionArgs builds the argv for a foreground `tmux new-session`, passing the environment
+// through -e and the command as argv after "--".
+//
+// Foreground, and no attach-session. The previous version created the session detached and then
+// ran `tmux attach-session` as the foreground command, which made the terminal a tmux client whose
+// lifetime was tied to a session it did not own: exiting the remote shell destroyed the session and
+// took the client with it, which on an SSH login reads as the terminal being killed rather than as
+// a return to the picker. Running new-session in the foreground means the command warren waits on
+// *is* the session, so it ends when the plugin ends and control comes back here.
+//
+// Also deliberately not a shell command string. tmux hands a single trailing argument to
+// /bin/sh -c, and an older version built one by concatenating "export "+e+"; " with arguments
+// wrapped in single quotes on the assumption none contained a quote. That put AWS-derived values
+// on a shell boundary: a profile name containing a space was enough to break it, and Session.Label
+// is always "name (account-id)/role" — a space and parentheses. Passing argv directly means
+// nothing here is re-parsed by a shell, whatever the values contain.
+//
+// height is passed already adjusted for the status bar.
+func tmuxNewSessionArgs(socket, confPath string, width, height int, env, argv []string) []string {
+	args := []string{
+		"-L", socket,
+		"-f", confPath,
+		"new-session",
+		"-x", fmt.Sprintf("%d", width),
+		"-y", fmt.Sprintf("%d", height),
+	}
+	for _, e := range env {
+		// Only the SSM-specific vars we set; the rest are inherited. WARREN_ is included so a
+		// credentialed shell can still name its own session in a prompt.
+		if strings.HasPrefix(e, "AWS_") || strings.HasPrefix(e, "WARREN_") {
+			args = append(args, "-e", e)
 		}
 	}
-	// Build plugin arg list safe for single-quoted shell embedding.
-	// The JSON blobs contain no single-quotes so this is safe.
-	quotedArgs := ""
-	for _, a := range cmd.Args {
-		quotedArgs += "'" + a + "' "
-	}
-	innerCmd := innerEnv + quotedArgs
+	return append(append(args, "--"), argv...)
+}
 
-	statusText := fmt.Sprintf(" ▶ postern  │  %s  │  %s ", authLabel, instanceName)
+// tmuxConf is the config that paints the status bar. It is a file rather than a series of
+// set-option calls because those need a session to target, which is what forced the old
+// create-detached-then-attach sequence in the first place.
+//
+// "#" is doubled: tmux reads it as the start of a format specifier like #S or #{session_name}, so
+// an account or instance name containing one would render as something else entirely, or eat the
+// text after it.
+func tmuxConf(authLabel, instanceName string) string {
+	esc := func(s string) string { return strings.ReplaceAll(s, "#", "##") }
+	return fmt.Sprintf(`set -g status on
+set -g status-position bottom
+set -g status-style "bg=colour63,fg=colour230,bold"
+set -g status-left " ▶ warren  │  %s  │  %s "
+set -g status-right ""
+set -g status-left-length 200
+set -g destroy-unattached off
+`, esc(authLabel), esc(instanceName))
+}
 
-	// new-session runs the plugin, then destroy-session on exit so attach returns.
-	newSession := exec.Command(tmuxBin,
-		"new-session", "-d",
-		"-s", sessionName,
-		"-x", fmt.Sprintf("%d", m.width),
-		"-y", fmt.Sprintf("%d", m.height-1), // -1 for status bar
-		innerCmd,
-	)
-	newSession.Env = cmd.Env
-	if err := newSession.Run(); err != nil {
-		// fallback: just run cmd directly
-		return cmd
-	}
-
-	// Configure status bar: bottom, purple, fixed text.
-	for _, args := range [][]string{
-		{"set-option", "-t", sessionName, "status", "on"},
-		{"set-option", "-t", sessionName, "status-position", "bottom"},
-		{"set-option", "-t", sessionName, "status-style", "bg=colour63,fg=colour230,bold"},
-		{"set-option", "-t", sessionName, "status-left", statusText},
-		{"set-option", "-t", sessionName, "status-right", ""},
-		{"set-option", "-t", sessionName, "status-left-length", "200"},
-		// destroy session automatically when the plugin exits
-		{"set-option", "-t", sessionName, "remain-on-exit", "off"},
-	} {
-		_ = exec.Command(tmuxBin, args...).Run()
+// wrapWithTmux runs cmd inside a foreground tmux session whose status bar carries the warren
+// banner, so it stays pinned instead of scrolling away when the remote shell clears the screen.
+//
+// Returns nil if the session cannot be prepared, leaving the caller to fall back to the plain
+// header. Nothing is run here — the returned command is what tea.ExecProcess executes — so unlike
+// the old version there is no half-created session to leave behind when something goes wrong.
+func (m *Model) wrapWithTmux(tmuxBin string, cmd *exec.Cmd, instanceName, authLabel string) *exec.Cmd {
+	confPath, err := writeTmuxConf(tmuxConf(authLabel, instanceName))
+	if err != nil {
+		return nil
 	}
 
-	// attach-session is what tea.ExecProcess will run foreground.
-	attach := exec.Command(tmuxBin, "attach-session", "-t", sessionName)
-	attach.Env = os.Environ()
-	return attach
+	// -1 on the height leaves the row the status bar occupies.
+	args := tmuxNewSessionArgs(tmuxSocketName(), confPath, m.width, m.height-1, cmd.Env, cmd.Args)
+	wrapped := exec.Command(tmuxBin, args...)
+	wrapped.Env = cmd.Env
+	return wrapped
+}
+
+// writeTmuxConf writes the status-bar config and returns its path.
+//
+// It goes in the user's cache directory under a fixed name, not a temp file: the command is run by
+// tea.ExecProcess after this returns, so there is no point at which we could safely delete a temp
+// file, and a per-session one would accumulate. A fixed path is simply overwritten each time. 0600
+// because the banner text contains the account name and ID.
+func writeTmuxConf(conf string) (string, error) {
+	base, err := os.UserCacheDir()
+	if err != nil {
+		return "", err
+	}
+	dir := filepath.Join(base, "warren")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", err
+	}
+	path := filepath.Join(dir, "tmux.conf")
+	if err := os.WriteFile(path, []byte(conf), 0o600); err != nil {
+		return "", err
+	}
+	return path, nil
 }
 
 func (m *Model) startSSH(user string) tea.Cmd {
@@ -1064,16 +1175,19 @@ var (
 	styleBannerSep  = lipgloss.NewStyle().Background(lipgloss.Color("63")).Foreground(lipgloss.Color("99")).PaddingLeft(1).PaddingRight(1)
 	styleBannerFill = lipgloss.NewStyle().Background(lipgloss.Color("63"))
 	styleBannerVer  = lipgloss.NewStyle().Background(lipgloss.Color("63")).Foreground(lipgloss.Color("104")).PaddingRight(1)
+	// The hint carries the same weight and brightness as the tool name. Dim was the obvious
+	// choice and the wrong one: it read as decoration and went unnoticed, which defeats the
+	// entire point of advertising a key nobody would otherwise guess.
+	styleBannerHint = lipgloss.NewStyle().Background(lipgloss.Color("63")).Foreground(lipgloss.Color("230")).Bold(true).PaddingLeft(1).PaddingRight(1)
 )
 
 // ---- view ------------------------------------------------------------------
 
 func (m *Model) View() string {
-	// Retire the wordmark the first time something other than the opening screen is drawn, and
-	// give the list back the rows it was holding. Done here rather than at each screen
+	// Size the list for whatever this screen looks like: the wordmark is on some screens and not
+	// others, so the rows available to the list change as you move. Done here rather than at each
 	// transition because there are a dozen of those and every one of them ends in a draw.
-	if !m.splashDone && m.screen != screenMethod && m.screen != screenSetup {
-		m.splashDone = true
+	if m.width > 0 {
 		m.resizeList()
 	}
 
@@ -1082,6 +1196,12 @@ func (m *Model) View() string {
 	}
 	if m.screen == screenBuildParams {
 		return m.banner() + m.builder.view(m.width)
+	}
+	if m.screen == screenAbout {
+		m.resizeAbout()
+		scrollable := m.aboutVP.TotalLineCount() > m.aboutVP.Height
+		return m.banner() + m.aboutVP.View() + "\n" +
+			aboutFooter(scrollable, m.aboutVP.AtBottom())
 	}
 	if m.loading {
 		return m.banner() + fmt.Sprintf("\n  %s loading...\n", m.spin.View())
@@ -1113,16 +1233,50 @@ func (m *Model) banner() string {
 		row = m.bannerRow(false)
 	}
 
-	// fill remaining width with banner background
+	// Fill the rest of the row with banner background, parking the "? help" hint at the right
+	// edge when it fits.
+	//
+	// The hint lives here because the banner is the one row present on every screen and it already
+	// ends in dead space — so discoverability costs nothing, where a footer line would cost a row
+	// off the list on every screen. Without it "?" is a key nobody presses, which makes a screen
+	// whose whole job is telling you the keys unreachable in practice.
 	if visibleLen := lipgloss.Width(row); m.width > visibleLen {
-		row += styleBannerFill.Render(strings.Repeat(" ", m.width-visibleLen))
+		fill := m.width - visibleLen
+		rendered := ""
+		if hint := m.bannerHint(); hint != "" {
+			rendered = styleBannerHint.Render(hint)
+		}
+		// Measure the *rendered* hint, not the string: the style pads a column either side,
+		// so measuring "? help" undercounts by two and the row overflows into a second line —
+		// the same failure the version guard above exists to avoid. Below that width the identity
+		// on the left matters more, so the hint is dropped rather than crowding it.
+		if hw := lipgloss.Width(rendered); rendered != "" && fill >= hw {
+			row += styleBannerFill.Render(strings.Repeat(" ", fill-hw)) + rendered
+		} else {
+			row += styleBannerFill.Render(strings.Repeat(" ", fill))
+		}
 	}
 
 	return row + "\n"
 }
 
+// bannerHint is the right-hand nudge in the banner: how you find out that "?" exists.
+func (m *Model) bannerHint() string {
+	switch {
+	// Pointless on the help screen itself — "?" closes it, and the screen already says so.
+	case m.screen == screenAbout:
+		return ""
+	// Text-entry screens have their own instructions and a "?" there is a literal character,
+	// so advertising it as a shortcut would be a lie.
+	case m.screen == screenSetup, m.screen == screenBuildParams:
+		return ""
+	default:
+		return "? help"
+	}
+}
+
 func (m *Model) bannerRow(withVersion bool) string {
-	title := styleBanner.Render("▶ postern")
+	title := styleBanner.Render("▶ warren")
 	sep := styleBannerSep.Render("│")
 
 	var parts []string

@@ -1,8 +1,8 @@
-// Package pathhint tells the user how to put postern on their PATH.
+// Package pathhint tells the user how to put warren on their PATH.
 //
 // `go install` has no post-install hook — a module cannot print anything once the toolchain
 // has copied the binary into GOPATH/bin — and that directory is not on PATH by default. The
-// result is `zsh: command not found: postern` immediately after a successful install. The
+// result is `zsh: command not found: warren` immediately after a successful install. The
 // only place left to say something useful is the binary itself, at runtime.
 package pathhint
 
@@ -22,7 +22,7 @@ func Hint() string {
 
 	name := filepath.Base(os.Args[0])
 	if name == "." || name == string(filepath.Separator) {
-		name = "postern"
+		name = "warren"
 	}
 
 	line, reload := shellAdvice(dir)

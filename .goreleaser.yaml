@@ -1,6 +1,6 @@
 version: 2
 
-project_name: postern
+project_name: warren
 
 before:
   hooks:
@@ -19,11 +19,15 @@ builds:
     ignore:
       - goos: windows
         goarch: arm64
+    # -trimpath keeps build-machine paths out of the binary: without it the release carried
+    # 366 copies of the developer's home directory, and builds were not reproducible.
+    flags:
+      - -trimpath
     ldflags:
       # .Tag, not .Version — .Version strips the leading "v", and the version
-      # `postern version` prints should match what `go install ...@v0.1.4`
+      # `warren version` prints should match what `go install ...@v1.0.0`
       # asks for and what the release page lists.
-      - -s -w -X github.com/treyperrone/postern/internal/buildinfo.version={{ .Tag }}
+      - -s -w -X github.com/treyperrone/warren/internal/buildinfo.version={{ .Tag }}
 
 archives:
   # `formats` (plural), not the deprecated `format` — `goreleaser check` fails on the old
@@ -32,9 +36,17 @@ archives:
     format_overrides:
       - goos: windows
         formats: [zip]
-    # Keep this template stable: these names are what the v0.1.0/v0.1.2 assets already use,
-    # so install instructions and checksums stay valid across releases.
+    # Keep this template stable once the first release is out: these names are what install
+    # instructions and checksums refer to, so changing them invalidates both.
     name_template: "{{ .ProjectName }}_{{ .Os }}_{{ .Arch }}"
+    # Specifying `files` replaces goreleaser's defaults (LICENSE*/README*/CHANGELOG*) rather
+    # than adding to them, so those are relisted here. NOTICE is the one that matters: Apache-2.0
+    # §4(d) is satisfied by shipping it with the distribution, and it is not a default.
+    files:
+      - LICENSE
+      - NOTICE
+      - THIRD-PARTY-NOTICES.md
+      - README.md
 
 checksum:
   name_template: checksums.txt

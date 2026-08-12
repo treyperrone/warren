@@ -15,7 +15,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/ssm"
-	"github.com/treyperrone/postern/internal/plugin"
+	"github.com/treyperrone/warren/internal/plugin"
 )
 
 type Kind string
@@ -93,7 +93,7 @@ type persistEntry struct {
 }
 
 func NewManager() *Manager {
-	f := filepath.Join(os.Getenv("HOME"), ".postern_sessions.json")
+	f := filepath.Join(os.Getenv("HOME"), ".warren_sessions.json")
 	m := &Manager{file: f}
 	m.load()
 	return m

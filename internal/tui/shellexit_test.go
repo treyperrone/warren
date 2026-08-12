@@ -5,7 +5,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
-	awsint "github.com/treyperrone/postern/internal/aws"
+	awsint "github.com/treyperrone/warren/internal/aws"
 )
 
 func mainScreenModel(t *testing.T) *Model {

@@ -17,27 +17,39 @@ func (s *Session) Creds() (accessKey, secretKey, sessionToken, region string) {
 // is built on, reports partial credentials rather than falling through to the next provider,
 // so emitting `AWS_ACCESS_KEY_ID=` would break the very command this is meant to enable.
 func (s *Session) Env() []string {
-	var env []string
+	return append(s.CredentialEnv(), s.RegionEnv()...)
+}
 
+// CredentialEnv is only the part that answers "who am I". It is separate from RegionEnv because a
+// caller serving credentials from an endpoint must replace this and keep the region: the SDK's
+// environment provider is consulted before the endpoint, so leaving these in would pin a child to
+// a frozen copy and make the endpoint pointless.
+func (s *Session) CredentialEnv() []string {
 	if s.AccessKeyID != "" {
-		env = append(env,
-			"AWS_ACCESS_KEY_ID="+s.AccessKeyID,
-			"AWS_SECRET_ACCESS_KEY="+s.SecretAccessKey,
-			"AWS_SESSION_TOKEN="+s.SessionToken,
-		)
-	} else if s.ProfileName != "" {
-		env = append(env, "AWS_PROFILE="+s.ProfileName)
+		return []string{
+			"AWS_ACCESS_KEY_ID=" + s.AccessKeyID,
+			"AWS_SECRET_ACCESS_KEY=" + s.SecretAccessKey,
+			"AWS_SESSION_TOKEN=" + s.SessionToken,
+		}
 	}
+	if s.ProfileName != "" {
+		return []string{"AWS_PROFILE=" + s.ProfileName}
+	}
+	return nil
+}
 
-	// Same reasoning as above: an empty region is worse than an unset one, since it
-	// suppresses the region the profile or the SDK would otherwise supply.
-	if s.Region != "" {
-		env = append(env,
-			"AWS_DEFAULT_REGION="+s.Region,
-			"AWS_REGION="+s.Region,
-		)
+// RegionEnv names the region, if one is known.
+//
+// Same reasoning as CredentialEnv's empty-value guard: an empty region is worse than an unset one,
+// since it suppresses the region the profile or the SDK would otherwise supply.
+func (s *Session) RegionEnv() []string {
+	if s.Region == "" {
+		return nil
 	}
-	return env
+	return []string{
+		"AWS_DEFAULT_REGION=" + s.Region,
+		"AWS_REGION=" + s.Region,
+	}
 }
 
 // EnvKeys lists every variable Env may set. Callers building a child environment strip these
@@ -51,6 +63,11 @@ func EnvKeys() []string {
 		"AWS_PROFILE",
 		"AWS_DEFAULT_REGION",
 		"AWS_REGION",
+		// Not set by Env, but stripped for the same reason: a stale endpoint inherited from an
+		// outer warren would otherwise compete with whatever this one supplies.
+		"AWS_CONTAINER_CREDENTIALS_FULL_URI",
+		"AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+		"AWS_CONTAINER_AUTHORIZATION_TOKEN",
 	}
 }
 

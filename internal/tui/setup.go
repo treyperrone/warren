@@ -9,7 +9,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
-	awsint "github.com/treyperrone/postern/internal/aws"
+	awsint "github.com/treyperrone/warren/internal/aws"
 )
 
 // Field order in the setup form.
@@ -135,7 +135,7 @@ func (f *setupForm) view(width int) string {
 	b.WriteString(styleFormHint.Width(width-4).MarginLeft(2).Render(
 		"Name and start URL are required; the region is prefilled. This is appended to "+
 			"~/.aws/config as an [sso-session] block — nothing already in the file is "+
-			"modified, and a .postern.bak copy is taken first.") + "\n\n")
+			"modified, and a .warren.bak copy is taken first.") + "\n\n")
 
 	labels := f.labels()
 	for i := range f.inputs {
@@ -242,7 +242,7 @@ func (m *Model) selectRegion(region string) tea.Cmd {
 }
 
 // StartSetup opens the form over whatever is currently on screen. Used by the method
-// screen's "+ Add SSO session" row and by the `postern setup` subcommand.
+// screen's "+ Add SSO session" row and by the `warren setup` subcommand.
 func (m *Model) StartSetup() tea.Cmd {
 	m.setup = newSetupForm()
 	m.setup.cancelable = true

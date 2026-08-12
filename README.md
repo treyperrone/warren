@@ -1,49 +1,64 @@
-# postern
+# warren
+
+[![ci](https://github.com/treyperrone/warren/actions/workflows/ci.yml/badge.svg)](https://github.com/treyperrone/warren/actions/workflows/ci.yml)
+[![codeql](https://github.com/treyperrone/warren/actions/workflows/codeql.yml/badge.svg)](https://github.com/treyperrone/warren/actions/workflows/codeql.yml)
 
 A single Go binary for browsing AWS accounts/roles via IAM Identity Center (SSO)
 and opening SSM sessions — interactive shells, SSH tunnels, or RDP tunnels —
 without needing the `aws` CLI, `session-manager-plugin` installed separately,
 `fzf`, or `jq`.
 
-## Why "postern"
+## Why "warren"
 
-> **postern** *(n.)* — a small secondary gate set into the wall of a fortified place, used for quiet comings and goings rather than the main entrance. From Late Latin *posterula*, "the little back one."
+> **warren** *(n.)* — a network of burrows and connecting passages, with many entrances and no obvious front door. From Anglo-French *warenne*, an enclosed ground where animals were kept.
 
-Which is the job. SSM reaches an instance with **no public IP, no bastion host, and no inbound port open** — a side gate rather than the front door. The same idea extends to the rest of it: a way in to fifty accounts without keeping credentials for any of them.
+Which is the job. SSM reaches an instance with **no public IP, no bastion host, and no inbound port open** — you arrive from inside rather than at the perimeter. And there is rarely just one way in or one place to go: fifty accounts, each with its own instances, shells, and tunnels, all reachable without keeping long-lived credentials for any of them.
 
 ## Features
 
 - AWS IAM Identity Center (SSO) auth via direct SDK calls — no CLI wrapper
 - bubbletea TUI (alt-screen, no terminal ghosting) for picking account → role → instance
 - Shell sessions (foreground), SSH tunnels, and RDP tunnels (backgrounded)
-- Hand the account and role you pick to any command — `postern exec`, `postern shell`, or from the TUI
+- Hand the account and role you pick to any command — `warren exec`, `warren shell`, or from the TUI
 - A guided builder for read-only AWS CLI commands, with the command always on screen and editable
 - Fuzzy search across everything on the row, including **any EC2 tag**
 - Credentials renewed in the background while the TUI is open; browser sign-in only when unavoidable
-- Active tunnels persisted to `~/.postern_sessions.json` and managed from the TUI
+- Active tunnels persisted to `~/.warren_sessions.json` and managed from the TUI
 - `session-manager-plugin` embedded so there is nothing else to install — macOS (amd64/arm64), Linux (amd64/arm64), Windows (amd64)
 
-Each build embeds only its own platform's plugin. A Go binary targets one platform anyway, so carrying the others added ~31MB per build for code it could never execute. Linux **arm64** is included, so Graviton instances and 64-bit Raspberry Pi OS work — note that 32-bit Pi OS (`armhf`) is a different architecture with no plugin published, and postern says so rather than handing over the wrong binary.
+Each build embeds only its own platform's plugin. A Go binary targets one platform anyway, so carrying the others added ~31MB per build for code it could never execute. Linux **arm64** is included, so Graviton instances and 64-bit Raspberry Pi OS work — note that 32-bit Pi OS (`armhf`) is a different architecture with no plugin published, and warren says so rather than handing over the wrong binary.
+
+### The embedded plugin
+
+The `session-manager-plugin` warren embeds is **built from AWS's source** at a pinned release tag, not copied from the binaries AWS distributes. Its source is Apache-2.0, which permits redistribution; AWS's prebuilt binaries are a separate artefact whose terms are less clear (Homebrew ships it as a cask that downloads from AWS rather than rehosting it). Embedding is what makes warren work in airgapped environments, so building the source is how it does that on solid footing.
+
+Which version is recorded in `internal/plugin/version.txt` and printed by `warren version`. Rebuild it yourself with:
+
+```sh
+./scripts/build-plugin.sh 1.2.835.0
+```
+
+A scheduled workflow watches for new plugin releases and opens a PR rebuilding from the new tag, so "embedded" does not quietly become "frozen".
 
 ## Install
 
-Download a prebuilt binary from the [Releases](https://github.com/treyperrone/postern/releases) page, or build from source:
+Download a prebuilt binary from the [Releases](https://github.com/treyperrone/warren/releases) page, or build from source:
 
 ```sh
-go install github.com/treyperrone/postern@latest
+go install github.com/treyperrone/warren@latest
 ```
 
-`go install` drops the binary in `$(go env GOPATH)/bin` (usually `~/go/bin`), which is not on `PATH` by default — so `postern` right after installing gives `command not found`. Run it once as `~/go/bin/postern` and it prints the exact line to add for your shell, then stops mentioning it once the directory is on `PATH`.
+`go install` drops the binary in `$(go env GOPATH)/bin` (usually `~/go/bin`), which is not on `PATH` by default — so `warren` right after installing gives `command not found`. Run it once as `~/go/bin/warren` and it prints the exact line to add for your shell, then stops mentioning it once the directory is on `PATH`.
 
 ## Usage
 
 ```sh
-postern                  # launch the interactive picker
-postern exec -- <cmd>    # pick an account and role, then run <cmd> with its credentials
-postern shell            # pick an account and role, then open a shell with its credentials
-postern setup            # add an [sso-session] block to ~/.aws/config
-postern version          # print the version
-postern help             # print usage
+warren                  # launch the interactive picker
+warren exec -- <cmd>    # pick an account and role, then run <cmd> with its credentials
+warren shell            # pick an account and role, then open a shell with its credentials
+warren setup            # add an [sso-session] block to ~/.aws/config
+warren version          # print warren's version and the embedded plugin's
+warren help             # print usage
 ```
 
 Authentication comes from an `sso-session` block or a named profile in `~/.aws/config` (standard AWS SSO setup). The TUI walks you through picking an SSO session, account, role, target instance, and connection type.
@@ -61,11 +76,13 @@ Both are renewed automatically while the TUI is open. Role credentials are re-fe
 
 The browser sign-in is only needed when silent renewal is impossible: nothing cached yet, an expired client registration, or a revoked refresh token. Background renewal never triggers it on its own — it reports `sign-in needed` in the header instead, because a device-code prompt from a background task would be painted behind the TUI while the tool appeared to hang.
 
-One limit worth knowing: a shell started by **Run AWS CLI commands** gets a copy of the credentials as they were at launch. A parent process cannot change a child's environment, so a shell left open past the hour will see `ExpiredToken` — press `esc` and re-enter it to get a fresh hour. The same applies to long-running tunnels.
+Commands and shells started by warren do not get a frozen copy of the credentials. A parent process cannot reach into a child's environment, so instead of handing over keys, warren serves credentials from a loopback endpoint that the child reads through the standard AWS container-credential variables — and keeps refreshing what it serves. A shell left open past the hour keeps working rather than failing with `ExpiredToken`. The endpoint listens on `127.0.0.1` only and requires a per-run token, so nothing else on the machine can read from it.
 
-If no SSO session or profile is configured, postern offers to create one on startup. To add another later — a prod range alongside a lab one — either run `postern setup`, or pick **+ Add SSO session** on the authentication screen (press `esc` from the account list to get there).
+Tunnels are the exception: they are started with the credentials as they stood at launch.
 
-`~/.aws/config` is only ever appended to, never rewritten: it is shared with the `aws` CLI, Terraform, and every SDK on the machine. A `config.postern.bak` copy is taken before each append.
+If no SSO session or profile is configured, warren offers to create one on startup. To add another later — a prod range alongside a lab one — either run `warren setup`, or pick **+ Add SSO session** on the authentication screen (press `esc` from the account list to get there).
+
+`~/.aws/config` is only ever appended to, never rewritten: it is shared with the `aws` CLI, Terraform, and every SDK on the machine. A `config.warren.bak` copy is taken before each append.
 
 The running version is also shown in the TUI's header bar, next to the name.
 
@@ -78,8 +95,11 @@ The running version is also shown in the TUI's header bar, next to the name.
 | `enter` | select |
 | `n` | new connection (main screen) |
 | `p` | switch auth (main screen) |
+| `?` | about — version, keys, and where to report a problem; works on every screen |
 | `q` | quit — active tunnels keep running |
 | `ctrl+c` | quit |
+
+`?` is advertised at the right-hand end of the banner, so you do not have to know it in advance. On a terminal too short to hold it, it scrolls with the arrow keys or the mouse wheel and always keeps the way out on screen. Note that scrolling your *terminal* back will not reveal it — warren runs in the alternate screen buffer, which has no scrollback, so the scrolling has to be warren's own. It shows the running warren and plugin versions plus your platform — exactly what a bug report needs — and it is reachable from wherever you happen to be rather than only from the main screen.
 
 Search covers the description line as well as the title, so accounts match on **name or account ID**, and instances match on **name, instance ID, private IP, or instance type**. With 50 accounts on one permission set, typing the last four digits of an account ID is usually the fastest way in.
 
@@ -87,9 +107,37 @@ An active search is cleared when you select something, so it never carries over 
 
 Instances additionally match on **any tag**, as `key=value`. Tags aren't displayed — an instance can carry a dozen CloudFormation-managed tags, which would bury the ID and IP on the row — but they are all searchable, so `/globogym` finds every instance tagged for that client and `/env=staging` narrows to one environment. This costs no extra API call: `DescribeInstances` already returns every tag.
 
+### Shell sessions and tmux
+
+An SSM shell runs directly in your terminal with a header line naming the account, role, and
+instance. Exiting the remote shell (`exit`) returns you to the instance list.
+
+Where tmux is available, warren runs the session inside it so that header stays pinned as a status
+bar rather than scrolling away when the remote shell clears the screen. Set `WARREN_TMUX=0` to turn
+that off and get a plain printed header instead.
+
+warren uses its own private tmux socket, so its session never shows up in your `tmux ls` and
+nothing it does can disturb your own sessions. It runs `new-session` in the foreground rather than
+creating a detached session and attaching to it, so the command warren waits on *is* the session:
+exiting the remote shell ends it and returns you to the picker.
+
+That detail matters because the earlier version got it wrong. It created the session detached and
+ran `tmux attach-session` as the foreground command, which made your terminal a client of a session
+it did not own — so exiting the remote shell destroyed the session and took the terminal with it.
+
+tmux is skipped when `$TMUX` is already set: it refuses to nest, and you already have a status line
+of your own.
+
 ## Running AWS CLI commands
 
-postern can hand the account and role you pick to any command, so you don't have to configure a profile per account just to run one query. There are two ways in.
+**This is the one part of warren that needs the `aws` CLI installed.** Sign-in, SSM shells, SSH and RDP tunnels all go through the AWS SDK and the embedded `session-manager-plugin`, so they work on a machine with no AWS tooling at all. The two features below shell out to `aws`, so they need it.
+
+It is not bundled: AWS CLI v2 ships its own Python runtime and is around a quarter of a gigabyte installed, which would make a 22MB binary something nobody would download in order to supply a program most people running AWS tooling already have. If it is missing, the two entries say so on the row rather than failing when you pick them, and `?` reports the detected version — or `not installed`.
+
+Either v1 or v2 works. The credential endpoint uses the standard container-credential variables, which botocore has supported for loopback addresses since 1.5.27, so any v1 from 2017 onward can read them. v2 is what gets tested.
+
+
+warren can hand the account and role you pick to any command, so you don't have to configure a profile per account just to run one query. There are two ways in.
 
 **From the TUI.** Once you've picked an account and role, a *What next?* screen appears:
 
@@ -102,12 +150,12 @@ postern can hand the account and role you pick to any command, so you don't have
 **From the command line**, when you already know what you want:
 
 ```sh
-postern exec -- aws s3 ls
-postern exec -- aws ec2 describe-instances --query 'Reservations[].Instances[].InstanceId'
-postern shell
+warren exec -- aws s3 ls
+warren exec -- aws ec2 describe-instances --query 'Reservations[].Instances[].InstanceId'
+warren shell
 ```
 
-Either way the credentials only ever live in the environment of the process postern starts. Nothing is written to `~/.aws/config`, nothing lands in your shell history, and they die with that process.
+Either way the credentials only ever live in the environment of the process warren starts. Nothing is written to `~/.aws/config`, nothing lands in your shell history, and they die with that process.
 
 ### The command builder
 
@@ -115,7 +163,7 @@ Covers **EC2** (find instances by partial tag, describe one, security groups, vo
 
 The assembled command is always on screen, and `ctrl+e` makes it editable before it runs. That's the point: the recipe list is a starting point, not an attempt to cover AWS. If your task isn't there, start from the nearest one and edit it — and because you see the real command every time, you gradually stop needing the menu.
 
-The command runs on the real terminal, and postern waits for a keypress before taking the screen back — without that, output would be hidden the moment the TUI redraws. It also says what happened, because a CLI that prints nothing is ambiguous if you don't already know the service:
+The command runs on the real terminal, and warren waits for a keypress before taking the screen back — without that, output would be hidden the moment the TUI redraws. It also says what happened, because a CLI that prints nothing is ambiguous if you don't already know the service:
 
 ```
 $ aws s3 ls
@@ -128,26 +176,59 @@ s3:GetBucketPolicy
 Command failed (exit 254).
 ```
 
-AWS's own error is passed straight through, byte for byte — error code and wording untouched — and the exit code is the real one. postern adds a line below it, never in place of it, and does not guess at a cause when AWS has already given one.
+AWS's own error is passed straight through, byte for byte — error code and wording untouched — and the exit code is the real one. warren adds a line below it, never in place of it, and does not guess at a cause when AWS has already given one.
 
 Two exceptions, where it adds something AWS can't say:
 
 - A denial that **names no action** (`You are not authorized to perform this operation`) gets a note that it's *often* a policy above the account — an SCP — rather than the role. AWS deliberately won't reveal org structure in a denial, so this is a possibility, not a diagnosis.
 - **Expired credentials** get told to press `esc` and pick the role again, since the fix is specific to this tool.
 
-`postern exec` deliberately does none of this — there, stdout belongs to your pipeline.
+`warren exec` deliberately does none of this — there, stdout belongs to your pipeline.
 
 Recipes are **read-only** — `describe`, `list`, `get`. A builder aimed at people who wouldn't spot a destructive command shouldn't be able to produce one, so anything that changes state you type yourself in the shell.
 
-A child process can't change its parent shell's environment, which is why this is a wrapper rather than something that "logs your shell in". Inside `postern shell`, `$POSTERN_SESSION` names the account and role — worth putting in your prompt, since an authenticated shell otherwise looks exactly like an unauthenticated one.
+A child process can't change its parent shell's environment, which is why this is a wrapper rather than something that "logs your shell in". Inside `warren shell`, `$WARREN_SESSION` names the account and role — worth putting in your prompt, since an authenticated shell otherwise looks exactly like an unauthenticated one.
 
 `exec` keeps stdout clean for the wrapped command and sends the picker and the identity line to stderr, so pipes and exit codes behave:
 
 ```sh
-postern exec -- aws s3api list-buckets --output json | jq -r '.Buckets[].Name'
-postern exec -- aws sts get-caller-identity && echo "worked"
+warren exec -- aws s3api list-buckets --output json | jq -r '.Buckets[].Name'
+warren exec -- aws sts get-caller-identity && echo "worked"
 ```
 
 ## Status
 
 Functional but early — see the AWS SDK's own docs for SSO/Identity Center setup if you haven't configured it yet. Known gap: Windows tunnel liveness checks are not fully implemented.
+
+## Development
+
+Pushing any branch runs the full check set, and the results show up three places: a pass/fail tick beside the commit, the run itself under **Actions**, and — for anything gosec or CodeQL finds — an alert with file and line context under **Security → Code scanning**.
+
+| check | what it covers |
+|---|---|
+| `go test` on Linux, macOS and Windows | the plugin is extracted and exec'd per-platform, and the tmux wrapper is skipped on Windows, so one OS is not enough |
+| `go test -race` | the credential endpoint and its renewal goroutine |
+| `gofmt`, `go vet`, `staticcheck` | formatting and correctness |
+| `govulncheck` | only vulnerabilities warren actually reaches, so a finding is real work |
+| `gosec` | reported to the Security tab and gating the job |
+| `go mod verify` | dependency checksums |
+| CodeQL | `security-and-quality`, plus weekly so improved queries reach unchanged code |
+
+### Cutting a release
+
+Tags are the trigger. Push a `v*` tag and the release workflow runs the same checks above, then goreleaser builds all five platforms and publishes a GitHub Release with archives and `checksums.txt`:
+
+```sh
+git tag -a v1.0.0 -m "first release"
+git push origin v1.0.0
+```
+
+Nothing else is manual. To rehearse the whole build without publishing, run the release workflow via **workflow_dispatch** — it builds a snapshot and uploads the archives as run artifacts instead of creating a release.
+
+The release is gated on the CI workflow rather than its own copy of the checks, so a tag can never publish something the checks would have rejected.
+
+## License
+
+Apache License 2.0 — see [LICENSE](LICENSE).
+
+warren embeds AWS's [session-manager-plugin](https://github.com/aws/session-manager-plugin), which is also Apache-2.0. Attribution for it and for every other dependency is in [NOTICE](NOTICE) and [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md), both of which ship inside the release archives.

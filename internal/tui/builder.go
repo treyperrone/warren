@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"errors"
 	"strings"
 
 	"github.com/charmbracelet/bubbles/list"
@@ -8,7 +9,8 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
-	"github.com/treyperrone/postern/internal/awsexec"
+	"github.com/treyperrone/warren/internal/awscli"
+	"github.com/treyperrone/warren/internal/awsexec"
 )
 
 // msgBuildDone reports that a built command finished and the screen is ours again.
@@ -213,12 +215,30 @@ func (m *Model) updateBuildParams(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 // scrollback like any other command, and takes the screen back afterwards.
 func (m *Model) runBuilt() tea.Cmd {
 	line := m.builder.commandLine()
-	cmd, err := awsexec.CommandLine(m.awsSess, line)
+
+	// Same endpoint as the shell: a `logs tail --follow` left running for an hour should not
+	// stop working halfway through.
+	credEnv, err := m.credentialEnv()
+	if err != nil {
+		m.builder.err = err
+		return nil
+	}
+
+	// Checked before running rather than letting exec fail: the raw failure is
+	// `aws: executable file not found in $PATH`, which does not say that this is the only part
+	// of warren needing the CLI, nor where to get it.
+	if !awscli.Detect().Found() {
+		m.builder.err = errors.New(awscli.MissingError())
+		return nil
+	}
+
+	cmd, err := awsexec.CommandLine(m.awsSess, line, credEnv...)
 	if err != nil {
 		m.builder.err = err
 		return nil
 	}
 	m.builder.err = nil
+	m.beginCredRefresh()
 	return tea.ExecProcess(cmd, func(error) tea.Msg { return msgBuildDone{} })
 }
 

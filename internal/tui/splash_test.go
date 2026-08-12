@@ -6,7 +6,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
-	awsint "github.com/treyperrone/postern/internal/aws"
+	awsint "github.com/treyperrone/warren/internal/aws"
 )
 
 // openingModel is a model sitting on the opening screen with a roomy terminal.
@@ -34,31 +34,37 @@ func TestSplashShowsOnTheOpeningScreen(t *testing.T) {
 	}
 }
 
-// The wordmark is a greeting. Once you are working it stops earning its rows, and it must not
-// come back when you navigate back to the opening screen.
-func TestSplashIsDismissedForGoodAfterTheFirstScreen(t *testing.T) {
+// The wordmark belongs on the screens you rest on, not the ones you pass through — and it has to
+// come back when you return to one, which is what backing out after a session does.
+func TestSplashFollowsTheScreenRatherThanBeingDismissed(t *testing.T) {
 	m := openingModel(t)
 	if !m.splashVisible() {
-		t.Fatal("wordmark not visible to begin with")
+		t.Fatal("wordmark not visible on the opening screen")
 	}
 
-	// Move past the opening screen; the draw is what retires it.
-	m.screen = screenAccount
-	m.buildAccountList()
-	m.View()
-
-	if !m.splashDone {
-		t.Error("wordmark was not retired after leaving the opening screen")
+	// Working lists: every row counts, so it gets out of the way.
+	for _, sc := range []screen{screenAccount, screenRole, screenInstance, screenAction} {
+		m.screen = sc
+		if m.splashVisible() {
+			t.Errorf("wordmark shown on screen %v, where rows are scarce", sc)
+		}
 	}
 
-	// ...and going back does not bring it back.
+	// The tunnel manager is where an SSM session returns you, and it is a resting screen.
+	m.screen = screenMain
+	m.buildMainList()
+	if !m.splashVisible() {
+		t.Error("wordmark missing from the tunnel manager")
+	}
+
+	// ...and backing all the way out brings it back.
 	m.screen = screenMethod
 	m.buildMethodList()
-	if m.splashVisible() {
-		t.Error("wordmark returned after navigating back")
+	if !m.splashVisible() {
+		t.Error("wordmark did not return to the opening screen")
 	}
-	if strings.Contains(m.View(), splashTagline) {
-		t.Error("wordmark redrawn after navigating back")
+	if !strings.Contains(m.View(), splashTagline) {
+		t.Error("wordmark not redrawn on the opening screen")
 	}
 }
 
@@ -68,7 +74,8 @@ func TestListIsSizedAroundTheSplash(t *testing.T) {
 	m := openingModel(t)
 	withSplash := m.list.Height()
 
-	m.splashDone = true
+	// A working list has no wordmark, so it gets those rows back.
+	m.screen = screenAccount
 	m.resizeList()
 	withoutSplash := m.list.Height()
 
@@ -136,8 +143,13 @@ func TestSplashArtRowsAreEqualWidth(t *testing.T) {
 			t.Errorf("row %d is %d runes wide, want %d", i, got, want)
 		}
 	}
-	if want >= splashMinWidth {
-		t.Errorf("art is %d wide but is drawn down to %d columns", want, splashMinWidth)
+	// The margin counts. Comparing the bare art width against splashMinWidth let art of 49 sit
+	// under a threshold of 50, where the 2-column MarginLeft in splash() pushed it to 51 and it
+	// clipped. Whatever the art is, the terminal has to fit art + margin.
+	const margin = 2
+	if want+margin > splashMinWidth {
+		t.Errorf("art is %d wide plus a %d-column margin, but is drawn down to %d columns",
+			want, margin, splashMinWidth)
 	}
 }
 

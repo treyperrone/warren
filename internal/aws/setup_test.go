@@ -107,7 +107,7 @@ func TestAddSSOSessionBacksUpExistingConfig(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	backup, err := os.ReadFile(path + ".postern.bak")
+	backup, err := os.ReadFile(path + ".warren.bak")
 	if err != nil {
 		t.Fatalf("no backup written: %v", err)
 	}
@@ -134,7 +134,7 @@ func TestAddSSOSessionCreatesConfigWhenMissing(t *testing.T) {
 		t.Errorf("got %+v, want one session in us-west-2", sessions)
 	}
 	// No prior file means nothing to back up.
-	if _, err := os.Stat(filepath.Join(home, ".aws", "config.postern.bak")); err == nil {
+	if _, err := os.Stat(filepath.Join(home, ".aws", "config.warren.bak")); err == nil {
 		t.Error("wrote a backup for a config that did not exist")
 	}
 }
@@ -202,5 +202,35 @@ func TestAddSSOSessionInvalidWritesNothing(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(home, ".aws", "config")); err == nil {
 		t.Error("invalid config still created ~/.aws/config")
+	}
+}
+
+// The old check was ContainsAny(name, " \t[]"), which read as "reject whitespace or a bracket"
+// but let every other control character through. A newline splits the [sso-session <name>]
+// header across two lines and corrupts ~/.aws/config — the file shared with the aws CLI,
+// Terraform and every SDK on the machine, which is why this file is only ever appended to.
+func TestSSOSessionNameRejectsControlCharacters(t *testing.T) {
+	valid := func(name string) error {
+		return ValidateSSOSession(SSOSessionConfig{
+			Name: name, StartURL: "https://x.awsapps.com/start", Region: "us-east-1",
+		})
+	}
+
+	for _, name := range []string{
+		"bad\nx",               // bare newline
+		"bad\nsso_region=evil", // an injected key, no space to catch it
+		"bad\rx", "bad\vx", "bad\fx",
+		"bad name", "bad\tx", "bad[x]", "bad]x",
+		"bad/x", "bad$x", "bad;x", "bad\x00x",
+	} {
+		if err := valid(name); err == nil {
+			t.Errorf("accepted %q, which cannot go inside an [sso-session] header", name)
+		}
+	}
+
+	for _, name := range []string{"prod", "my-sso", "my_sso", "corp.sso", "sso2024", "A-b_c.9"} {
+		if err := valid(name); err != nil {
+			t.Errorf("rejected %q, which is a reasonable session name: %v", name, err)
+		}
 	}
 }

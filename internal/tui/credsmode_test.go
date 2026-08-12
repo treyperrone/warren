@@ -7,7 +7,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
-	awsint "github.com/treyperrone/postern/internal/aws"
+	awsint "github.com/treyperrone/warren/internal/aws"
 )
 
 // isQuit reports whether cmd is the quit command, by running it and inspecting the message.
@@ -108,7 +108,7 @@ func TestSelectingBrowseStartsTheInstanceFetch(t *testing.T) {
 }
 
 // A profile-backed session resolves through a different path than SSO, and must reach the same
-// stopping point — otherwise `postern exec` works for SSO sessions and hangs for profiles.
+// stopping point — otherwise `warren exec` works for SSO sessions and hangs for profiles.
 func TestCredsModeQuitsForProfileSession(t *testing.T) {
 	m := newFormModel(t)
 	m.StartCredsMode()

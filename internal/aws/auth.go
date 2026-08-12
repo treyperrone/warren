@@ -141,14 +141,31 @@ func ParseConfig() ([]SSOSessionConfig, []ProfileConfig, error) {
 // ValidateSSOSession checks a proposed sso-session block before it is written. The cost of
 // a typo here is a confusing OIDC failure several screens later, so it is worth catching
 // the obvious cases at the point of entry.
+// validSessionName reports whether name is safe to write inside an [sso-session <name>] header.
+func validSessionName(name string) bool {
+	for _, r := range name {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+		case r == '.', r == '-', r == '_':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
 func ValidateSSOSession(s SSOSessionConfig) error {
 	switch {
 	case s.Name == "":
 		return errors.New("name is required")
-	// The name becomes the text inside [sso-session <name>], so anything that would break
-	// the header — whitespace or a bracket — has to be rejected rather than escaped.
-	case strings.ContainsAny(s.Name, " \t[]"):
-		return errors.New("name cannot contain spaces or brackets")
+	// The name becomes the text inside [sso-session <name>], so anything that would break the
+	// header has to be rejected rather than escaped. This is an allowlist because the previous
+	// blocklist — " \t[]" — read as "whitespace or a bracket" but let \n, \r, \v and \f
+	// through, and a newline splits the header across two lines. ~/.aws/config is shared with
+	// the aws CLI, Terraform and every SDK on the machine, so corrupting it breaks all of them,
+	// which is the same reason this file is only ever appended to.
+	case !validSessionName(s.Name):
+		return errors.New("name can contain only letters, digits, dots, dashes and underscores")
 	case s.StartURL == "":
 		return errors.New("start URL is required")
 	case s.Region == "":
@@ -193,8 +210,13 @@ func AddSSOSession(s SSOSessionConfig) error {
 	}
 
 	// Back up whatever is already there before touching it. A missing file needs no backup.
+	//
+	// #nosec G703,G304 -- gosec sees a non-literal path and reports traversal. path is
+	// ConfigPath(), which is filepath.Join(os.Getenv("HOME"), ".aws", "config"): no caller
+	// supplies it and no request data reaches it. A user able to set their own HOME can
+	// already read and write their own files.
 	if prev, err := os.ReadFile(path); err == nil {
-		if err := os.WriteFile(path+".postern.bak", prev, 0o600); err != nil {
+		if err := os.WriteFile(path+".warren.bak", prev, 0o600); err != nil {
 			return fmt.Errorf("backing up ~/.aws/config: %w", err)
 		}
 	} else if !errors.Is(err, fs.ErrNotExist) {
@@ -202,7 +224,7 @@ func AddSSOSession(s SSOSessionConfig) error {
 	}
 
 	scopes := strings.Join(s.scopes(), ",")
-	block := fmt.Sprintf("\n# added by postern\n[sso-session %s]\nsso_start_url = %s\nsso_region = %s\nsso_registration_scopes = %s\n",
+	block := fmt.Sprintf("\n# added by warren\n[sso-session %s]\nsso_start_url = %s\nsso_region = %s\nsso_registration_scopes = %s\n",
 		s.Name, s.StartURL, s.Region, scopes)
 
 	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
@@ -305,14 +327,14 @@ func Login(ctx context.Context, sess SSOSessionConfig) (string, error) {
 	// rejects the scoped registration, losing silent renewal beats being unable to log in
 	// at all — so warn and retry bare rather than failing outright.
 	reg, err := oidc.RegisterClient(ctx, &ssooidc.RegisterClientInput{
-		ClientName: aws.String("postern"),
+		ClientName: aws.String("warren"),
 		ClientType: aws.String("public"),
 		Scopes:     sess.scopes(),
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[sso] scoped registration failed (%v); retrying without scopes — sessions will not auto-renew\n", err)
 		reg, err = oidc.RegisterClient(ctx, &ssooidc.RegisterClientInput{
-			ClientName: aws.String("postern"),
+			ClientName: aws.String("warren"),
 			ClientType: aws.String("public"),
 		})
 	}
@@ -415,12 +437,16 @@ func refresh(ctx context.Context, sess SSOSessionConfig, rec *tokenRecord) (stri
 func writeRecord(rec *tokenRecord) {
 	dir := ssoCacheDir()
 	_ = os.MkdirAll(dir, 0700)
+	// #nosec G117 -- gosec flags the marshalled AccessToken as a secret reaching disk, which it
+	// is. This is ~/.aws/sso/cache, whose format and location AWS defines; the aws CLI writes
+	// the same token to the same place. Writing it is the point — it is what makes silent
+	// renewal possible instead of a browser prompt every hour. Written 0600 into a 0700 dir.
 	data, err := json.Marshal(rec)
 	if err != nil {
 		return
 	}
 	// hash of the start URL as filename, mirroring the AWS CLI convention
-	name := fmt.Sprintf("postern-%x.json", hashString(rec.StartURL))
+	name := fmt.Sprintf("warren-%x.json", hashString(rec.StartURL))
 	_ = os.WriteFile(filepath.Join(dir, name), data, 0600)
 }
 

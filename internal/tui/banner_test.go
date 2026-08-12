@@ -6,9 +6,9 @@ import (
 
 	"github.com/charmbracelet/lipgloss"
 
-	awsint "github.com/treyperrone/postern/internal/aws"
-	"github.com/treyperrone/postern/internal/buildinfo"
-	"github.com/treyperrone/postern/internal/tunnel"
+	awsint "github.com/treyperrone/warren/internal/aws"
+	"github.com/treyperrone/warren/internal/buildinfo"
+	"github.com/treyperrone/warren/internal/tunnel"
 )
 
 // The banner pads itself to the terminal width by hand, so an off-by-one in the
@@ -42,7 +42,7 @@ func TestBannerVersionFollowsToolName(t *testing.T) {
 	m.awsSess = &awsint.Session{Label: "some-account/SomeRole"}
 
 	row := m.banner()
-	name := strings.Index(row, "postern")
+	name := strings.Index(row, "warren")
 	version := strings.Index(row, buildinfo.Version())
 	label := strings.Index(row, "some-account/SomeRole")
 

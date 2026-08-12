@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	awsint "github.com/treyperrone/postern/internal/aws"
+	awsint "github.com/treyperrone/warren/internal/aws"
 )
 
 func sessionExpiringIn(d time.Duration) *awsint.Session {

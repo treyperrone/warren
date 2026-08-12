@@ -1,5 +1,5 @@
 // Package plugin supplies the AWS session-manager-plugin binary for the platform this build
-// targets, so there is nothing to install alongside postern.
+// targets, so there is nothing to install alongside warren.
 //
 // The plugin is embedded per-platform, by build-constrained files rather than by one
 // `embed assets/*`. A Go binary is compiled for a single GOOS/GOARCH regardless, so embedding
@@ -9,6 +9,8 @@
 package plugin
 
 import (
+	"bytes"
+	"crypto/sha256"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -22,8 +24,8 @@ var (
 	binErr  error
 )
 
-// Path extracts the session-manager-plugin for the current platform to a temp file on first
-// call and returns the path. Subsequent calls return the cached path.
+// Path extracts the session-manager-plugin for the current platform into the user's cache
+// directory on first call and returns the path. Subsequent calls return the cached path.
 func Path() (string, error) {
 	once.Do(func() {
 		binPath, binErr = extract()
@@ -45,15 +47,64 @@ func extract() (string, error) {
 	if runtime.GOOS == "windows" {
 		ext = ".exe"
 	}
-	dest := filepath.Join(os.TempDir(), "postern-plugin"+ext)
 
-	// skip re-write if already there and same size
-	if info, err := os.Stat(dest); err == nil && info.Size() == int64(len(pluginBinary)) {
+	// Not os.TempDir(): /tmp is world-writable and the old filename was fixed, so any local
+	// user could pre-create a binary of the right size at that path. The previous check
+	// compared only the size before reusing what it found, so warren would have executed
+	// that file — with live AWS credentials in its environment. The cache directory is the
+	// user's own and created 0700, and the name carries a digest of the bytes so a stale or
+	// different build cannot be mistaken for this one.
+	dir, err := cacheDir()
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(pluginBinary)
+	dest := filepath.Join(dir, fmt.Sprintf("session-manager-plugin-%x%s", sum[:8], ext))
+
+	// Reuse only bytes that are exactly ours. Size is not identity.
+	if existing, err := os.ReadFile(dest); err == nil && bytes.Equal(existing, pluginBinary) {
 		return dest, nil
 	}
 
-	if err := os.WriteFile(dest, pluginBinary, 0700); err != nil {
-		return "", fmt.Errorf("writing plugin to %s: %w", dest, err)
+	// Write to a unique name in the same directory and rename into place, so a second warren
+	// starting concurrently can never exec a half-written plugin.
+	tmp, err := os.CreateTemp(dir, "plugin-*")
+	if err != nil {
+		return "", fmt.Errorf("creating plugin temp file: %w", err)
+	}
+	defer os.Remove(tmp.Name()) // no-op once the rename succeeds
+	if err := tmp.Chmod(0o700); err != nil {
+		tmp.Close()
+		return "", fmt.Errorf("setting plugin permissions: %w", err)
+	}
+	if _, err := tmp.Write(pluginBinary); err != nil {
+		tmp.Close()
+		return "", fmt.Errorf("writing plugin: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return "", fmt.Errorf("writing plugin: %w", err)
+	}
+
+	if err := os.Rename(tmp.Name(), dest); err != nil {
+		// Windows refuses to replace a file that is currently executing. Another warren
+		// having already put the right bytes there is success, not failure.
+		if existing, rerr := os.ReadFile(dest); rerr == nil && bytes.Equal(existing, pluginBinary) {
+			return dest, nil
+		}
+		return "", fmt.Errorf("installing plugin to %s: %w", dest, err)
 	}
 	return dest, nil
+}
+
+// cacheDir returns a private per-user directory for the extracted plugin, creating it 0700.
+func cacheDir() (string, error) {
+	base, err := os.UserCacheDir()
+	if err != nil {
+		return "", fmt.Errorf("locating a cache directory for the plugin: %w", err)
+	}
+	dir := filepath.Join(base, "warren")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", fmt.Errorf("creating %s: %w", dir, err)
+	}
+	return dir, nil
 }

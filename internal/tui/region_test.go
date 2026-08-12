@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	awsint "github.com/treyperrone/postern/internal/aws"
+	awsint "github.com/treyperrone/warren/internal/aws"
 )
 
 func newFormModel(t *testing.T) *Model {

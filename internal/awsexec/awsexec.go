@@ -2,7 +2,7 @@
 // environment.
 //
 // This is the answer to a constraint, not a design preference: a child process cannot modify
-// its parent shell's environment, so postern can never simply "log your shell in". It can
+// its parent shell's environment, so warren can never simply "log your shell in". It can
 // hand credentials to one process it starts. `exec` makes that process your command; `shell`
 // makes it your shell. Either way the credentials live and die with that process — they are
 // never written to disk and never enter your shell history.
@@ -16,13 +16,13 @@ import (
 	"runtime"
 	"strings"
 
-	awsint "github.com/treyperrone/postern/internal/aws"
+	awsint "github.com/treyperrone/warren/internal/aws"
 )
 
 // SessionLabelVar names the selected session inside the child process. It is not read by the
 // AWS SDK — it exists so a shell prompt can show which account it is pointed at, since an
 // authenticated shell that looks identical to an unauthenticated one is how mistakes happen.
-const SessionLabelVar = "POSTERN_SESSION"
+const SessionLabelVar = "WARREN_SESSION"
 
 // Env builds the child environment: the parent's, minus every AWS variable this tool sets,
 // plus the session's own.
@@ -31,7 +31,10 @@ const SessionLabelVar = "POSTERN_SESSION"
 // user's shell sitting alongside the injected keys, and which one wins then depends on the
 // SDK's provider order rather than on what was selected here. Removing them makes the child
 // unambiguous.
-func Env(parent []string, sess *awsint.Session) []string {
+// credOverride, when given, replaces the session's own credential variables — used to point the
+// child at the local credential endpoint instead of handing it a copy that cannot be updated. The
+// region and the session label are supplied either way.
+func Env(parent []string, sess *awsint.Session, credOverride ...string) []string {
 	strip := make(map[string]bool, len(awsint.EnvKeys()))
 	for _, k := range awsint.EnvKeys() {
 		strip[k] = true
@@ -49,7 +52,13 @@ func Env(parent []string, sess *awsint.Session) []string {
 		out = append(out, kv)
 	}
 
-	out = append(out, sess.Env()...)
+	if len(credOverride) > 0 {
+		out = append(out, credOverride...)
+	} else {
+		out = append(out, sess.CredentialEnv()...)
+	}
+	out = append(out, sess.RegionEnv()...)
+
 	if sess.Label != "" {
 		out = append(out, SessionLabelVar+"="+sess.Label)
 	}
@@ -74,17 +83,17 @@ func Env(parent []string, sess *awsint.Session) []string {
 // status travels through a second file because a POSIX pipeline reports the status of its last
 // stage, which here is tee.
 const runnerScript = `
-printf '\033[38;5;99m$ \033[0m%s\n' "$_POSTERN_CMD"
+printf '\033[38;5;99m$ \033[0m%s\n' "$_WARREN_CMD"
 
 captured=""
 if tmpdir=$(mktemp -d 2>/dev/null); then
 	captured="$tmpdir/out"
-	{ eval "$_POSTERN_CMD"; echo $? > "$tmpdir/status"; } 2>&1 | tee "$captured"
+	{ eval "$_WARREN_CMD"; echo $? > "$tmpdir/status"; } 2>&1 | tee "$captured"
 	status=$(cat "$tmpdir/status" 2>/dev/null)
 	bytes=$(wc -c < "$captured" 2>/dev/null | tr -d ' \n')
 else
 	# No temp dir: still run, but claim nothing about emptiness we cannot measure.
-	eval "$_POSTERN_CMD" 2>&1
+	eval "$_WARREN_CMD" 2>&1
 	status=$?
 	bytes=1
 fi
@@ -119,7 +128,7 @@ fi
 [ -n "$tmpdir" ] && rm -rf "$tmpdir"
 
 if [ -t 0 ]; then
-	printf '\033[38;5;240mPress enter to return to postern.\033[0m'
+	printf '\033[38;5;240mPress enter to return to warren.\033[0m'
 	read -r _ 2>/dev/null || true
 	printf '\n'
 fi
@@ -138,7 +147,7 @@ exit "$status"
 //
 // This is for the interactive builder. `exec` uses Run instead and stays silent, because there
 // stdout belongs to the caller's pipeline and a friendly footer would be corruption.
-func CommandLine(sess *awsint.Session, line string) (*exec.Cmd, error) {
+func CommandLine(sess *awsint.Session, line string, credOverride ...string) (*exec.Cmd, error) {
 	if strings.TrimSpace(line) == "" {
 		return nil, errors.New("no command given")
 	}
@@ -152,7 +161,7 @@ func CommandLine(sess *awsint.Session, line string) (*exec.Cmd, error) {
 		cmd = exec.Command("/bin/sh", "-c", runnerScript)
 	}
 
-	cmd.Env = append(Env(os.Environ(), sess), "_POSTERN_CMD="+line)
+	cmd.Env = append(Env(os.Environ(), sess, credOverride...), "_WARREN_CMD="+line)
 	return cmd, nil
 }
 
@@ -170,7 +179,7 @@ func ShellArgv() []string {
 // Command builds argv as a command with the session's credentials injected, leaving stdio
 // unset so the caller can decide. tea.ExecProcess wires stdio to the terminal itself, which
 // is how the TUI hands a credentialed shell to the user and gets control back afterwards.
-func Command(sess *awsint.Session, argv []string) (*exec.Cmd, error) {
+func Command(sess *awsint.Session, argv []string, credOverride ...string) (*exec.Cmd, error) {
 	if len(argv) == 0 {
 		return nil, errors.New("no command given")
 	}
@@ -183,17 +192,17 @@ func Command(sess *awsint.Session, argv []string) (*exec.Cmd, error) {
 	}
 
 	cmd := exec.Command(path, argv[1:]...)
-	cmd.Env = Env(os.Environ(), sess)
+	cmd.Env = Env(os.Environ(), sess, credOverride...)
 	return cmd, nil
 }
 
 // Run runs argv with the session's credentials injected, wired to the real terminal, and
 // returns the command's own exit code.
 //
-// The exit code is propagated rather than collapsed to 0/1 so that `postern exec -- aws ...`
+// The exit code is propagated rather than collapsed to 0/1 so that `warren exec -- aws ...`
 // can be used in a script or a && chain and behave like the command it wrapped.
-func Run(sess *awsint.Session, argv []string) (int, error) {
-	cmd, err := Command(sess, argv)
+func Run(sess *awsint.Session, argv []string, credOverride ...string) (int, error) {
+	cmd, err := Command(sess, argv, credOverride...)
 	if err != nil {
 		if len(argv) == 0 {
 			return 1, err
@@ -208,7 +217,7 @@ func Run(sess *awsint.Session, argv []string) (int, error) {
 
 	if err := cmd.Run(); err != nil {
 		// The command ran and failed on its own terms — that is its exit code to report, not
-		// an postern error to wrap.
+		// an warren error to wrap.
 		var ee *exec.ExitError
 		if errors.As(err, &ee) {
 			return ee.ExitCode(), nil

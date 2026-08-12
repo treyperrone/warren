@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/treyperrone/postern/internal/tui"
+	"github.com/treyperrone/warren/internal/tui"
 )
 
 // The bug this guards: quitting the picker without choosing must not run the wrapped command.
