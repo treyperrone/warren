@@ -1,0 +1,120 @@
+name: ci
+
+on:
+  # Every branch, not just main. Work usually lives on a branch before it is a pull request, and
+  # a check that only runs at merge time tells you too late to be useful.
+  push:
+  pull_request:
+  workflow_dispatch:
+  # Lets release.yml gate a tag on exactly these checks instead of keeping its own shorter copy
+  # that drifts. See the `checks` job there.
+  workflow_call:
+
+# A second push supersedes the first: cancel the older run rather than paying for a result nobody
+# will read. Tags are excluded — a release run must never be cancelled by an unrelated push.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    # warren ships for all three, and the differences are exactly where bugs hide: the plugin is
+    # extracted and exec'd per-platform, and the tmux wrapper is skipped on Windows. Testing only
+    # on Linux would have missed a released linux/arm64 bug once already.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: test
+        run: go test ./... -count=1
+
+      # Separate from the plain run: -race roughly triples the runtime, and the credential
+      # endpoint plus its renewal goroutine are the parts most worth checking it against.
+      - name: test -race
+        run: go test ./... -race -count=1
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # gofmt has no exit code for "unformatted", so the file list is the signal.
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "these files need gofmt:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: staticcheck
+        run: |
+          go install honnef.co/go/tools/cmd/staticcheck@v0.7.0
+          staticcheck ./...
+
+  security:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write # to upload gosec findings as code-scanning alerts
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # Reports only vulnerabilities warren actually reaches, so a finding here is real work
+      # rather than a version-number match somewhere in the dependency tree.
+      - name: govulncheck
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
+          govulncheck ./...
+
+      # Three rule classes are excluded because they fire on what warren structurally is, and a
+      # job that is always red gets ignored:
+      #   G104 unhandled errors — Close()/Kill() during teardown, idiomatic
+      #   G204 subprocess with a variable — launching the plugin, a shell and a browser is the job
+      #   G304 file opened via a variable — every path is derived from HOME or the cache dir
+      # Everything else stays enabled, and the two remaining known findings carry #nosec
+      # annotations with reasons in the source rather than being silenced here, so a genuinely
+      # new one fails this job.
+      # Run twice on purpose. The first pass with -no-fail always produces a report, so findings
+      # land in the Security tab as alerts with file and line context; the second pass is the gate
+      # that actually fails the job. One pass could do one or the other, not both.
+      - name: gosec (report)
+        run: |
+          go install github.com/securego/gosec/v2/cmd/gosec@v2.22.10
+          gosec -exclude=G104,G204,G304 -severity=medium -no-fail -fmt=sarif -out=gosec.sarif ./...
+
+      - name: upload gosec findings
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: gosec.sarif
+          category: gosec
+
+      - name: gosec (gate)
+        run: gosec -exclude=G104,G204,G304 -severity=medium ./...
+
+      # go.sum should already cover this, but it is one command and catches a tampered cache.
+      - name: verify module checksums
+        run: go mod verify

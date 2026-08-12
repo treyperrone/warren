@@ -15,7 +15,18 @@ permissions:
   contents: write # required to create the release and upload assets
 
 jobs:
+  # Gate the tag on exactly the checks CI runs, rather than a shorter copy kept here. This used to
+  # be a local `go test` plus `go vet`, which meant a tag could publish code that gofmt,
+  # staticcheck, gosec or govulncheck would have rejected — and it silently fell behind every time
+  # a check was added to CI.
+  checks:
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+      security-events: write
+
   release:
+    needs: checks
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -30,14 +41,6 @@ jobs:
           # never drift below the `go` directive.
           go-version-file: go.mod
           cache: true
-
-      # Don't publish a tag that doesn't build or pass its tests. The e2e test skips itself
-      # without POSTERN_E2E, so this stays offline.
-      - name: Test
-        run: go test ./...
-
-      - name: Vet
-        run: go vet ./...
 
       # Runs through the action so it uses the same pinned goreleaser as the release step.
       # `release` only warns about deprecated config; `check` fails on it, which is what

@@ -1,0 +1,42 @@
+name: codeql
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  # CodeQL's queries improve over time, so a weekly run finds things in unchanged code that the
+  # commit-time run could not have known about.
+  schedule:
+    - cron: "27 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  security-events: write # required to upload results to the Security tab
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Explicit setup-go rather than leaving it to autobuild, so the toolchain matches go.mod
+      # and CodeQL analyses the same code the release builds.
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - uses: github/codeql-action/init@v3
+        with:
+          languages: go
+          # security-and-quality is a superset of the default security-only suite. It is noisier,
+          # but this is a small codebase that brokers AWS credentials, so the trade is worth it.
+          queries: security-and-quality
+
+      - uses: github/codeql-action/autobuild@v3
+
+      - uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:go"
