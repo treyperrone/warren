@@ -73,12 +73,16 @@ func extract() (string, error) {
 		return "", fmt.Errorf("creating plugin temp file: %w", err)
 	}
 	defer os.Remove(tmp.Name()) // no-op once the rename succeeds
+	// The close errors on these two paths are discarded deliberately, unlike the one below and
+	// unlike AddSSOSession: this temp file is being abandoned and the deferred os.Remove deletes
+	// it, so there is no data whose durability could matter. Written as `_ =` so that is a
+	// decision on the page rather than an oversight.
 	if err := tmp.Chmod(0o700); err != nil {
-		tmp.Close()
+		_ = tmp.Close()
 		return "", fmt.Errorf("setting plugin permissions: %w", err)
 	}
 	if _, err := tmp.Write(pluginBinary); err != nil {
-		tmp.Close()
+		_ = tmp.Close()
 		return "", fmt.Errorf("writing plugin: %w", err)
 	}
 	if err := tmp.Close(); err != nil {

@@ -239,17 +239,21 @@ func AddSSOSession(s SSOSessionConfig) error {
 	if err != nil {
 		return fmt.Errorf("opening ~/.aws/config: %w", err)
 	}
-	if _, err := f.WriteString(block); err != nil {
-		f.Close()
-		return fmt.Errorf("writing ~/.aws/config: %w", err)
+	// One close, always reached, and its error always checked — rather than `defer f.Close()` or a
+	// bare Close on the error path. For a file opened for writing, Close is where buffered data
+	// actually reaches the disk, so discarding its error can report a successful append that never
+	// landed, on a full disk or a network filesystem. Reporting success for a block that is not in
+	// the file is the one outcome this function is built to avoid.
+	//
+	// The write error takes precedence when both fail: it says what went wrong, where a close
+	// error on an already-failed write is a consequence rather than the cause.
+	_, writeErr := f.WriteString(block)
+	closeErr := f.Close()
+	if writeErr != nil {
+		return fmt.Errorf("writing ~/.aws/config: %w", writeErr)
 	}
-	// Closed explicitly, and its error returned, rather than `defer f.Close()`. For a file opened
-	// for writing, Close is where buffered data actually reaches the disk — so discarding its
-	// error can report a successful append that never landed, on a full disk or a network
-	// filesystem. Reporting success for a block that is not in the file is the one outcome this
-	// function is built to avoid.
-	if err := f.Close(); err != nil {
-		return fmt.Errorf("writing ~/.aws/config: %w", err)
+	if closeErr != nil {
+		return fmt.Errorf("writing ~/.aws/config: %w", closeErr)
 	}
 	return nil
 }
