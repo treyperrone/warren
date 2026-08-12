@@ -9,12 +9,14 @@ import (
 	"testing"
 
 	awsint "github.com/treyperrone/warren/internal/aws"
+
+	"github.com/treyperrone/warren/internal/testenv"
 )
 
 // A machine with no ~/.aws/config used to be a hard stop: ParseConfig returned an error and
 // the program exited before drawing anything. Now it opens the form.
 func TestNewOpensSetupWhenNothingConfigured(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	testenv.SetHome(t, t.TempDir())
 
 	m, err := New(context.Background())
 	if err != nil {
@@ -29,7 +31,7 @@ func TestNewOpensSetupWhenNothingConfigured(t *testing.T) {
 // picker with nothing selectable — the same dead end by a different route.
 func TestNewOpensSetupWhenConfigHasNothingUsable(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	testenv.SetHome(t, home)
 	if err := os.MkdirAll(filepath.Join(home, ".aws"), 0700); err != nil {
 		t.Fatal(err)
 	}
@@ -85,7 +87,7 @@ func TestSetupFormRegionDefaults(t *testing.T) {
 // Clearing the prefilled region is a deliberate act and must not silently resurrect the
 // default — an empty region is an error, the same as it was before.
 func TestSetupFormClearedRegionIsAnError(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	testenv.SetHome(t, t.TempDir())
 
 	m, err := New(context.Background())
 	if err != nil {
@@ -107,7 +109,7 @@ func TestSetupFormClearedRegionIsAnError(t *testing.T) {
 // Saving with nothing typed must report which field is missing rather than writing anything.
 func TestSaveSetupRequiresEveryField(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	testenv.SetHome(t, home)
 
 	m, err := New(context.Background())
 	if err != nil {
@@ -138,7 +140,7 @@ func TestSaveSetupRequiresEveryField(t *testing.T) {
 
 // Whitespace is not a value. " " in the name field must not create [sso-session  ].
 func TestSaveSetupRejectsWhitespaceOnlyFields(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	testenv.SetHome(t, t.TempDir())
 
 	m, err := New(context.Background())
 	if err != nil {
@@ -208,7 +210,7 @@ func TestSetupViewOffersCancelWhenReachedFromMethod(t *testing.T) {
 // the failure mode of appending to the in-memory slice incorrectly, or of replacing it.
 func TestSaveSetupKeepsExistingSessions(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	testenv.SetHome(t, home)
 	if err := os.MkdirAll(filepath.Join(home, ".aws"), 0700); err != nil {
 		t.Fatal(err)
 	}
@@ -257,7 +259,7 @@ func TestSaveSetupKeepsExistingSessions(t *testing.T) {
 // on it at startup rather than being dropped straight into the account list.
 func TestMethodScreenIsFirstWithOneSession(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	testenv.SetHome(t, home)
 	if err := os.MkdirAll(filepath.Join(home, ".aws"), 0700); err != nil {
 		t.Fatal(err)
 	}

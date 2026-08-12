@@ -84,6 +84,8 @@ If no SSO session or profile is configured, warren offers to create one on start
 
 `~/.aws/config` is only ever appended to, never rewritten: it is shared with the `aws` CLI, Terraform, and every SDK on the machine. A `config.warren.bak` copy is taken before each append.
 
+The location follows the same rules the `aws` CLI uses — `AWS_CONFIG_FILE` if you set it, otherwise `~/.aws/config`, which on Windows means `%USERPROFILE%\.aws\config`. Sharing that path is what lets the SSO token cache be shared too, so signing in with one tool satisfies the other.
+
 The running version is also shown in the TUI's header bar, next to the name.
 
 ### Keys

@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/treyperrone/warren/internal/testenv"
 )
 
 // stamp renders an RFC3339 timestamp offset from now, the way the SSO cache stores expiries.
@@ -18,7 +20,7 @@ func stamp(d time.Duration) string {
 func fakeHome(t *testing.T) string {
 	t.Helper()
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	testenv.SetHome(t, home)
 	cache := filepath.Join(home, ".aws", "sso", "cache")
 	if err := os.MkdirAll(cache, 0700); err != nil {
 		t.Fatal(err)
@@ -58,7 +60,7 @@ func TestLive(t *testing.T) {
 
 func TestParseConfigScopes(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	testenv.SetHome(t, home)
 	if err := os.MkdirAll(filepath.Join(home, ".aws"), 0700); err != nil {
 		t.Fatal(err)
 	}
@@ -227,7 +229,7 @@ func TestCachedRecordIgnoresOtherStartURLs(t *testing.T) {
 
 func TestCachedRecordNoCacheDir(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home) // no .aws/sso/cache at all
+	testenv.SetHome(t, home) // no .aws/sso/cache at all
 	if rec := cachedRecord("https://one.example.com/start"); rec != nil {
 		t.Errorf("got %+v, want nil when the cache dir is absent", rec)
 	}

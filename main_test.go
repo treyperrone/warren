@@ -5,6 +5,8 @@ import (
 	"testing"
 
 	"github.com/treyperrone/warren/internal/tui"
+
+	"github.com/treyperrone/warren/internal/testenv"
 )
 
 // The bug this guards: quitting the picker without choosing must not run the wrapped command.
@@ -12,7 +14,7 @@ import (
 // "do nothing, exit clean" would run the command with whatever credentials the ambient
 // environment happened to hold — the opposite of what was asked for.
 func TestCancelledPickerRunsNothing(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	testenv.SetHome(t, t.TempDir())
 
 	m, err := tui.New(context.Background())
 	if err != nil {

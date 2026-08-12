@@ -5,12 +5,14 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/treyperrone/warren/internal/testenv"
 )
 
 func writeConfig(t *testing.T, body string) (home, path string) {
 	t.Helper()
 	home = t.TempDir()
-	t.Setenv("HOME", home)
+	testenv.SetHome(t, home)
 	if err := os.MkdirAll(filepath.Join(home, ".aws"), 0700); err != nil {
 		t.Fatal(err)
 	}
@@ -25,7 +27,7 @@ func writeConfig(t *testing.T, body string) (home, path string) {
 // first-run state, not a failure — the TUI offers to create one, which it cannot do if
 // ParseConfig aborts first.
 func TestParseConfigMissingFileIsNotAnError(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	testenv.SetHome(t, t.TempDir())
 
 	sessions, profiles, err := ParseConfig()
 	if err != nil {
@@ -118,7 +120,7 @@ func TestAddSSOSessionBacksUpExistingConfig(t *testing.T) {
 
 func TestAddSSOSessionCreatesConfigWhenMissing(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	testenv.SetHome(t, home)
 
 	if err := AddSSOSession(SSOSessionConfig{
 		Name: "fresh", StartURL: "https://e.awsapps.com/start", Region: "us-west-2",
@@ -195,7 +197,7 @@ func TestValidateSSOSession(t *testing.T) {
 // backup and a half-written config behind.
 func TestAddSSOSessionInvalidWritesNothing(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	testenv.SetHome(t, home)
 
 	if err := AddSSOSession(SSOSessionConfig{Name: "bad name", StartURL: "nope", Region: ""}); err == nil {
 		t.Fatal("invalid config was accepted")

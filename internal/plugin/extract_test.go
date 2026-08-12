@@ -9,6 +9,8 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+
+	"github.com/treyperrone/warren/internal/testenv"
 )
 
 // privateCache points UserCacheDir at a temp directory so extract() can be exercised without
@@ -19,7 +21,7 @@ func privateCache(t *testing.T) string {
 	dir := t.TempDir()
 	switch runtime.GOOS {
 	case "darwin":
-		t.Setenv("HOME", dir)
+		testenv.SetHome(t, dir)
 		return filepath.Join(dir, "Library", "Caches", "warren")
 	case "windows":
 		t.Setenv("LocalAppData", dir)

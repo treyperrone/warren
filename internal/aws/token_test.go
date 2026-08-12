@@ -5,6 +5,8 @@ import (
 	"errors"
 	"testing"
 	"time"
+
+	"github.com/treyperrone/warren/internal/testenv"
 )
 
 // The trap this guards: LiveToken falls through to the device-auth flow, which prints a user
@@ -15,7 +17,7 @@ import (
 // With no token cache there is nothing to validate and nothing to refresh, so this also proves
 // the silent path makes no network call before giving up.
 func TestSilentTokenNeverStartsDeviceAuth(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
+	testenv.SetHome(t, t.TempDir())
 
 	sess := SSOSessionConfig{
 		Name:     "crlab",

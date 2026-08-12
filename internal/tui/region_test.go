@@ -6,11 +6,13 @@ import (
 	"testing"
 
 	awsint "github.com/treyperrone/warren/internal/aws"
+
+	"github.com/treyperrone/warren/internal/testenv"
 )
 
 func newFormModel(t *testing.T) *Model {
 	t.Helper()
-	t.Setenv("HOME", t.TempDir())
+	testenv.SetHome(t, t.TempDir())
 	m, err := New(context.Background())
 	if err != nil {
 		t.Fatal(err)

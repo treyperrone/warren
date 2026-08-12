@@ -17,6 +17,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/sso"
 	"github.com/aws/aws-sdk-go-v2/service/ssooidc"
+
+	"github.com/treyperrone/warren/internal/homedir"
 )
 
 // Session holds a resolved set of AWS credentials and metadata.
@@ -72,7 +74,13 @@ type Account struct {
 // ConfigPath is the shared AWS config file. It belongs to the `aws` CLI, Terraform, and
 // every SDK on the machine — this package reads it freely but only ever appends to it.
 func ConfigPath() string {
-	return filepath.Join(os.Getenv("HOME"), ".aws", "config")
+	// AWS_CONFIG_FILE is the documented override and the aws CLI honours it, so ignoring it meant
+	// warren read a different file from the CLI on any machine that set it — while sharing the
+	// same SSO token cache, which is a confusing way to fail.
+	if p := os.Getenv("AWS_CONFIG_FILE"); p != "" {
+		return p
+	}
+	return filepath.Join(homedir.Dir(), ".aws", "config")
 }
 
 // ParseConfig reads ~/.aws/config and returns all sso-session blocks and named profiles.
@@ -138,9 +146,6 @@ func ParseConfig() ([]SSOSessionConfig, []ProfileConfig, error) {
 	return sessions, profiles, nil
 }
 
-// ValidateSSOSession checks a proposed sso-session block before it is written. The cost of
-// a typo here is a confusing OIDC failure several screens later, so it is worth catching
-// the obvious cases at the point of entry.
 // validSessionName reports whether name is safe to write inside an [sso-session <name>] header.
 func validSessionName(name string) bool {
 	for _, r := range name {
@@ -154,6 +159,9 @@ func validSessionName(name string) bool {
 	return true
 }
 
+// ValidateSSOSession checks a proposed sso-session block before it is written. The cost of
+// a typo here is a confusing OIDC failure several screens later, so it is worth catching
+// the obvious cases at the point of entry.
 func ValidateSSOSession(s SSOSessionConfig) error {
 	switch {
 	case s.Name == "":
@@ -212,8 +220,8 @@ func AddSSOSession(s SSOSessionConfig) error {
 	// Back up whatever is already there before touching it. A missing file needs no backup.
 	//
 	// #nosec G703,G304 -- gosec sees a non-literal path and reports traversal. path is
-	// ConfigPath(), which is filepath.Join(os.Getenv("HOME"), ".aws", "config"): no caller
-	// supplies it and no request data reaches it. A user able to set their own HOME can
+	// ConfigPath(): the user's own home directory, or AWS_CONFIG_FILE if they set it. No caller
+	// supplies it and no request data reaches it. A user able to set their own environment can
 	// already read and write their own files.
 	if prev, err := os.ReadFile(path); err == nil {
 		if err := os.WriteFile(path+".warren.bak", prev, 0o600); err != nil {
@@ -231,8 +239,16 @@ func AddSSOSession(s SSOSessionConfig) error {
 	if err != nil {
 		return fmt.Errorf("opening ~/.aws/config: %w", err)
 	}
-	defer f.Close()
 	if _, err := f.WriteString(block); err != nil {
+		f.Close()
+		return fmt.Errorf("writing ~/.aws/config: %w", err)
+	}
+	// Closed explicitly, and its error returned, rather than `defer f.Close()`. For a file opened
+	// for writing, Close is where buffered data actually reaches the disk — so discarding its
+	// error can report a successful append that never landed, on a full disk or a network
+	// filesystem. Reporting success for a block that is not in the file is the one outcome this
+	// function is built to avoid.
+	if err := f.Close(); err != nil {
 		return fmt.Errorf("writing ~/.aws/config: %w", err)
 	}
 	return nil
@@ -258,7 +274,7 @@ type tokenRecord struct {
 const expirySkew = 60 * time.Second
 
 func ssoCacheDir() string {
-	return filepath.Join(os.Getenv("HOME"), ".aws", "sso", "cache")
+	return filepath.Join(homedir.Dir(), ".aws", "sso", "cache")
 }
 
 // live reports whether an RFC3339 timestamp is still in the future. An unparseable or
