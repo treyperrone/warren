@@ -5,10 +5,30 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
 )
+
+// requireSh skips a test that runs a generated script. The scripts are /bin/sh, which Windows has
+// no equivalent of — and it needs none: Choose reports no window on Windows, so Launch returns
+// before writing a script at all. TestWindowsReportsNoWindow is what covers that contract.
+func requireSh(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("generated scripts are /bin/sh; Windows never reaches the code that writes one")
+	}
+}
+
+// noOutputCmd is a command that succeeds and prints nothing, for tests that assert on exactly what
+// the script itself emits.
+//
+// Not /bin/true: that path does not exist on macOS, where true lives in /usr/bin — which cost a CI
+// run to discover. /bin/sh is required by POSIX to be there, so the shell is the portable choice.
+func noOutputCmd() *exec.Cmd {
+	return exec.Command("/bin/sh", "-c", ":")
+}
 
 // fakeEnv builds an Env with a fixed platform, a fixed set of variables, and a fixed set of
 // binaries that exist. Nothing here touches the real host, so the same cases run on every runner.
@@ -138,6 +158,7 @@ func TestWindowsReportsNoWindow(t *testing.T) {
 // The plugin's arguments are JSON containing $, ", and \, all of which a double-quoted shell
 // string would re-expand. Getting this wrong corrupts the one argument the session depends on.
 func TestShellQuoteSurvivesJSON(t *testing.T) {
+	requireSh(t)
 	payload := `{"SessionId":"s-1","TokenValue":"a$b\"c\\d","Stream":"wss://x?y=1&z=2"}`
 	script := shellQuote(payload)
 
@@ -153,6 +174,7 @@ func TestShellQuoteSurvivesJSON(t *testing.T) {
 // A single quote is the one character single-quoting cannot contain, and the plugin's argv does
 // carry apostrophes in practice.
 func TestShellQuoteHandlesASingleQuote(t *testing.T) {
+	requireSh(t)
 	in := `it's a "test" $HOME`
 	out, err := exec.Command("/bin/sh", "-c", "printf %s "+shellQuote(in)).Output()
 	if err != nil {
@@ -164,6 +186,7 @@ func TestShellQuoteHandlesASingleQuote(t *testing.T) {
 }
 
 func TestScriptRunsTheCommandWithItsEnvironment(t *testing.T) {
+	requireSh(t)
 	dir := t.TempDir()
 	cmd := exec.Command("/bin/sh", "-c", `printf '%s|%s' "$WARREN_SESSION" "$1"`, "sh", "hello world")
 	cmd.Env = []string{"WARREN_SESSION=acct/Role", "PATH=" + os.Getenv("PATH")}
@@ -187,8 +210,9 @@ func TestScriptRunsTheCommandWithItsEnvironment(t *testing.T) {
 // With several sessions open at once, the window title is the only thing distinguishing them —
 // which is the point of opening them in separate windows in the first place.
 func TestScriptSetsTheWindowTitle(t *testing.T) {
+	requireSh(t)
 	dir := t.TempDir()
-	cmd := exec.Command("/bin/true")
+	cmd := noOutputCmd()
 	cmd.Env = []string{}
 
 	path, err := writeScript(dir, cmd, "goad-dc01")
@@ -227,6 +251,9 @@ func TestScriptExecsRatherThanReturning(t *testing.T) {
 
 // The script holds a session token, so its mode is part of the contract, not an incidental.
 func TestScriptIsPrivate(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Unix permission bits are not meaningful on Windows; ACLs govern access there")
+	}
 	dir := t.TempDir()
 	cmd := exec.Command("/bin/echo", "hi")
 	cmd.Env = []string{"AWS_SESSION_TOKEN=secret"}
