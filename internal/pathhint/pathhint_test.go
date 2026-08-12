@@ -7,10 +7,17 @@ import (
 	"testing"
 )
 
+// joinPath builds a PATH value with the separator this platform actually uses. Hardcoding ":"
+// made every "already on PATH" test fail on Windows, where the separator is ";" — the whole
+// string parsed as one entry, the directory was never found, and the hint fired.
+func joinPath(entries ...string) string {
+	return strings.Join(entries, string(os.PathListSeparator))
+}
+
 // The test binary lives in a temp directory that is not on PATH, which is the same
 // situation as a fresh `go install` — so a hint is expected by default.
 func TestHintWhenNotOnPath(t *testing.T) {
-	t.Setenv("PATH", "/usr/bin:/bin")
+	t.Setenv("PATH", joinPath("/usr/bin", "/bin"))
 	t.Setenv("SHELL", "/bin/zsh")
 
 	got := Hint()
@@ -36,7 +43,7 @@ func TestNoHintWhenOnPath(t *testing.T) {
 	if !ok {
 		t.Fatal("could not resolve exec dir")
 	}
-	t.Setenv("PATH", "/usr/bin:"+dir+":/bin")
+	t.Setenv("PATH", joinPath("/usr/bin", dir, "/bin"))
 
 	if got := Hint(); got != "" {
 		t.Errorf("hint shown for a binary already on PATH:\n%s", got)
@@ -55,7 +62,7 @@ func TestNoHintWhenPathEntryIsASymlink(t *testing.T) {
 		t.Skipf("symlinks unavailable: %v", err)
 	}
 
-	t.Setenv("PATH", "/usr/bin:"+link)
+	t.Setenv("PATH", joinPath("/usr/bin", link))
 	if got := Hint(); got != "" {
 		t.Errorf("hint shown when PATH reaches the directory via a symlink:\n%s", got)
 	}
@@ -64,7 +71,7 @@ func TestNoHintWhenPathEntryIsASymlink(t *testing.T) {
 // Relative and empty PATH entries are common ("" from a trailing colon, "." from older
 // setups) and must not crash or produce a spurious match.
 func TestOddPathEntriesAreHarmless(t *testing.T) {
-	t.Setenv("PATH", ":.::/usr/bin:")
+	t.Setenv("PATH", joinPath("", ".", "", "/usr/bin", ""))
 	t.Setenv("SHELL", "/bin/bash")
 
 	if got := Hint(); got == "" {

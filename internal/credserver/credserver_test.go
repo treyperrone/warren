@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -269,13 +270,32 @@ func TestRealAWSCLIUsesTheEndpoint(t *testing.T) {
 	s := testServer(t)
 	s.Set(session(time.Now().Add(time.Hour)))
 
-	cmd := exec.Command("aws", "configure", "list")
-	cmd.Env = append([]string{
+	// A scratch home so there is no real ~/.aws to fall back on: the point is that the credentials
+	// come from the endpoint and nowhere else.
+	//
+	// Both HOME and USERPROFILE, because the environment is built from scratch rather than
+	// inherited. The AWS CLI locates the home directory from USERPROFILE on Windows, and with
+	// neither set it refuses to start at all — "Could not determine home directory" — which looked
+	// like the endpoint failing when it was the test handing over an unusable environment.
+	home := t.TempDir()
+	env := []string{
 		"PATH=" + os.Getenv("PATH"),
 		"AWS_EC2_METADATA_DISABLED=1",
 		"AWS_REGION=us-east-1",
-		"HOME=" + t.TempDir(), // no real ~/.aws to fall back on
-	}, s.Env()...)
+		"HOME=" + home,
+		"USERPROFILE=" + home,
+	}
+	if runtime.GOOS == "windows" {
+		// Python, which the CLI is built on, needs these to import its own standard library.
+		for _, k := range []string{"SystemRoot", "SystemDrive", "TEMP", "TMP"} {
+			if v := os.Getenv(k); v != "" {
+				env = append(env, k+"="+v)
+			}
+		}
+	}
+
+	cmd := exec.Command("aws", "configure", "list")
+	cmd.Env = append(env, s.Env()...)
 
 	out, err := cmd.CombinedOutput()
 	if err != nil {

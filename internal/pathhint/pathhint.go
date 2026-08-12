@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 )
 
 // Hint returns advice on adding this binary's directory to PATH, or "" if it is already
@@ -47,21 +48,27 @@ func execDir() (string, bool) {
 	return dir, true
 }
 
+// onPath reports whether dir is one of the directories in PATH.
+//
+// Compared with os.SameFile rather than by string, because a string comparison is wrong in more
+// ways than it looks: Windows paths are case-insensitive, so C:\Users\me\go\bin and
+// c:\users\me\go\bin are one directory that compares unequal, and Windows also hands out 8.3
+// short names (RUNNER~1) for the same path. os.SameFile asks the filesystem whether two paths are
+// the same directory, which also covers symlinks and hardlinks for free.
 func onPath(dir string) bool {
+	want, err := os.Stat(dir)
+	if err != nil {
+		return false
+	}
 	for _, entry := range filepath.SplitList(os.Getenv("PATH")) {
 		if entry == "" {
 			continue
 		}
-		abs, err := filepath.Abs(entry)
+		got, err := os.Stat(entry)
 		if err != nil {
-			continue
+			continue // a PATH entry that does not exist cannot be this directory
 		}
-		// Resolve the PATH entry too: ~/go/bin and a symlinked /usr/local/go/bin can be the
-		// same directory by different names.
-		if resolved, err := filepath.EvalSymlinks(abs); err == nil {
-			abs = resolved
-		}
-		if abs == dir {
+		if os.SameFile(want, got) {
 			return true
 		}
 	}
@@ -72,6 +79,15 @@ func onPath(dir string) bool {
 // syntax differs enough between fish and the POSIX shells that a single generic line would
 // be wrong for someone.
 func shellAdvice(dir string) (line, reload string) {
+	// Windows first: $SHELL is normally unset there, so this used to fall through to the POSIX
+	// default and tell a Windows user to run `export PATH=...`, which is advice they cannot use.
+	// SetEnvironmentVariable at User scope is the persistent equivalent, and unlike setx it does
+	// not silently truncate a long PATH at 1024 characters.
+	if runtime.GOOS == "windows" {
+		return fmt.Sprintf(`[Environment]::SetEnvironmentVariable("Path", $env:Path + ";%s", "User")`, dir),
+			"(then open a new terminal)"
+	}
+
 	// Quote the directory, since a home directory can contain spaces.
 	switch filepath.Base(os.Getenv("SHELL")) {
 	case "zsh":
