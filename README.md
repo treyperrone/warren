@@ -111,6 +111,31 @@ An active search is cleared when you select something, so it never carries over 
 
 Instances additionally match on **any tag**, as `key=value`. Tags aren't displayed — an instance can carry a dozen CloudFormation-managed tags, which would bury the ID and IP on the row — but they are all searchable, so `/globogym` finds every instance tagged for that client and `/env=staging` narrows to one environment. This costs no extra API call: `DescribeInstances` already returns every tag.
 
+### Platform
+
+Each instance row leads with its platform, so the list reads:
+
+```
+goad-dc01       [windows] i-029e7453d3a7fb42e  10.71.191.132  t3.medium
+kali-01         [linux]   i-00e50be03fdd849cd  10.71.191.44   t3.small
+```
+
+The badge is fixed-width to keep the columns behind it aligned, and `/windows` narrows the list to
+the hosts worth pointing an RDP client at. The longer `PlatformDetails` string — `Red Hat Enterprise
+Linux`, `Windows with SQL Server Standard` — isn't displayed, since it would eat half a row, but it
+is searchable, so `/red hat` works.
+
+Like tags, this is free: `DescribeInstances` already returns `Platform` and `PlatformDetails`. AWS
+sets `Platform` to `windows` for Windows and omits it otherwise, so absence means "not Windows"
+rather than "Linux" — the positive Linux answer comes from `PlatformDetails`. When neither field
+settles it the badge reads `[unknown]`, because a wrong `[linux]` on a Windows host would send you
+to `ssh` and cost exactly the time the badge exists to save.
+
+The connection screen names the platform too — `Connect to goad-dc01 (windows)` — but **nothing is
+filtered out because of it**. Windows Server ships an optional OpenSSH server, xrdp exists for
+Linux, and a lab host may be running whatever someone put there. Hiding a connection type would be
+warren overruling a setup it can't see; naming the platform informs the choice instead of making it.
+
 ### Shell sessions and tmux
 
 An SSM shell runs directly in your terminal with a header line naming the account, role, and

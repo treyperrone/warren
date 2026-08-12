@@ -707,10 +707,12 @@ func (m *Model) selectInstance(id string) tea.Cmd {
 	for _, inst := range m.instances {
 		if inst.ID == id {
 			m.selInstance = &awsint.Instance{
-				ID:        inst.ID,
-				Name:      inst.Name,
-				PrivateIP: inst.PrivateIP,
-				Type:      inst.Type,
+				ID:              inst.ID,
+				Name:            inst.Name,
+				PrivateIP:       inst.PrivateIP,
+				Type:            inst.Type,
+				Platform:        inst.Platform,
+				PlatformDetails: inst.PlatformDetails,
 			}
 			m.buildConnTypeList()
 			m.screen = screenConnType
@@ -1125,15 +1127,22 @@ func (m *Model) buildInstanceList() {
 	for _, i := range m.instances {
 		items = append(items, item{
 			title: i.Name,
-			desc:  fmt.Sprintf("%s  %s  %s", i.ID, i.PrivateIP, i.Type),
+			// Platform leads the row rather than trailing it. It is the field that decides
+			// which connection type is worth trying, so it wants to be scannable down the
+			// column; the id and IP are things you copy once you have already chosen a row.
+			desc:  fmt.Sprintf("%s %s  %s  %s", i.PlatformBadge(), i.ID, i.PrivateIP, i.Type),
 			value: i.ID,
 			// Tags are searchable but not shown — see item.search. "key=value" means a search
 			// for "prod" hits any tag whose value contains it, and "env=prod" narrows to the
 			// one tag, without needing a query syntax of our own.
-			search: strings.Join(i.TagPairs(), " "),
+			//
+			// PlatformDetails joins them for the same reason: "/windows" then narrows to the
+			// hosts worth an RDP tunnel, and the longer strings ("Red Hat Enterprise Linux")
+			// are searchable without costing a row's width to display.
+			search: strings.Join(append(i.TagPairs(), i.PlatformDetails), " "),
 		})
 	}
-	m.list.Title = "Select instance  •  /=search name, ID, IP, or any tag  •  Esc=back"
+	m.list.Title = "Select instance  •  /=search name, ID, IP, platform, or any tag  •  Esc=back"
 	m.list.SetStatusBarItemName("instance", "instances")
 	m.setListItems(items)
 }
@@ -1145,7 +1154,15 @@ func (m *Model) buildConnTypeList() {
 		item{title: "RDP tunnel", desc: "forward port 3389 → localhost:13389+", value: "rdp"},
 		item{title: "Quit", desc: "", value: "quit"},
 	}
-	m.list.Title = fmt.Sprintf("Connect to %s  •  Esc=back", m.selInstance.Name)
+	// The platform is named here, on the one screen where it changes the decision, but nothing
+	// on this list is removed because of it: Windows Server ships an optional OpenSSH server and
+	// xrdp exists for Linux, so hiding a connection type would be warren overruling a setup it
+	// cannot see. Naming the platform informs the choice; filtering would make it for you.
+	title := fmt.Sprintf("Connect to %s", m.selInstance.Name)
+	if p := m.selInstance.Platform; p != "" {
+		title += " (" + p + ")"
+	}
+	m.list.Title = title + "  •  Esc=back"
 	m.setListItems(items)
 }
 
