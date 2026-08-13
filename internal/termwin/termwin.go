@@ -101,15 +101,18 @@ func Choose(e Env) Strategy {
 
 	switch e.GOOS {
 	case "darwin":
-		// `open -a <app> <file>` makes the app open the file in a new window, which for a
-		// terminal means running it. osascript could do more but needs Automation permission,
-		// and a permission prompt on first connect is a bad trade for a window.
-		app := "Terminal"
-		if strings.Contains(strings.ToLower(e.Getenv("TERM_PROGRAM")), "iterm") {
-			app = "iTerm"
-		}
+		// `open -a Terminal <file>` makes Terminal.app open the file in a new window, which
+		// for a terminal means running it. osascript could do more but needs Automation
+		// permission, and a permission prompt on first connect is a bad trade for a window.
+		//
+		// Always Terminal.app rather than detecting the calling emulator: `open -a` only
+		// reliably runs the script (rather than merely opening it) in apps that register as a
+		// terminal handler the way Terminal.app and iTerm do, and that is not true of every
+		// emulator someone might be running warren from. Terminal.app ships with macOS, so it
+		// is always there to fall back to. Anyone who wants their own emulator instead already
+		// has WARREN_TERMINAL for exactly this.
 		if bin, err := e.LookPath("open"); err == nil {
-			return Strategy{Name: app, Argv: []string{bin, "-a", app}}
+			return Strategy{Name: "Terminal", Argv: []string{bin, "-a", "Terminal"}}
 		}
 	case "linux", "freebsd", "openbsd", "netbsd":
 		// No display, no window. Checked before looking for an emulator, because the emulator

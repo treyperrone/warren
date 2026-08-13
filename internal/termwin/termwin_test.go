@@ -102,10 +102,13 @@ func TestDarwinDoesNotNeedDisplay(t *testing.T) {
 	}
 }
 
-func TestITermPreferredWhenRunningInIt(t *testing.T) {
+// Terminal.app is the choice regardless of which emulator warren was launched from: `open -a`
+// only reliably runs a script (rather than just opening it) in apps registered as a terminal
+// handler, which not every emulator is, and Terminal.app is guaranteed present on macOS.
+func TestDarwinAlwaysUsesTerminalApp(t *testing.T) {
 	e := fakeEnv("darwin", map[string]string{"TERM_PROGRAM": "iTerm.app"}, "open")
-	if got := Choose(e).Name; got != "iTerm" {
-		t.Errorf("chose %q inside iTerm, want iTerm", got)
+	if got := Choose(e).Name; got != "Terminal" {
+		t.Errorf("chose %q inside iTerm, want Terminal", got)
 	}
 }
 
