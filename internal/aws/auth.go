@@ -77,8 +77,17 @@ func ConfigPath() string {
 	// AWS_CONFIG_FILE is the documented override and the aws CLI honours it, so ignoring it meant
 	// warren read a different file from the CLI on any machine that set it — while sharing the
 	// same SSO token cache, which is a confusing way to fail.
+	//
+	// Except warren's own sentinel: `warren shell`/`exec` set this exact value on a child so that
+	// child's AWS calls cannot see an ambient [default] profile. Running warren again from inside
+	// that child — its ordinary, expected shell — inherits the same environment, and honouring
+	// the sentinel here would make warren unable to find its own sso-sessions, showing first-run
+	// setup on a machine that is already configured. A value the user set deliberately for their
+	// own reasons is still honoured; only this one specific, warren-generated value is skipped.
 	if p := os.Getenv("AWS_CONFIG_FILE"); p != "" {
-		return p
+		if sentinel, _ := NeutralizedProfilePaths(); p != sentinel {
+			return p
+		}
 	}
 	return filepath.Join(homedir.Dir(), ".aws", "config")
 }

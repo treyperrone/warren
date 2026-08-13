@@ -125,3 +125,31 @@ func TestExpiresIn(t *testing.T) {
 		})
 	}
 }
+
+// NeutralizedProfilePaths is shared between two consumers that must agree on the exact value: one
+// that sets it (internal/awsexec, on a spawned child) and one that has to recognise and discard it
+// (ConfigPath, so warren run from inside that child can still find its own config). Either
+// consumer computing its own copy risks drift; a stable, deterministic value is what makes sharing
+// the single source of truth actually work.
+func TestNeutralizedProfilePathsIsStable(t *testing.T) {
+	cfg1, creds1 := NeutralizedProfilePaths()
+	cfg2, creds2 := NeutralizedProfilePaths()
+	if cfg1 != cfg2 || creds1 != creds2 {
+		t.Errorf("NeutralizedProfilePaths is not stable across calls: (%q,%q) vs (%q,%q)", cfg1, creds1, cfg2, creds2)
+	}
+}
+
+// A generic name like "config" under a shared temp directory is exactly the kind of path some
+// unrelated tool might also use — namespacing to warren specifically is what avoids that
+// collision, and is also what would let anyone reading an env dump recognise it as warren's.
+func TestNeutralizedProfilePathsAreNamespaced(t *testing.T) {
+	cfg, creds := NeutralizedProfilePaths()
+	for _, p := range []string{cfg, creds} {
+		if !strings.Contains(strings.ToLower(p), "warren") {
+			t.Errorf("%q is not namespaced to warren", p)
+		}
+	}
+	if cfg == creds {
+		t.Error("config and credentials sentinels must be distinct paths")
+	}
+}

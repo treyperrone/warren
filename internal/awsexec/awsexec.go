@@ -13,7 +13,6 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"runtime"
 	"strings"
 
@@ -85,14 +84,18 @@ func Env(parent []string, sess *awsint.Session, credOverride ...string) []string
 //
 // It does not need to exist. Verified live against the real CLI: a missing config or credentials
 // file is treated as "no profiles defined", not as an error — so this asks for nothing warren has
-// to create or clean up. os.TempDir() rather than a cache directory because it never errors,
-// which matters here: this path has no error return, so a fallible lookup would need one just to
-// stay unreachable.
+// to create or clean up.
+//
+// The exact values come from awsint.NeutralizedProfilePaths rather than being generated here,
+// because warren's own process has to recognise and discard this exact sentinel at startup — see
+// stripInheritedNeutralization in main.go. A local copy that drifted from that one even slightly
+// would go unrecognised, and warren run from inside its own spawned shell would be unable to find
+// the user's real ~/.aws/config again.
 func noAmbientProfileEnv() []string {
-	dir := filepath.Join(os.TempDir(), "warren-no-ambient-aws-profile")
+	cfg, creds := awsint.NeutralizedProfilePaths()
 	return []string{
-		"AWS_CONFIG_FILE=" + filepath.Join(dir, "config"),
-		"AWS_SHARED_CREDENTIALS_FILE=" + filepath.Join(dir, "credentials"),
+		"AWS_CONFIG_FILE=" + cfg,
+		"AWS_SHARED_CREDENTIALS_FILE=" + creds,
 	}
 }
 

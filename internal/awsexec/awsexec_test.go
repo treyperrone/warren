@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	awsint "github.com/treyperrone/warren/internal/aws"
+	"github.com/treyperrone/warren/internal/testenv"
 )
 
 func envMap(t *testing.T, pairs []string) map[string]string {
@@ -519,6 +520,28 @@ func TestEnvSetsProfileFilePathsExactlyOnce(t *testing.T) {
 
 	if n := strings.Count(joined, "AWS_CONFIG_FILE="); n != 1 {
 		t.Errorf("AWS_CONFIG_FILE appears %d times, want exactly 1", n)
+	}
+}
+
+// The exact scenario confirmed on the first real machine this shipped to: `warren shell` opens an
+// interactive shell — the user's ordinary, expected use of it — and that shell carries the
+// sentinel Env sets. Running warren again from inside it must still find the real ~/.aws/config,
+// or every sso-session on the machine appears to vanish and warren offers first-run setup on an
+// already-configured machine.
+func TestEnvSentinelIsTransparentToConfigPathInAChild(t *testing.T) {
+	home := t.TempDir()
+	testenv.SetHome(t, home)
+
+	sess := &awsint.Session{AccessKeyID: "AKIA", SecretAccessKey: "s", Region: "us-east-1"}
+	got := envMap(t, Env(nil, sess))
+
+	// Simulates "warren, run again, inside the shell Env just described" — that shell's own
+	// AWS_CONFIG_FILE is exactly what Env put in its environment.
+	t.Setenv("AWS_CONFIG_FILE", got["AWS_CONFIG_FILE"])
+
+	want := filepath.Join(home, ".aws", "config")
+	if p := awsint.ConfigPath(); p != want {
+		t.Errorf("ConfigPath() = %q inside a warren-spawned shell, want the real config %q", p, want)
 	}
 }
 

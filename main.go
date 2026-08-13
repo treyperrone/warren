@@ -50,6 +50,7 @@ const (
 )
 
 func main() {
+	stripInheritedNeutralization()
 	run := parseArgs()
 
 	ctx := context.Background()
@@ -94,6 +95,30 @@ func main() {
 	// Printed last, and only while it is still true: once the directory is on PATH the
 	// hint disappears on its own, so this cannot become a permanent nag.
 	fmt.Print(pathhint.Hint())
+}
+
+// stripInheritedNeutralization undoes, at the start of every warren process, what a warren-spawned
+// child was given to protect ITS OWN AWS calls from an ambient profile.
+//
+// The bug this closes: `warren exec`/`shell` set AWS_CONFIG_FILE and AWS_SHARED_CREDENTIALS_FILE
+// on the child to a path that never exists, so the child's own AWS calls cannot fall back to a
+// bare [default] profile in ~/.aws/credentials — see internal/awsexec.Env. That child is, for
+// `warren shell`, an ordinary interactive shell the user goes on using. Running `warren` again
+// from inside it inherits the same two variables, and both warren's own config.ParseConfig (via
+// ConfigPath) and every AWS SDK call this tool makes (config.LoadDefaultConfig, used by
+// ProfileSession, ListInstances, and the tunnel package) read AWS_SHARED_CREDENTIALS_FILE
+// directly — a check inside ConfigPath alone cannot reach that second one. So a warren launched
+// from inside its own spawned shell would see no sso-sessions and be unable to resolve any named
+// profile, reproducing on itself exactly the failure this was built to prevent for everything
+// else. This must run before anything else touches the environment or loads AWS config.
+func stripInheritedNeutralization() {
+	cfg, creds := awsint.NeutralizedProfilePaths()
+	if os.Getenv("AWS_CONFIG_FILE") == cfg {
+		os.Unsetenv("AWS_CONFIG_FILE")
+	}
+	if os.Getenv("AWS_SHARED_CREDENTIALS_FILE") == creds {
+		os.Unsetenv("AWS_SHARED_CREDENTIALS_FILE")
+	}
 }
 
 // invocation is the parsed command line.

@@ -2,6 +2,8 @@ package aws
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"time"
 )
 
@@ -69,6 +71,24 @@ func EnvKeys() []string {
 		"AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
 		"AWS_CONTAINER_AUTHORIZATION_TOKEN",
 	}
+}
+
+// NeutralizedProfilePaths are the AWS_CONFIG_FILE and AWS_SHARED_CREDENTIALS_FILE values a child
+// process is given to stop it falling back to an ambient [default] profile — a bare profile in
+// ~/.aws/credentials needs no AWS_PROFILE to be reached, and it was found to answer ahead of both
+// injected credentials and a credential endpoint. Neither path is ever created; a missing config
+// or credentials file is treated as "no profiles defined," not an error.
+//
+// Exported, and read back by ConfigPath below, for a reason specific to this tool: warren itself
+// is a consumer of AWS_CONFIG_FILE, to find the very sso-sessions its own picker lists. `warren
+// exec`/`shell` spawn a child that carries this sentinel so *its* AWS calls cannot see the ambient
+// profile — but running `warren` again from inside that child (its normal, expected shell) would
+// otherwise inherit the sentinel and be unable to find the user's real ~/.aws/config, reproducing
+// on warren itself the exact failure this was built to prevent for everything else. ConfigPath
+// recognising its own sentinel and discarding it is what keeps those two purposes from colliding.
+func NeutralizedProfilePaths() (configFile, credentialsFile string) {
+	dir := filepath.Join(os.TempDir(), "warren-no-ambient-aws-profile")
+	return filepath.Join(dir, "config"), filepath.Join(dir, "credentials")
 }
 
 // ExpiresIn renders the time left on the credentials, or "" when the expiry is unknown —

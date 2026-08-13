@@ -60,6 +60,39 @@ func TestConfigPathHonoursAwsConfigFile(t *testing.T) {
 	}
 }
 
+// The bug this guards: warren's own sentinel — set on a `warren shell`/`exec` child by
+// internal/awsexec so *that child's* AWS calls cannot see an ambient [default] profile — is
+// still just an AWS_CONFIG_FILE value, and ConfigPath honoured AWS_CONFIG_FILE unconditionally.
+// Run `warren` again from inside the shell it just handed you (its ordinary, expected use), and
+// it would inherit the sentinel and find no sso-sessions, offering first-run setup on a machine
+// that is already configured. Confirmed live: exactly this happened on the first real machine
+// this shipped to.
+func TestConfigPathIgnoresItsOwnNeutralizationSentinel(t *testing.T) {
+	home := t.TempDir()
+	testenv.SetHome(t, home)
+
+	sentinel, _ := NeutralizedProfilePaths()
+	t.Setenv("AWS_CONFIG_FILE", sentinel)
+
+	want := filepath.Join(home, ".aws", "config")
+	if got := ConfigPath(); got != want {
+		t.Errorf("ConfigPath() = %q with its own sentinel set, want the real default %q", got, want)
+	}
+}
+
+// A value the user set for their own reasons — pointing warren and the aws CLI at a shared
+// alternate config — must still be honoured. Only the exact sentinel value is special-cased.
+func TestConfigPathStillHonoursARealOverride(t *testing.T) {
+	testenv.SetHome(t, t.TempDir())
+
+	custom := filepath.Join(t.TempDir(), "elsewhere.cfg")
+	t.Setenv("AWS_CONFIG_FILE", custom)
+
+	if got := ConfigPath(); got != custom {
+		t.Errorf("ConfigPath() = %q, want the deliberate override %q — the sentinel check must not swallow a real one", got, custom)
+	}
+}
+
 // An empty AWS_CONFIG_FILE must not be mistaken for a request to use "" as the path, which would
 // make every read fail and every write land nowhere.
 func TestEmptyAwsConfigFileFallsBackToHome(t *testing.T) {
