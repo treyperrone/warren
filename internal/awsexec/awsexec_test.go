@@ -2,7 +2,9 @@ package awsexec
 
 import (
 	"errors"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
@@ -443,5 +445,95 @@ func TestEnvStripsInheritedEndpointVariables(t *testing.T) {
 		if strings.HasPrefix(k, "AWS_CONTAINER_") {
 			t.Errorf("inherited %s survived: %q", k, got[k])
 		}
+	}
+}
+
+// The bug this guards: an ordinary [default] profile in ~/.aws/config or ~/.aws/credentials needs
+// no AWS_PROFILE to be reached, and the CLI's own resolution order let that profile answer ahead
+// of both the injected keys and the credential endpoint. Confirmed live: two `warren exec` calls
+// against two different accounts returned the identical S3 bucket at the identical creation
+// timestamp, proving the same ambient identity answered both times regardless of which account
+// had been picked. Hiding the parent's config and credentials files is what closes that off.
+func TestEnvHidesAmbientProfileFiles(t *testing.T) {
+	sess := &awsint.Session{AccessKeyID: "AKIA", SecretAccessKey: "s", Region: "us-east-1"}
+	override := []string{
+		"AWS_CONTAINER_CREDENTIALS_FULL_URI=http://127.0.0.1:9/credentials",
+		"AWS_CONTAINER_AUTHORIZATION_TOKEN=tok",
+	}
+
+	for _, tc := range []struct {
+		name string
+		got  map[string]string
+	}{
+		{"static credentials", envMap(t, Env(nil, sess))},
+		{"credential endpoint", envMap(t, Env(nil, sess, override...))},
+	} {
+		for _, k := range []string{"AWS_CONFIG_FILE", "AWS_SHARED_CREDENTIALS_FILE"} {
+			v := tc.got[k]
+			if v == "" {
+				t.Errorf("%s: %s not set, so the child falls back to the real ~/.aws files", tc.name, k)
+				continue
+			}
+			if _, err := os.Stat(v); !os.IsNotExist(err) {
+				t.Errorf("%s: %s = %q exists (or stat failed unexpectedly: %v) — it must point at nothing", tc.name, k, v, err)
+			}
+			// Not just "happens not to exist on this machine": a bare, generic name like
+			// "/tmp/config" is exactly the kind of path some unrelated tool might also use,
+			// which would reintroduce the same bug by a different door. The directory has to be
+			// namespaced to warren specifically, or "it doesn't exist right now" is luck, not a
+			// guarantee.
+			if dir := filepath.Dir(v); !strings.Contains(strings.ToLower(dir), "warren") {
+				t.Errorf("%s: %s = %q is not namespaced to warren, so another tool's file at the same generic path would reopen this bug", tc.name, k, v)
+			}
+		}
+	}
+}
+
+// A parent that had its own AWS_CONFIG_FILE (a legitimate override for the user's own shell, e.g.
+// to use an alternate config) must not have that value survive into the child — only warren's
+// own nonexistent path may reach it, or the ambient-profile hole reopens.
+func TestEnvStripsInheritedProfileFilePaths(t *testing.T) {
+	parent := []string{
+		"AWS_CONFIG_FILE=/home/trey/somewhere/config",
+		"AWS_SHARED_CREDENTIALS_FILE=/home/trey/somewhere/credentials",
+	}
+	got := envMap(t, Env(parent, &awsint.Session{AccessKeyID: "AKIA", SecretAccessKey: "s"}))
+
+	for k, inherited := range map[string]string{
+		"AWS_CONFIG_FILE":             "/home/trey/somewhere/config",
+		"AWS_SHARED_CREDENTIALS_FILE": "/home/trey/somewhere/credentials",
+	} {
+		if got[k] == inherited {
+			t.Errorf("%s = %q, the inherited value survived instead of being replaced", k, got[k])
+		}
+	}
+}
+
+// Each of AWS_CONFIG_FILE and AWS_SHARED_CREDENTIALS_FILE must appear exactly once. A stray
+// second assignment would mean the strip and the append both fired, and which one a shell or the
+// SDK honours is not something to leave to chance — the same failure mode this whole fix exists
+// to remove.
+func TestEnvSetsProfileFilePathsExactlyOnce(t *testing.T) {
+	parent := []string{"AWS_CONFIG_FILE=/stale/config"}
+	joined := strings.Join(Env(parent, &awsint.Session{AccessKeyID: "AKIA", SecretAccessKey: "s"}), "\n")
+
+	if n := strings.Count(joined, "AWS_CONFIG_FILE="); n != 1 {
+		t.Errorf("AWS_CONFIG_FILE appears %d times, want exactly 1", n)
+	}
+}
+
+// Proves the hiding actually works end to end, not just that Env() returns the right strings: a
+// real child process must be unable to see anything at the path it was given.
+func TestChildCannotReadTheHiddenProfileFiles(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX shell not available")
+	}
+	sess := &awsint.Session{AccessKeyID: "AKIA", SecretAccessKey: "s", Region: "us-east-1"}
+	code, err := Run(sess, []string{"sh", "-c", `test ! -e "$AWS_CONFIG_FILE" && test ! -e "$AWS_SHARED_CREDENTIALS_FILE"`})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if code != 0 {
+		t.Error("the child sees something at the path meant to hide the ambient profile files")
 	}
 }

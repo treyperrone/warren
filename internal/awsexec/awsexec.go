@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strings"
 
@@ -34,14 +35,26 @@ const SessionLabelVar = "WARREN_SESSION"
 // credOverride, when given, replaces the session's own credential variables — used to point the
 // child at the local credential endpoint instead of handing it a copy that cannot be updated. The
 // region and the session label are supplied either way.
+//
+// AWS_CONFIG_FILE and AWS_SHARED_CREDENTIALS_FILE are stripped and then repointed at a path that
+// never exists — see noAmbientProfileEnv. The bug this closes: with an ordinary [default] profile
+// on the machine (a plain `~/.aws/credentials`, no AWS_PROFILE needed to reach it), the CLI's own
+// resolution order let that profile answer ahead of the credential endpoint. Two `warren exec`
+// calls against two different accounts returned the identical S3 bucket at the identical creation
+// timestamp — proof it was the same ambient identity both times, not the account either had
+// picked. Every Session reaching this function already carries resolved static keys (see
+// ProfileSession), so no caller depends on the child resolving anything by profile name, which is
+// what makes hiding the ambient files safe unconditionally rather than only for the endpoint path.
 func Env(parent []string, sess *awsint.Session, credOverride ...string) []string {
-	strip := make(map[string]bool, len(awsint.EnvKeys()))
+	strip := make(map[string]bool, len(awsint.EnvKeys())+2)
 	for _, k := range awsint.EnvKeys() {
 		strip[k] = true
 	}
 	strip[SessionLabelVar] = true
+	strip["AWS_CONFIG_FILE"] = true
+	strip["AWS_SHARED_CREDENTIALS_FILE"] = true
 
-	out := make([]string, 0, len(parent)+len(awsint.EnvKeys())+1)
+	out := make([]string, 0, len(parent)+len(awsint.EnvKeys())+4)
 	for _, kv := range parent {
 		// An entry without "=" is not a variable assignment; pass it through untouched
 		// rather than guessing at it.
@@ -58,11 +71,29 @@ func Env(parent []string, sess *awsint.Session, credOverride ...string) []string
 		out = append(out, sess.CredentialEnv()...)
 	}
 	out = append(out, sess.RegionEnv()...)
+	out = append(out, noAmbientProfileEnv()...)
 
 	if sess.Label != "" {
 		out = append(out, SessionLabelVar+"="+sess.Label)
 	}
 	return out
+}
+
+// noAmbientProfileEnv points AWS_CONFIG_FILE and AWS_SHARED_CREDENTIALS_FILE at a path warren
+// never writes to, so a child cannot fall back to reading the real ~/.aws/config or
+// ~/.aws/credentials.
+//
+// It does not need to exist. Verified live against the real CLI: a missing config or credentials
+// file is treated as "no profiles defined", not as an error — so this asks for nothing warren has
+// to create or clean up. os.TempDir() rather than a cache directory because it never errors,
+// which matters here: this path has no error return, so a fallible lookup would need one just to
+// stay unreachable.
+func noAmbientProfileEnv() []string {
+	dir := filepath.Join(os.TempDir(), "warren-no-ambient-aws-profile")
+	return []string{
+		"AWS_CONFIG_FILE=" + filepath.Join(dir, "config"),
+		"AWS_SHARED_CREDENTIALS_FILE=" + filepath.Join(dir, "credentials"),
+	}
 }
 
 // runnerScript runs the user's command line and then explains what happened.
