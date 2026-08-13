@@ -173,7 +173,7 @@ sessions can be open at once. What counts as a window depends on where warren is
 | --- | --- |
 | `$WARREN_TERMINAL` set | that command opens the window |
 | inside tmux | a new tmux window |
-| macOS | a new Terminal (or iTerm) window |
+| macOS | a new Terminal.app window, whichever emulator you started from |
 | Linux/BSD with a display | the first of `x-terminal-emulator`, `gnome-terminal`, `konsole`, `xfce4-terminal`, `alacritty`, `kitty`, `wezterm`, `xterm` |
 | **anything headless** | the session runs in place, as before |
 
@@ -182,12 +182,16 @@ a terminal emulator, which needs a display server to draw into. Over SSH to a he
 none, so *no* process running there can make a window — warren included. It runs the session in place
 and the `?` screen says why, rather than appearing to do nothing.
 
-Detection can't be exhaustive, so `WARREN_TERMINAL` overrides all of it. The value is an argv prefix
-and the script path is appended last:
+On macOS it is always Terminal.app, even from iTerm or Ghostty. `open -a` only reliably *runs* a
+script rather than merely opening it in apps that register as a terminal handler, which not every
+emulator does — and Terminal.app ships with the OS, so it is always there. Detection can't be
+exhaustive anyway, which is what `WARREN_TERMINAL` is for: it overrides everything above. The value
+is an argv prefix and the script path is appended last:
 
 ```sh
 export WARREN_TERMINAL="wezterm start --"
 export WARREN_TERMINAL="kitty --hold"
+export WARREN_TERMINAL="open -a Ghostty"
 ```
 
 warren launches the window and forgets it. It doesn't track the session, because knowing when the
