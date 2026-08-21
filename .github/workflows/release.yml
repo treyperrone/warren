@@ -45,12 +45,12 @@ jobs:
       # Runs through the action so it uses the same pinned goreleaser as the release step.
       # `release` only warns about deprecated config; `check` fails on it, which is what
       # keeps the config from rotting until a goreleaser major removes something.
-      - uses: goreleaser/goreleaser-action@v6
+      - uses: goreleaser/goreleaser-action@v7
         with:
           version: "~> v2"
           args: check
 
-      - uses: goreleaser/goreleaser-action@v6
+      - uses: goreleaser/goreleaser-action@v7
         with:
           version: "~> v2"
           # On a tag: build and publish. On manual dispatch: build only, so a dry run
