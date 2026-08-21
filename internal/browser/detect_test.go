@@ -2,7 +2,6 @@ package browser
 
 import (
 	"errors"
-	"path/filepath"
 	"testing"
 )
 
@@ -84,7 +83,7 @@ func TestDetectWindowsProbesEnvRootedPaths(t *testing.T) {
 		"LOCALAPPDATA":      `C:\Users\trey\AppData\Local`,
 		"APPDATA":           `C:\Users\trey\AppData\Roaming`,
 	}
-	edgeExe := filepath.Join(`C:\Program Files (x86)`, `Microsoft\Edge\Application\msedge.exe`)
+	edgeExe := `C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe`
 	d := fakeDeps("windows", `C:\Users\trey`, env, map[string]bool{edgeExe: true}, nil)
 
 	got := detect(d)
@@ -94,7 +93,7 @@ func TestDetectWindowsProbesEnvRootedPaths(t *testing.T) {
 	if got[0].Path != edgeExe {
 		t.Errorf("edge.Path = %q, want the probed exe path %q", got[0].Path, edgeExe)
 	}
-	if want := filepath.Join(`C:\Users\trey\AppData\Local`, `Microsoft\Edge\User Data`); got[0].DataDir != want {
+	if want := `C:\Users\trey\AppData\Local\Microsoft\Edge\User Data`; got[0].DataDir != want {
 		t.Errorf("edge.DataDir = %q, want %q", got[0].DataDir, want)
 	}
 }
@@ -103,7 +102,7 @@ func TestDetectWindowsProbesEnvRootedPaths(t *testing.T) {
 // relative path that accidentally exists — the env miss skips the candidate outright.
 func TestDetectWindowsSkipsUnsetEnvRoots(t *testing.T) {
 	d := fakeDeps("windows", `C:\Users\trey`, map[string]string{},
-		map[string]bool{filepath.Join("", `Mozilla Firefox\firefox.exe`): true}, nil)
+		map[string]bool{`\Mozilla Firefox\firefox.exe`: true}, nil)
 	if got := detect(d); len(got) != 0 {
 		t.Fatalf("detect = %v, want nothing when every env root is unset", got)
 	}

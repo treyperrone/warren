@@ -11,7 +11,7 @@ package browser
 import (
 	"os"
 	"os/exec"
-	"path/filepath"
+	"path"
 	"runtime"
 	"strings"
 
@@ -166,6 +166,18 @@ type deps struct {
 	lookPath func(string) (string, error)
 }
 
+// join builds a path in the SIMULATED OS's dialect, not the host's. Detection is driven by
+// d.goos so tests can describe any OS from any OS — but the host's filepath.Join broke that
+// promise: simulating macOS on the Windows CI runner produced \-joined paths that matched
+// nothing, which is exactly the class of only-fails-on-another-OS bug the injected deps
+// exist to prevent. On a real machine d.goos is runtime.GOOS and this agrees with the host.
+func (d deps) join(elem ...string) string {
+	if d.goos == "windows" {
+		return strings.Join(elem, `\`)
+	}
+	return path.Join(elem...)
+}
+
 func realDeps() deps {
 	return deps{
 		goos:     runtime.GOOS,
@@ -203,8 +215,8 @@ func (s spec) locate(d deps) (Browser, bool) {
 		}
 		// /Applications first, ~/Applications second: both are where macOS puts apps, and
 		// `open -a <name>` will find either — the probe only decides whether to list it.
-		for _, root := range []string{"/Applications", filepath.Join(d.home, "Applications")} {
-			if d.exists(filepath.Join(root, s.macApp+".app")) {
+		for _, root := range []string{"/Applications", d.join(d.home, "Applications")} {
+			if d.exists(d.join(root, s.macApp+".app")) {
 				b.Path = s.macApp
 				return b, true
 			}
@@ -215,7 +227,7 @@ func (s spec) locate(d deps) (Browser, bool) {
 			if root == "" {
 				continue
 			}
-			p := filepath.Join(root, w.sub)
+			p := d.join(root, w.sub)
 			if d.exists(p) {
 				b.Path = p
 				return b, true
@@ -275,11 +287,11 @@ func (s spec) expandDataDir(d deps, raw string) string {
 			return ""
 		}
 		// The template reads `%VAR%\sub\path`; the separator after the variable belongs to
-		// the template's readability, not to Join, which supplies its own.
-		return filepath.Join(root, strings.TrimPrefix(raw[end+1:], `\`))
+		// the template's readability, not to join, which supplies its own.
+		return d.join(root, strings.TrimPrefix(raw[end+1:], `\`))
 	}
 	if d.home == "" {
 		return ""
 	}
-	return filepath.Join(d.home, filepath.FromSlash(raw))
+	return d.join(d.home, raw)
 }
