@@ -24,6 +24,7 @@ Which is the job. SSM reaches an instance with **no public IP, no bastion host, 
 - A guided builder for read-only AWS CLI commands, with the command always on screen and editable
 - Fuzzy search across everything on the row, including **any EC2 tag**
 - Credentials renewed in the background while the TUI is open; browser sign-in only when unavoidable
+- Sign-in opens in the browser **and profile** you choose — Chrome, Edge, Brave, Firefox, Safari — or in no browser at all, showing the device code to open anywhere
 - Active tunnels persisted to `~/.warren_sessions.json` and managed from the TUI
 - `session-manager-plugin` embedded so there is nothing else to install — macOS (amd64/arm64), Linux (amd64/arm64), Windows (amd64)
 
@@ -58,6 +59,9 @@ warren                     # launch the interactive picker
 warren exec -- <cmd>       # pick an account and role, then run <cmd> with its credentials
 warren shell               # pick an account and role, then open a shell with its credentials
 warren ssm-shell <target>  # pick an account and role, then open an SSM shell on <target>
+warren login [identity]    # sign in without the TUI: device-code by default (URL + code + OSC 52 clipboard)
+warren login --browser     # the only way login opens a browser: saved browser/profile, or a picker
+warren login --status      # report token liveness without signing in; exit 0 live, 1 not
 warren setup               # add an [sso-session] block to ~/.aws/config
 warren version             # print warren's version and the embedded plugin's
 warren help                # print usage
@@ -77,6 +81,19 @@ There are two clocks, and it matters which is which:
 Both are renewed automatically while the TUI is open. Role credentials are re-fetched about ten minutes before they expire, and the SSO token is renewed silently with its refresh token when needed — so a long session keeps working without interruption, and the header shows the time remaining.
 
 The browser sign-in is only needed when silent renewal is impossible: nothing cached yet, an expired client registration, or a revoked refresh token. Background renewal never triggers it on its own — it reports `sign-in needed` in the header instead, because a device-code prompt from a background task would be painted behind the TUI while the tool appeared to hang.
+
+### Where sign-in opens
+
+When a sign-in is needed, warren shows the verification URL and the device code on screen and, out of the box, **asks where to open it**: a picker lists the detected browsers (and their profiles), plus the system default and a no-browser option. Choose **Just this once** to be asked again next time, **Always for ‹session›** to save the answer for that SSO session alone — work signs in through the work profile, personal through something else — or **Always, for every session** to save it globally. Everything here is about the TUI — `warren login` is device-code by default and consults these choices only with `--browser`. The same choice lives under **⚙ Browser for SSO sign-in** on the authentication screen, where a saved default can be changed or set back to *Ask at each sign-in*:
+
+- **A specific browser and profile.** warren detects the browsers installed on the machine (Chrome, Edge, Brave, Chromium, Firefox, Safari) and lists each one's profiles — Chromium-family profiles from `Local State`, Firefox's from `profiles.ini` — so the sign-in lands in the work profile that is already signed in to Identity Center, not whichever profile happens to be frontmost. Safari has no command-line profile selection, so it opens as-is.
+- **No browser — device code only.** Nothing opens, ever; the URL and code stay on screen for you to open on any device. This is the right setting over SSH and on headless boxes, and warren also detects those cases on its own: inside an SSH session or on a Linux box with no display, it never launches a browser — and never shows the picker, since nothing it could choose would open. `WARREN_NO_BROWSER=1` forces the same behaviour for one run.
+
+On the CLI the default is always a pure device-code sign-in: the URL and code print, the URL rides OSC 52 to your local clipboard, and no browser opens — saved overrides included, which stay the TUI's business (the output says when one is being skipped). A browser opens from `warren login` only with `--browser`, which uses your saved browser/profile when one exists and offers the picker otherwise. `--code` forces device-code for one run.
+
+`warren login` covers named profiles too: an SSO-backed profile (modern `sso_session` or legacy inline `sso_start_url`) signs in through its underlying session, and a keys/assume-role profile — which has nothing to sign in to — has its credentials validated instead. The TUI does the same: selecting a profile whose SSO session has expired routes into the sign-in flow and then resolves the profile, rather than dead-ending on "login session has expired, please reauthenticate".
+
+Per-session overrides are keyed by the session's start URL, so they survive renaming the `[sso-session]` block, and each one is listed (and removable) on the same ⚙ screen. The choices are saved in `~/.warren_config.json` — warren's own file, following the same rule as everything else it owns: `~/.aws/config` is never written beyond the append-only session bootstrap.
 
 Commands and shells started by warren do not get a frozen copy of the credentials. A parent process cannot reach into a child's environment, so instead of handing over keys, warren serves credentials from a loopback endpoint that the child reads through the standard AWS container-credential variables — and keeps refreshing what it serves. A shell left open past the hour keeps working rather than failing with `ExpiredToken`. The endpoint listens on `127.0.0.1` only and requires a per-run token, so nothing else on the machine can read from it.
 

@@ -18,6 +18,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/sso"
 	"github.com/aws/aws-sdk-go-v2/service/ssooidc"
 
+	"github.com/treyperrone/warren/internal/browser"
 	"github.com/treyperrone/warren/internal/homedir"
 )
 
@@ -60,9 +61,42 @@ func (s SSOSessionConfig) scopes() []string {
 	return s.Scopes
 }
 
-// ProfileConfig is a named [profile] block.
+// ProfileConfig is a named [profile] block, carrying the keys that decide how — and whether
+// — a sign-in can satisfy it.
 type ProfileConfig struct {
 	Name string
+	// SSOSession is the sso_session key: the modern format, pointing at an [sso-session]
+	// block. Signing in to that block is what makes this profile work.
+	SSOSession string
+	// SSOStartURL/SSORegion are the legacy inline format (sso_start_url in the profile
+	// itself, no sso-session block). It predates refresh tokens but authenticates through
+	// the same device flow, so login can serve it by synthesizing a session config.
+	SSOStartURL string
+	SSORegion   string
+}
+
+// LoginSession resolves the sso-session a sign-in for this profile should run against, or
+// false for a profile nothing device-auth can help — static keys, assume-role from keys, a
+// credential process. Those aren't errors; they are profiles whose credentials either work
+// or need fixing in ~/.aws/config, and the caller says which by resolving them.
+func (p ProfileConfig) LoginSession(sessions []SSOSessionConfig) (*SSOSessionConfig, bool) {
+	if p.SSOSession != "" {
+		for i := range sessions {
+			if sessions[i].Name == p.SSOSession {
+				return &sessions[i], true
+			}
+		}
+		// Named a block that does not exist: surface it as an SSO profile with no target
+		// rather than "nothing to do" — the config is broken, not keys-based.
+		return nil, true
+	}
+	if p.SSOStartURL != "" {
+		// Legacy format: the profile is its own session, minus the name. Scopes stay
+		// default; if the Identity Center instance rejects scoped registration, Login
+		// already falls back to a scopeless one.
+		return &SSOSessionConfig{Name: p.Name, StartURL: p.SSOStartURL, Region: p.SSORegion}, true
+	}
+	return nil, false
 }
 
 // Account is an SSO-enumerated account.
@@ -133,7 +167,12 @@ func ParseConfig() ([]SSOSessionConfig, []ProfileConfig, error) {
 		case strings.HasPrefix(curHeader, "profile "):
 			name := strings.TrimPrefix(curHeader, "profile ")
 			if name != "default" {
-				profiles = append(profiles, ProfileConfig{Name: name})
+				profiles = append(profiles, ProfileConfig{
+					Name:        name,
+					SSOSession:  cur["sso_session"],
+					SSOStartURL: cur["sso_start_url"],
+					SSORegion:   cur["sso_region"],
+				})
 			}
 		}
 	}
@@ -340,11 +379,40 @@ func cachedRecord(startURL string) *tokenRecord {
 	return refreshable
 }
 
-// Login performs the SSO device-auth flow and returns a live access token.
-func Login(ctx context.Context, sess SSOSessionConfig) (string, error) {
+// PendingLogin is a device authorization that has been started but not yet approved: the
+// verification URL and user code exist, and AWS is waiting for a human to say yes.
+//
+// It is a separate step from waiting so a UI can put the URL and code *on screen* before the
+// blocking poll starts. The old single-call Login printed them to stderr, which the TUI's alt
+// screen made invisible — the flow only ever worked because the auto-opened browser carried
+// the code in its URL, and any user whose browser failed to open was stuck staring at a
+// spinner with no way to know what to type where.
+type PendingLogin struct {
+	// VerificationURL is the full URL with the user code embedded; opening it leaves only
+	// an Allow click. UserCode is shown separately for the no-browser path, where the URL
+	// is retyped on another device and the code entered by hand.
+	VerificationURL string
+	UserCode        string
+	// RegistrationWarning is set when the scoped client registration failed and the bare
+	// retry succeeded: sign-in works but silent renewal will not. It is a field, not a
+	// stderr print, because StartLogin's primary caller runs behind the TUI's alt screen,
+	// where stderr is exactly the channel this type exists to stop relying on.
+	RegistrationWarning string
+
+	sess     SSOSessionConfig
+	oidc     *ssooidc.Client
+	reg      *ssooidc.RegisterClientOutput
+	device   *ssooidc.StartDeviceAuthorizationOutput
+	interval time.Duration
+	deadline time.Time
+}
+
+// StartLogin registers the OIDC client and starts a device authorization, returning the
+// pending login for the caller to surface and then Wait on.
+func StartLogin(ctx context.Context, sess SSOSessionConfig) (*PendingLogin, error) {
 	cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(sess.Region))
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	oidc := ssooidc.NewFromConfig(cfg)
 
@@ -360,15 +428,16 @@ func Login(ctx context.Context, sess SSOSessionConfig) (string, error) {
 		ClientType: aws.String("public"),
 		Scopes:     sess.scopes(),
 	})
+	var regWarning string
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "[sso] scoped registration failed (%v); retrying without scopes — sessions will not auto-renew\n", err)
+		regWarning = fmt.Sprintf("scoped registration failed (%v); continuing without scopes — sessions will not auto-renew", err)
 		reg, err = oidc.RegisterClient(ctx, &ssooidc.RegisterClientInput{
 			ClientName: aws.String("warren"),
 			ClientType: aws.String("public"),
 		})
 	}
 	if err != nil {
-		return "", fmt.Errorf("register client: %w", err)
+		return nil, fmt.Errorf("register client: %w", err)
 	}
 
 	auth, err := oidc.StartDeviceAuthorization(ctx, &ssooidc.StartDeviceAuthorizationInput{
@@ -377,29 +446,47 @@ func Login(ctx context.Context, sess SSOSessionConfig) (string, error) {
 		StartUrl:     aws.String(sess.StartURL),
 	})
 	if err != nil {
-		return "", fmt.Errorf("start device auth: %w", err)
+		return nil, fmt.Errorf("start device auth: %w", err)
 	}
 
-	fmt.Fprintf(os.Stderr, "\n[sso] Opening browser for %s\n", sess.StartURL)
-	fmt.Fprintf(os.Stderr, "[sso] If browser doesn't open, visit: %s\n", aws.ToString(auth.VerificationUriComplete))
-	fmt.Fprintf(os.Stderr, "[sso] User code: %s\n\n", aws.ToString(auth.UserCode))
-
-	// attempt to open browser
-	openBrowser(aws.ToString(auth.VerificationUriComplete))
-
-	// poll for token
 	interval := time.Duration(auth.Interval) * time.Second
 	if interval == 0 {
 		interval = 5 * time.Second
 	}
-	deadline := time.Now().Add(time.Duration(auth.ExpiresIn) * time.Second)
-	for time.Now().Before(deadline) {
-		time.Sleep(interval)
-		tok, err := oidc.CreateToken(ctx, &ssooidc.CreateTokenInput{
-			ClientId:     reg.ClientId,
-			ClientSecret: reg.ClientSecret,
+	return &PendingLogin{
+		VerificationURL:     aws.ToString(auth.VerificationUriComplete),
+		UserCode:            aws.ToString(auth.UserCode),
+		RegistrationWarning: regWarning,
+		sess:                sess,
+		oidc:                oidc,
+		reg:                 reg,
+		device:              auth,
+		interval:            interval,
+		deadline:            time.Now().Add(time.Duration(auth.ExpiresIn) * time.Second),
+	}, nil
+}
+
+// Wait polls until the user approves the authorization, the code expires, or ctx is
+// cancelled, and returns the access token. Cancellation is checked on every sleep — the old
+// loop used bare time.Sleep, so quitting the TUI mid-login left the process alive for up to
+// one full poll interval after its screen was gone.
+func (p *PendingLogin) Wait(ctx context.Context) (string, error) {
+	timer := time.NewTimer(p.interval)
+	defer timer.Stop()
+
+	for time.Now().Before(p.deadline) {
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-timer.C:
+		}
+		timer.Reset(p.interval)
+
+		tok, err := p.oidc.CreateToken(ctx, &ssooidc.CreateTokenInput{
+			ClientId:     p.reg.ClientId,
+			ClientSecret: p.reg.ClientSecret,
 			GrantType:    aws.String("urn:ietf:params:oauth:grant-type:device_code"),
-			DeviceCode:   auth.DeviceCode,
+			DeviceCode:   p.device.DeviceCode,
 		})
 		if err != nil {
 			if strings.Contains(err.Error(), "AuthorizationPendingException") ||
@@ -411,18 +498,42 @@ func Login(ctx context.Context, sess SSOSessionConfig) (string, error) {
 		// Persist the refresh material, not just the access token — that is what lets the
 		// next run renew silently instead of reopening the browser.
 		writeRecord(&tokenRecord{
-			StartURL:              sess.StartURL,
-			Region:                sess.Region,
+			StartURL:              p.sess.StartURL,
+			Region:                p.sess.Region,
 			AccessToken:           aws.ToString(tok.AccessToken),
 			ExpiresAt:             expiryStamp(int(tok.ExpiresIn)),
 			RefreshToken:          aws.ToString(tok.RefreshToken),
-			ClientID:              aws.ToString(reg.ClientId),
-			ClientSecret:          aws.ToString(reg.ClientSecret),
-			RegistrationExpiresAt: time.Unix(reg.ClientSecretExpiresAt, 0).UTC().Format(time.RFC3339),
+			ClientID:              aws.ToString(p.reg.ClientId),
+			ClientSecret:          aws.ToString(p.reg.ClientSecret),
+			RegistrationExpiresAt: time.Unix(p.reg.ClientSecretExpiresAt, 0).UTC().Format(time.RFC3339),
 		})
 		return aws.ToString(tok.AccessToken), nil
 	}
 	return "", fmt.Errorf("login timed out")
+}
+
+// Login performs the SSO device-auth flow and returns a live access token: StartLogin, the
+// URL and code on stderr, the preferred browser, then Wait. This is the whole flow for a
+// plain terminal; the TUI drives the same pieces itself so the code lands on its alt screen
+// instead of behind it.
+func Login(ctx context.Context, sess SSOSessionConfig) (string, error) {
+	pending, err := StartLogin(ctx, sess)
+	if err != nil {
+		return "", err
+	}
+
+	fmt.Fprintf(os.Stderr, "\n[sso] Signing in to %s\n", sess.StartURL)
+	if pending.RegistrationWarning != "" {
+		fmt.Fprintf(os.Stderr, "[sso] %s\n", pending.RegistrationWarning)
+	}
+	fmt.Fprintf(os.Stderr, "[sso] If no browser opens, visit: %s\n", pending.VerificationURL)
+	fmt.Fprintf(os.Stderr, "[sso] User code: %s\n", pending.UserCode)
+	// The per-session override applies here too: `warren login work` from a terminal should
+	// land in the same browser profile the TUI would use for that session.
+	pref, _ := browser.ResolvePrefFor(sess.StartURL)
+	fmt.Fprintf(os.Stderr, "[sso] %s\n\n", browser.OpenForLogin(pref, pending.VerificationURL))
+
+	return pending.Wait(ctx)
 }
 
 func expiryStamp(expiresIn int) string {

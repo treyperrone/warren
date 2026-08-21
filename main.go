@@ -27,6 +27,11 @@ usage:
   warren exec -- <cmd>       pick an account and role, then run <cmd> with its credentials
   warren shell               pick an account and role, then open a shell with its credentials
   warren ssm-shell <target>  pick an account and role, then open an SSM shell on <target>
+  warren login [identity]    sign in without the TUI: device-code by default — URL + code
+                             shown, URL sent to your local clipboard (OSC 52)
+  warren login --browser     opt in to opening a browser (uses your saved browser/profile,
+                             or asks when nothing is saved)
+  warren login --status      report token liveness without signing in; exit 0 live, 1 not
   warren setup               add an [sso-session] block to ~/.aws/config
   warren version             print the version and exit
   warren help                print this message and exit
@@ -151,6 +156,11 @@ func parseArgs() invocation {
 		fmt.Print(usage)
 		fmt.Print(pathhint.Hint())
 		os.Exit(0)
+
+	case "login":
+		// Handled here rather than through the TUI plumbing below: login needs no picker,
+		// no alt screen, and no instance list — that absence is its entire reason to exist.
+		os.Exit(runLogin(context.Background(), os.Args[2:]))
 
 	case "setup":
 		return invocation{mode: modeTUI, startInSetup: true}

@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -18,6 +19,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	awsint "github.com/treyperrone/warren/internal/aws"
+	"github.com/treyperrone/warren/internal/browser"
 	"github.com/treyperrone/warren/internal/buildinfo"
 	"github.com/treyperrone/warren/internal/credserver"
 	"github.com/treyperrone/warren/internal/termwin"
@@ -38,13 +40,18 @@ const (
 	screenMain                   // main tunnel manager
 	// screenSetup is last so that screenMethod stays the zero value: a Model that somehow
 	// reaches Update without New() should fall into the normal picker, not the config writer.
-	screenSetup        // first run — no sso-session and no profile in ~/.aws/config
-	screenRegion       // region picker, opened from the setup form
-	screenAction       // what to do with the credentials just resolved
-	screenBuildService // command builder: pick a service
-	screenBuildTask    // command builder: pick a task within that service
-	screenBuildParams  // command builder: fill in parameters and run
-	screenAbout        // version, keys, and where to report a problem
+	screenSetup          // first run — no sso-session and no profile in ~/.aws/config
+	screenRegion         // region picker, opened from the setup form
+	screenAction         // what to do with the credentials just resolved
+	screenBuildService   // command builder: pick a service
+	screenBuildTask      // command builder: pick a task within that service
+	screenBuildParams    // command builder: fill in parameters and run
+	screenAbout          // version, keys, and where to report a problem
+	screenBrowser        // which browser SSO sign-in opens in (the ⚙ setting)
+	screenBrowserProfile // which profile inside that browser
+	screenLoginBrowser   // the same choice, asked inline because a sign-in is needed NOW
+	screenLoginProfile   // profile step of the inline ask
+	screenLoginRemember  // "just this once" vs "always" after an inline pick
 )
 
 // ---- list plumbing ---------------------------------------------------------
@@ -158,6 +165,35 @@ type Model struct {
 	selAccount  *awsint.Account
 	roles       []string
 	awsSess     *awsint.Session
+
+	// browser preference for SSO sign-in
+	browsers        []browser.Browser
+	selBrowser      *browser.Browser
+	browserProfiles []browser.Profile
+
+	// pendingLogin is a device authorization awaiting approval. Non-nil is what switches the
+	// view from the plain spinner to the sign-in screen with the URL and code on it; loginNote
+	// says what happened to the browser (opened, suppressed, failed), because "nothing visibly
+	// happened" needs an explanation right where the user is looking.
+	pendingLogin *awsint.PendingLogin
+	loginNote    string
+	// loginChoice is the answer the inline ask produced, overriding the saved preference for
+	// exactly one sign-in; loginChoiceDraft carries it between the pick and the remember
+	// question. Cleared when the token arrives, so the next ask starts clean.
+	loginChoice      *browser.Pref
+	loginChoiceDraft browser.Pref
+	// loginAskShownAt guards the inline picker against the Enter that selected the session
+	// arriving twice (double-tap, key repeat) — see selectLoginBrowser.
+	loginAskShownAt time.Time
+	// pendingProfile is the profile whose credential resolution is waiting on the sign-in
+	// currently in flight; profileLoginSess anchors selSession for that detour, since the
+	// session may be synthesized (legacy inline SSO) and point into no slice.
+	pendingProfile   string
+	profileLoginSess awsint.SSOSessionConfig
+	// loginCancel aborts the Wait poll. Quitting is the only key the loading guard lets
+	// through while a login is pending, and without this the polling goroutine outlives the
+	// screen — m.ctx is main's context.Background and nothing ever cancels it.
+	loginCancel context.CancelFunc
 
 	// instance selection
 	instances   []awsint.Instance
@@ -304,6 +340,11 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tea.KeyMsg:
 		if msg.String() == "ctrl+c" {
+			// Stop a pending sign-in poll on the way out, or the goroutine keeps polling
+			// AWS until the device code expires — after the screen it reports to is gone.
+			if m.loginCancel != nil {
+				m.loginCancel()
+			}
 			return m, tea.Quit
 		}
 		// Nothing but ctrl+c while a request is in flight.
@@ -407,13 +448,88 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.applyCredRefresh(msg)
 		return m, nil
 
+	case msgProfileLoginNeeded:
+		// Route the profile into the ordinary sign-in flow — ask screen, per-session
+		// browser override, code on screen — and remember to come back for its
+		// credentials once the token lands. selSession points at a Model-owned copy
+		// because a legacy profile's session is synthesized and lives in no slice.
+		m.profileLoginSess = msg.sess
+		m.selSession = &m.profileLoginSess
+		m.pendingProfile = msg.profile.Name
+		m.loading = true
+		return m, m.fetchToken()
+
+	case msgLoginAsk:
+		m.startLoginAsk()
+		return m, nil
+
+	case msgLoginPending:
+		// Put the URL and code on screen *before* anything opens: if the browser launch
+		// fails or lands somewhere invisible, the screen already holds everything needed
+		// to finish by hand. OpenForLogin never errors — failures come back as the note.
+		m.pendingLogin = msg.pending
+		var pref browser.Pref
+		switch {
+		case m.loginChoice != nil:
+			// The inline ask already answered for this one sign-in.
+			pref = *m.loginChoice
+		case m.selSession != nil:
+			pref, _ = browser.ResolvePrefFor(m.selSession.StartURL)
+		default:
+			pref = browser.LoadPref()
+		}
+		m.loginNote = browser.OpenForLogin(pref, msg.pending.VerificationURL)
+		if w := msg.pending.RegistrationWarning; w != "" {
+			m.loginNote += "\n" + w
+		}
+		ctx, cancel := context.WithCancel(m.ctx)
+		m.loginCancel = cancel
+		return m, m.waitForLogin(ctx, msg.pending)
+
 	case msgToken:
 		m.loading = false
+		m.pendingLogin = nil
+		m.loginNote = ""
+		m.loginChoice = nil
+		if m.loginCancel != nil {
+			// Wait already returned; cancelling only releases the derived context.
+			m.loginCancel()
+			m.loginCancel = nil
+		}
 		if msg.err != nil {
 			m.err = msg.err
+			// A failed sign-in ends any profile detour with it, or a LATER token success
+			// would resurrect a retry nobody is waiting for.
+			if m.pendingProfile != "" {
+				m.pendingProfile = ""
+				m.selSession = nil
+			}
 			return m, nil
 		}
 		m.token = msg.token
+		// A sign-in that ran on behalf of a profile goes back for the profile's
+		// credentials, not to the account list — accounts belong to the session flow, and
+		// the profile already names its account and role. selSession reverts to nil so
+		// goBack keeps treating this as the profile flow it is.
+		if m.pendingProfile != "" {
+			var pending *awsint.ProfileConfig
+			for i := range m.profiles {
+				if m.profiles[i].Name == m.pendingProfile {
+					pending = &m.profiles[i]
+					break
+				}
+			}
+			m.pendingProfile = ""
+			m.selSession = nil
+			if pending == nil {
+				// Config changed under us mid-flight; the method list is the only honest place.
+				m.buildMethodList()
+				m.screen = screenMethod
+				return m, nil
+			}
+			m.loading = true
+			return m, m.fetchProfileSession(*pending)
+		}
 		m.loading = true
 		return m, m.fetchAccounts()
 
@@ -602,6 +718,28 @@ func (m *Model) goBack() tea.Cmd {
 		// the form's cursor is still focused, but nothing is driving it after the detour.
 		m.screen = screenSetup
 		return m.setup.init()
+	case screenBrowser:
+		m.screen = screenMethod
+		m.buildMethodList()
+	case screenBrowserProfile:
+		m.buildBrowserList()
+		m.screen = screenBrowser
+	case screenLoginBrowser:
+		// Backing out of the ask abandons the sign-in — the authorization has not started
+		// yet, so there is nothing to cancel beyond returning to the method list. That
+		// includes any profile detour that was waiting on it.
+		if m.pendingProfile != "" {
+			m.pendingProfile = ""
+			m.selSession = nil
+		}
+		m.screen = screenMethod
+		m.buildMethodList()
+	case screenLoginProfile:
+		m.buildLoginBrowserList()
+		m.screen = screenLoginBrowser
+	case screenLoginRemember:
+		m.buildLoginBrowserList()
+		m.screen = screenLoginBrowser
 	case screenBuildService:
 		m.buildActionList()
 		m.screen = screenAction
@@ -649,6 +787,16 @@ func (m *Model) handleSelect() tea.Cmd {
 		return m.handleMainSelect(selected.value)
 	case screenRegion:
 		return m.selectRegion(selected.value)
+	case screenBrowser:
+		return m.selectBrowser(selected.value)
+	case screenBrowserProfile:
+		return m.selectBrowserProfile(selected.value)
+	case screenLoginBrowser:
+		return m.selectLoginBrowser(selected.value)
+	case screenLoginProfile:
+		return m.selectLoginProfile(selected.value)
+	case screenLoginRemember:
+		return m.selectLoginRemember(selected.value)
 	}
 	return nil
 }
@@ -662,23 +810,14 @@ func (m *Model) selectMethod(val string) tea.Cmd {
 	if val == methodAddSession {
 		return m.StartSetup()
 	}
+	if val == methodBrowserPref {
+		return m.startBrowserPref()
+	}
 	// profile
 	for _, p := range m.profiles {
 		if "profile:"+p.Name == val {
-			// Resolve real credentials rather than setting AWS_PROFILE in this process and
-			// carrying an empty Session. Every consumer passes the Session's fields to a
-			// static credentials provider, which rejects empty values, so the old shape
-			// failed at the first API call. Async because an SSO-backed or assume-role
-			// profile can reach the network here.
-			name := p.Name
 			m.loading = true
-			return func() tea.Msg {
-				sess, err := awsint.ProfileSession(m.ctx, name)
-				if err != nil {
-					return msgError{err}
-				}
-				return msgProfileReady{sess: sess}
-			}
+			return m.fetchProfileSession(p)
 		}
 	}
 	// SSO session
@@ -706,6 +845,41 @@ func (m *Model) selectAccount(val string) tea.Cmd {
 type msgCredsReady struct{}
 
 type msgProfileReady struct{ sess *awsint.Session }
+
+// msgProfileLoginNeeded means a profile's credentials failed BECAUSE its SSO session needs a
+// sign-in — the one failure a device auth actually fixes. It used to surface as a dead-end
+// error ("login session has expired, please reauthenticate" + press-any-key), telling the
+// user to do by hand exactly what the tool exists to do.
+type msgProfileLoginNeeded struct {
+	profile awsint.ProfileConfig
+	sess    awsint.SSOSessionConfig
+}
+
+// fetchProfileSession resolves a profile's credentials, diagnosing an expired SSO session as
+// the reauth case rather than an error. Resolve real credentials rather than setting
+// AWS_PROFILE in this process and carrying an empty Session: every consumer passes the
+// Session's fields to a static credentials provider, which rejects empty values. Async
+// because an SSO-backed or assume-role profile can reach the network here.
+func (m *Model) fetchProfileSession(p awsint.ProfileConfig) tea.Cmd {
+	ctx := m.ctx
+	sessions := m.ssoSessions
+	return func() tea.Msg {
+		sess, err := awsint.ProfileSession(ctx, p.Name)
+		if err == nil {
+			return msgProfileReady{sess: sess}
+		}
+		// Only claim "sign in fixes this" when it plausibly does: the profile is SSO-backed
+		// AND its underlying session genuinely has no silent path left. Any other failure —
+		// bad keys, a broken role chain, a live session with a different problem — stays an
+		// error, because routing it into a sign-in would burn a device code on a dead end.
+		if loginSess, ssoBacked := p.LoginSession(sessions); ssoBacked && loginSess != nil {
+			if _, serr := awsint.SilentToken(ctx, *loginSess); errors.Is(serr, awsint.ErrLoginRequired) {
+				return msgProfileLoginNeeded{profile: p, sess: *loginSess}
+			}
+		}
+		return msgError{err}
+	}
+}
 
 // StartCredsMode stops the flow at the point credentials exist, for `exec` and `shell`.
 func (m *Model) StartCredsMode() {
@@ -1095,11 +1269,34 @@ func (m *Model) handleMainSelect(val string) tea.Cmd {
 
 // ---- async commands --------------------------------------------------------
 
+// fetchToken resolves an SSO token in two visible stages instead of one opaque LiveToken
+// call. Silent renewal stays a plain spinner; only when a real sign-in is unavoidable does
+// StartLogin run, and the pending authorization comes back as a message so the URL and user
+// code are rendered *on* the alt screen — LiveToken printed them to stderr behind it, where
+// they were unreadable and the flow survived only because the auto-opened browser carried
+// the code in its URL.
 func (m *Model) fetchToken() tea.Cmd {
 	sess := *m.selSession
+	ctx := m.ctx
 	return func() tea.Msg {
-		token, err := awsint.LiveToken(m.ctx, sess)
-		return msgToken{token: token, err: err}
+		token, err := awsint.SilentToken(ctx, sess)
+		if err == nil {
+			return msgToken{token: token}
+		}
+		if !errors.Is(err, awsint.ErrLoginRequired) {
+			return msgToken{err: err}
+		}
+		// The inline picker runs before the device authorization, not after: codes live
+		// about ten minutes, and a picker left up over lunch must not resume into a code
+		// that is already dead.
+		if pref, _ := browser.ResolvePrefFor(sess.StartURL); browser.ShouldAsk(pref) {
+			return msgLoginAsk{}
+		}
+		pending, err := awsint.StartLogin(ctx, sess)
+		if err != nil {
+			return msgToken{err: err}
+		}
+		return msgLoginPending{pending: pending}
 	}
 }
 
@@ -1157,6 +1354,10 @@ func (m *Model) buildMethodList() {
 		desc:  "append a new [sso-session] block to ~/.aws/config",
 		value: methodAddSession,
 	})
+	// The sign-in browser setting sits with the sign-in methods because that is where you
+	// are when it is wrong: sign-in just opened in the wrong place, and re-selecting the
+	// session is the retry.
+	items = append(items, browserPrefRow())
 
 	m.list.Title = "Select authentication method"
 	m.list.SetStatusBarItemName("method", "methods")
@@ -1299,6 +1500,11 @@ func (m *Model) View() string {
 		scrollable := m.aboutVP.TotalLineCount() > m.aboutVP.Height
 		return m.banner() + m.aboutVP.View() + "\n" +
 			aboutFooter(scrollable, m.aboutVP.AtBottom())
+	}
+	// Before the generic spinner: a pending sign-in *is* a loading state, but one whose
+	// whole point is the URL and code being readable while it waits.
+	if m.pendingLogin != nil {
+		return m.loginView()
 	}
 	if m.loading {
 		return m.banner() + fmt.Sprintf("\n  %s loading...\n", m.spin.View())
