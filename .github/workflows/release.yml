@@ -35,7 +35,7 @@ jobs:
           # makes it guess wrong or fail.
           fetch-depth: 0
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           # Read the version from go.mod rather than pinning it here, so the toolchain can
           # never drift below the `go` directive.
