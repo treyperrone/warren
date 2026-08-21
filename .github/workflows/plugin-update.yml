@@ -83,7 +83,7 @@ jobs:
 
       - name: open a pull request
         if: steps.latest.outputs.changed == 'true'
-        uses: peter-evans/create-pull-request@v7
+        uses: peter-evans/create-pull-request@v8
         with:
           branch: plugin/${{ steps.latest.outputs.latest }}
           title: "plugin: rebuild from session-manager-plugin ${{ steps.latest.outputs.latest }}"
