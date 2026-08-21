@@ -1,0 +1,21 @@
+# Dependabot covers what govulncheck cannot: it proposes the UPGRADE, not just the finding,
+# and it watches the module graph and the actions this repo runs in CI. The scheduled
+# security-scan answers "is shipped code reachable by a known vuln"; this answers "a fix
+# exists, here is the PR". Weekly, mirroring the plugin-update workflow's rhythm — a solo
+# repo drowns under daily dependency PRs and then ignores all of them.
+version: 2
+updates:
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+    # One PR per week grouping everything non-major keeps the review cost of staying
+    # current at a single glance; majors stay separate because they mean reading changelogs.
+    groups:
+      go-minor-and-patch:
+        update-types: [minor, patch]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

@@ -1,0 +1,33 @@
+name: security-scan
+
+# govulncheck compares warren's call graph against the Go vulnerability database, and the
+# database side moves without any push here: the Go 1.26.6 stdlib findings sat unknowable in
+# code that hadn't changed until a feature push happened to re-run CI. CodeQL already re-runs
+# weekly for the same reason (its queries improve); this does the same for the vuln DB, daily
+# because the scan costs about a minute and a scheduled failure emails the owner — which is
+# the entire alerting mechanism, so red-until-fixed is the point, not noise.
+on:
+  schedule:
+    - cron: "43 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  govulncheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # Same pinned version as ci.yml so a finding here reproduces there and vice versa.
+      # Reports only vulnerabilities warren actually reaches, so a finding is real work
+      # rather than a version-number match somewhere in the dependency tree.
+      - name: govulncheck
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
+          govulncheck ./...
