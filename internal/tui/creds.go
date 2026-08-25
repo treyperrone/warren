@@ -138,6 +138,9 @@ func (m *Model) applyCredRefresh(msg msgCredsRefreshed) {
 
 	m.credRefreshErr = nil
 	m.awsSess = msg.sess
+	// Mirror for transfer goroutines (see Model.liveSess): renewals must reach a download
+	// already in flight, which reads the box, not the Model.
+	m.liveSess.Store(msg.sess)
 	if msg.token != "" {
 		m.token = msg.token
 	}

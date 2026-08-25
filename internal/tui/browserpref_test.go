@@ -2,9 +2,12 @@ package tui
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
+
+	tea "github.com/charmbracelet/bubbletea"
 
 	awsint "github.com/treyperrone/warren/internal/aws"
 	"github.com/treyperrone/warren/internal/browser"
@@ -407,5 +410,431 @@ func TestProfileLoginDetourRoutesAndRetries(t *testing.T) {
 	m.Update(msgToken{err: errors.New("denied")})
 	if m.pendingProfile != "" || m.selSession != nil {
 		t.Error("failed sign-in left the profile detour armed")
+	}
+}
+
+func TestProfileSlug(t *testing.T) {
+	cases := map[[2]string]string{
+		{"Corp Lab", "AdminRole"}:        "corp-lab-adminrole",
+		{"prod (123)", "ReadOnly+Audit"}: "prod-123-readonly-audit",
+		{"--weird--", "role"}:            "weird-role",
+	}
+	for in, want := range cases {
+		if got := profileSlug(in[0], in[1]); got != want {
+			t.Errorf("profileSlug(%q, %q) = %q, want %q", in[0], in[1], got, want)
+		}
+	}
+}
+
+// The save-profile row exists only in the sso-session flow: a named-profile flow has no
+// session/account/role triple to write, and offering the row there would produce a broken
+// block.
+func TestSaveProfileRowOnlyInSessionFlow(t *testing.T) {
+	m := modelWithSSOSession(t)
+	m.awsSess = &awsint.Session{Label: "x", AccessKeyID: "AKIA", RoleName: "Admin"}
+
+	m.buildActionList() // selSession nil: profile flow
+	if _, ok := findItem(m, actionSaveProfile); ok {
+		t.Error("save-profile row offered with no sso-session selected")
+	}
+
+	m.selSession = &m.ssoSessions[0]
+	m.selAccount = &awsint.Account{ID: "123456789012", Name: "Corp Lab"}
+	m.buildActionList()
+	row, ok := findItem(m, actionSaveProfile)
+	if !ok {
+		t.Fatal("save-profile row missing in the session flow")
+	}
+	if !strings.Contains(row.desc, "corp-lab-admin") {
+		t.Errorf("row desc = %q, want the generated profile name visible before selecting", row.desc)
+	}
+}
+
+// The favorite round trip inside the TUI: star on the action screen, see it pinned first on
+// the method screen, and Enter goes straight for the token with account+role staged.
+func TestFavoriteStarPinSelect(t *testing.T) {
+	m := modelWithSSOSession(t)
+	m.selSession = &m.ssoSessions[0]
+	m.selAccount = &awsint.Account{ID: "123456789012", Name: "Corp Lab"}
+	m.awsSess = &awsint.Session{Label: "x", AccessKeyID: "AKIA", RoleName: "AdminRole"}
+
+	m.buildActionList()
+	if _, ok := findItem(m, actionFavAdd); !ok {
+		t.Fatal("no add-to-favorites row")
+	}
+	m.selectAction(actionFavAdd)
+	if _, ok := findItem(m, actionFavRemove); !ok {
+		t.Fatal("star did not flip to remove after adding")
+	}
+
+	m.selSession, m.selAccount = nil, nil
+	m.buildMethodList()
+	first, ok := m.list.Items()[0].(item)
+	if !ok || !strings.HasPrefix(first.title, "★ Corp Lab / AdminRole") {
+		t.Fatalf("first method row = %+v, want the pinned favorite", first)
+	}
+	// The nickname is searchable even though the row does not display it.
+	if !strings.Contains(first.FilterValue(), "corp-lab-adminrole") {
+		t.Errorf("favorite row not searchable by nickname: %q", first.FilterValue())
+	}
+
+	cmd := m.selectMethod(first.value)
+	if cmd == nil || !m.loading {
+		t.Fatal("selecting the favorite did not start a token fetch")
+	}
+	if m.selSession == nil || m.selAccount == nil || m.pendingFavRole != "AdminRole" {
+		t.Fatalf("favorite staging: sess=%v acct=%v role=%q", m.selSession, m.selAccount, m.pendingFavRole)
+	}
+
+	// Token lands: the flow fetches role credentials directly, no account list.
+	_, cmd = m.Update(msgToken{token: "tok"})
+	if m.pendingFavRole != "" || cmd == nil {
+		t.Fatalf("favorite role fetch not started (pending=%q)", m.pendingFavRole)
+	}
+
+	// Esc from the action screen after a favorite goes home, not to an empty account list.
+	m.awsSess = &awsint.Session{Label: "x", AccessKeyID: "AKIA", RoleName: "AdminRole"}
+	m.accounts = nil
+	m.screen = screenAction
+	m.goBack()
+	if m.screen != screenMethod {
+		t.Fatalf("goBack from favorite action screen = %v, want screenMethod", m.screen)
+	}
+}
+
+// A favorite whose sso-session was deleted must explain itself, not guess.
+func TestFavoriteWithDeadSessionErrors(t *testing.T) {
+	m := modelWithSSOSession(t)
+	if err := browser.AddFavorite(browser.Favorite{
+		Nickname: "ghost", StartURL: "https://gone.awsapps.com/start", AccountID: "1", Role: "r",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	m.buildMethodList()
+	m.selectMethod("fav:0")
+	if m.err == nil || !strings.Contains(m.err.Error(), "gone.awsapps.com") {
+		t.Fatalf("err = %v, want the orphaned start URL named", m.err)
+	}
+}
+
+// Connection favorites: the tunnel manager offers to star the connection that just started,
+// and selecting the pinned row later replays it — creds, then instance resolution by Name
+// tag, then the same start path.
+func TestConnectionFavoriteStarAndReplay(t *testing.T) {
+	m := modelWithSSOSession(t)
+	m.selSession = &m.ssoSessions[0]
+	m.selAccount = &awsint.Account{ID: "123456789012", Name: "Corp Lab"}
+	m.awsSess = &awsint.Session{Label: "x", AccessKeyID: "AKIA", RoleName: "AdminRole"}
+
+	// The connection lands: candidate noted, star row offered.
+	m.noteConnFavCandidate("kali-box", "rdp", "")
+	m.buildMainList()
+	row, ok := findItem(m, "favconn")
+	if !ok {
+		t.Fatal("no favorite-this-connection row after a tunnel started")
+	}
+	if !strings.Contains(row.desc, "corp-lab-adminrole-kali-box-rdp") {
+		t.Errorf("row desc = %q, want the nickname visible", row.desc)
+	}
+	m.handleMainSelect("favconn")
+	if _, saved := browser.FindFavorite(*m.connFavCandidate); !saved {
+		t.Fatal("star did not save the connection favorite")
+	}
+	// Saved: the row withdraws.
+	m.buildMainList()
+	if _, ok := findItem(m, "favconn"); ok {
+		t.Error("star row still offered after saving")
+	}
+
+	// Replay: the pinned row stages the connection half alongside account and role.
+	m.selSession, m.selAccount, m.awsSess = nil, nil, nil
+	m.buildMethodList()
+	first := m.list.Items()[0].(item)
+	if !strings.HasPrefix(first.title, "★ Corp Lab / AdminRole") {
+		t.Fatalf("first row = %q, want the connection favorite pinned", first.title)
+	}
+	m.selectMethod(first.value)
+	if m.pendingFavConn == nil || m.pendingFavConn.InstanceName != "kali-box" {
+		t.Fatalf("connection half not staged: %+v", m.pendingFavConn)
+	}
+
+	// Instance resolution: by Name TAG, against what is running.
+	m.token = "tok"
+	m.pendingFavRole = "" // creds step done for this test's purposes
+	m.awsSess = &awsint.Session{Label: "x", AccessKeyID: "AKIA", RoleName: "AdminRole"}
+	f := *m.pendingFavConn
+
+	// Zero matches: land on the list with the reason, favorite consumed.
+	m.Update(msgInstances{instances: []awsint.Instance{{ID: "i-1", Name: "other"}}})
+	if m.screen != screenInstance || !strings.Contains(m.notice, "not running") {
+		t.Errorf("zero-match: screen=%v notice=%q", m.screen, m.notice)
+	}
+
+	// Ambiguity: same landing, different reason.
+	m.pendingFavConn = &f
+	m.Update(msgInstances{instances: []awsint.Instance{{ID: "i-1", Name: "kali-box"}, {ID: "i-2", Name: "kali-box"}}})
+	if !strings.Contains(m.notice, "2 running instances") {
+		t.Errorf("ambiguous: notice=%q", m.notice)
+	}
+
+	// Unique match: the instance is selected and the RDP start path engages (loading, cmd).
+	m.pendingFavConn = &f
+	_, cmd := m.Update(msgInstances{instances: []awsint.Instance{{ID: "i-9", Name: "kali-box", Platform: "windows"}}})
+	if m.selInstance == nil || m.selInstance.ID != "i-9" {
+		t.Fatalf("unique match not selected: %+v", m.selInstance)
+	}
+	if cmd == nil || !m.loading {
+		t.Error("RDP start did not engage on the unique match")
+	}
+	if m.pendingFavConn != nil {
+		t.Error("connection half not consumed")
+	}
+}
+
+// Past favInlineMax the method screen shows one collapsed row instead of a bookmark pile,
+// and the dedicated screen carries the full set plus the removal flow.
+func TestFavoritesCollapseBeyondInlineMax(t *testing.T) {
+	m := modelWithSSOSession(t)
+	url := m.ssoSessions[0].StartURL
+	for i := 0; i < favInlineMax+2; i++ {
+		if err := browser.AddFavorite(browser.Favorite{
+			Nickname: fmt.Sprintf("fav-%d", i), StartURL: url,
+			AccountID: fmt.Sprintf("%012d", i), AccountName: fmt.Sprintf("Acct %d", i), Role: "Admin",
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	m.buildMethodList()
+	if _, ok := findItem(m, "fav:0"); ok {
+		t.Error("favorites still inline past the cap")
+	}
+	row, ok := findItem(m, methodFavList)
+	if !ok || !strings.Contains(row.title, fmt.Sprintf("(%d)", favInlineMax+2)) {
+		t.Fatalf("collapsed row = %+v", row)
+	}
+
+	m.selectMethod(methodFavList)
+	if m.screen != screenFavorites {
+		t.Fatalf("screen = %v", m.screen)
+	}
+	if _, ok := findItem(m, "fav:0"); !ok {
+		t.Error("favorites screen missing the bookmarks")
+	}
+
+	// Remove flow: delete one, the list shrinks in place.
+	m.buildFavoriteRemoveList()
+	m.screen = screenFavoriteRemove
+	m.selectFavoriteRemove("favdel:0")
+	if len(browser.Favorites()) != favInlineMax+1 {
+		t.Errorf("favorite not removed: %d left", len(browser.Favorites()))
+	}
+	if _, ok := findItem(m, fmt.Sprintf("favdel:%d", favInlineMax)); !ok {
+		t.Error("remove list did not rebuild in place")
+	}
+}
+
+// Profile removal: preview screen carries the exact block, "keep" is the safe first row,
+// and removal reloads what the picker knows.
+func TestProfileRemoveFlow(t *testing.T) {
+	m := modelWithSSOSession(t)
+	if err := awsint.AddCredentialProcessProfile("bad-one", "corp", "111111111111", "Admin"); err != nil {
+		t.Fatal(err)
+	}
+	sessions, profiles, _ := awsint.ParseConfig()
+	m.ssoSessions, m.profiles = sessions, profiles
+
+	m.buildMethodList()
+	if _, ok := findItem(m, methodRemoveProfil); !ok {
+		t.Fatal("no remove-profile row despite a profile existing")
+	}
+	m.selectMethod(methodRemoveProfil)
+	if m.screen != screenProfileRemove {
+		t.Fatalf("screen = %v", m.screen)
+	}
+
+	m.selectProfileRemove("bad-one")
+	if m.screen != screenProfileConfirm || !strings.Contains(m.profileRemoveBlock, "[profile bad-one]") {
+		t.Fatalf("confirm: screen=%v block=%q", m.screen, m.profileRemoveBlock)
+	}
+	if first := m.list.Items()[0].(item); first.value != "keep" {
+		t.Errorf("first confirm row = %+v — Enter-through must be safe", first)
+	}
+
+	// Keep: nothing changes.
+	m.selectProfileConfirm("keep")
+	if _, _, err := awsint.ParseConfig(); err != nil {
+		t.Fatal(err)
+	}
+	if len(m.profiles) != 1 {
+		t.Error("keep removed something")
+	}
+
+	// Remove: the block goes, the picker reloads, and with zero profiles left the
+	// remove-profile row withdraws from the method screen.
+	m.screen = screenProfileConfirm
+	m.selectProfileConfirm("remove")
+	if len(m.profiles) != 0 {
+		t.Errorf("profiles after removal: %+v", m.profiles)
+	}
+	if m.screen != screenMethod {
+		t.Fatalf("screen = %v, want method with nothing left to remove", m.screen)
+	}
+	if _, ok := findItem(m, methodRemoveProfil); ok {
+		t.Error("remove-profile row offered with no profiles")
+	}
+}
+
+// x on a highlighted inline favorite deletes it — the fix for "I have a bad favorite and
+// no TUI way to remove it" when the count is under the collapse threshold and the manage
+// screen therefore does not exist.
+func TestInlineFavoriteRemovedWithX(t *testing.T) {
+	m := modelWithSSOSession(t)
+	if err := browser.AddFavorite(browser.Favorite{
+		Nickname: "linux-box-rdp", StartURL: m.ssoSessions[0].StartURL,
+		AccountID: "111111111111", AccountName: "Lab", Role: "Admin",
+		InstanceName: "linux-box", ConnType: "rdp",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	m.buildMethodList()
+	row, ok := findItem(m, "fav:0")
+	if !ok {
+		t.Fatal("favorite not inline")
+	}
+	if !strings.Contains(row.desc, "x removes") {
+		t.Errorf("row desc = %q — the key must advertise itself", row.desc)
+	}
+
+	m.list.Select(0) // cursor on the favorite
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'x'}})
+	if len(browser.Favorites()) != 0 {
+		t.Fatal("x did not remove the favorite")
+	}
+	if _, ok := findItem(m, "fav:0"); ok {
+		t.Error("row still rendered after removal")
+	}
+	if !strings.Contains(m.notice, "linux-box-rdp") {
+		t.Errorf("notice = %q, want the removed nickname named", m.notice)
+	}
+
+	// x anywhere else must do nothing destructive: on a session row it is just a key.
+	m.list.Select(0)
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'x'}})
+	if m.err != nil {
+		t.Errorf("x on a non-favorite row errored: %v", m.err)
+	}
+}
+
+// RDP toward a Linux box: the conn-type row warns in place, and a favorite replay pauses on
+// that screen instead of silently tunnelling to a port nothing listens on. Enter still
+// proceeds — xrdp exists — and unknown platforms stay silent so the warning keeps meaning.
+func TestRDPLinuxMismatchWarns(t *testing.T) {
+	m := modelWithSSOSession(t)
+	m.awsSess = &awsint.Session{Label: "x", AccessKeyID: "AKIA", RoleName: "Admin"}
+	m.selInstance = &awsint.Instance{ID: "i-1", Name: "kali", Platform: "linux"}
+	m.buildConnTypeList()
+	rdp, _ := findItem(m, "rdp")
+	if !strings.Contains(rdp.desc, "Linux box") {
+		t.Errorf("rdp row = %q, want the mismatch named", rdp.desc)
+	}
+
+	m.selInstance = &awsint.Instance{ID: "i-2", Name: "mystery", Platform: ""}
+	m.buildConnTypeList()
+	if rdp, _ := findItem(m, "rdp"); strings.Contains(rdp.desc, "Linux") {
+		t.Errorf("unknown platform warned anyway: %q", rdp.desc)
+	}
+
+	// Favorite replay: unique match, RDP wanted, Linux reported → pause on the screen.
+	m.pendingFavConn = &browser.Favorite{InstanceName: "kali", ConnType: "rdp"}
+	_, cmd := m.Update(msgInstances{instances: []awsint.Instance{{ID: "i-1", Name: "kali", Platform: "linux"}}})
+	if cmd != nil || m.screen != screenConnType {
+		t.Fatalf("paused wrong: cmd=%v screen=%v", cmd, m.screen)
+	}
+	if !strings.Contains(m.notice, "paused") {
+		t.Errorf("notice = %q", m.notice)
+	}
+	// A Windows box replays straight through.
+	m.pendingFavConn = &browser.Favorite{InstanceName: "winbox", ConnType: "rdp"}
+	_, cmd = m.Update(msgInstances{instances: []awsint.Instance{{ID: "i-3", Name: "winbox", Platform: "windows"}}})
+	if cmd == nil {
+		t.Error("windows RDP favorite did not auto-connect")
+	}
+}
+
+// Proceeding past the Linux-RDP warning is the "don't show this again": the warning and the
+// favorite pause both stand down for that account+name afterwards, and only for it.
+func TestRDPLinuxAckSuppressesWarning(t *testing.T) {
+	m := modelWithSSOSession(t)
+	m.awsSess = &awsint.Session{Label: "x", AccessKeyID: "AKIA", RoleName: "Admin", AccountID: "111111111111"}
+	m.selInstance = &awsint.Instance{ID: "i-1", Name: "kali", Platform: "linux"}
+
+	// Proceeding records the acknowledgment (startRDP fires async; the ack is synchronous).
+	m.selectConnType("rdp")
+	m.loading = false
+	if !browser.RDPLinuxAcked("111111111111", "kali") {
+		t.Fatal("proceeding did not record the acknowledgment")
+	}
+
+	// The row warning stands down for this box…
+	m.buildConnTypeList()
+	if rdp, _ := findItem(m, "rdp"); strings.Contains(rdp.desc, "Linux box") {
+		t.Errorf("warning shown after ack: %q", rdp.desc)
+	}
+	// …but not for its neighbours.
+	m.selInstance = &awsint.Instance{ID: "i-2", Name: "other-linux", Platform: "linux"}
+	m.buildConnTypeList()
+	if rdp, _ := findItem(m, "rdp"); !strings.Contains(rdp.desc, "Linux box") {
+		t.Error("ack leaked to a different instance")
+	}
+
+	// The favorite replay no longer pauses on the acked box.
+	m.pendingFavConn = &browser.Favorite{InstanceName: "kali", ConnType: "rdp"}
+	_, cmd := m.Update(msgInstances{instances: []awsint.Instance{{ID: "i-1", Name: "kali", Platform: "linux"}}})
+	if cmd == nil {
+		t.Error("acked RDP favorite still paused")
+	}
+}
+
+// The HIGH finding: any error must end every pending detour, or a stale pendingFavConn
+// hijacks the NEXT credential flow into an automatic connection in whatever account the
+// user moved on to.
+func TestErrorClearsPendingDetours(t *testing.T) {
+	m := modelWithSSOSession(t)
+	m.pendingFavConn = &browser.Favorite{InstanceName: "kali", ConnType: "rdp"}
+	m.pendingFavRole = "Admin"
+	m.pendingProfile = "tp24"
+
+	m.Update(msgError{errors.New("role was removed")})
+	if m.pendingFavConn != nil || m.pendingFavRole != "" || m.pendingProfile != "" {
+		t.Fatalf("pending state survived msgError: conn=%v role=%q profile=%q",
+			m.pendingFavConn, m.pendingFavRole, m.pendingProfile)
+	}
+}
+
+// A favorite skips the account and role screens, so it must also clear the lists a previous
+// flow left behind — goBack from its action screen otherwise offered another account's
+// roles under this account's title.
+func TestFavoriteClearsStaleAccountAndRoleLists(t *testing.T) {
+	m := modelWithSSOSession(t)
+	m.accounts = []awsint.Account{{ID: "1", Name: "old"}}
+	m.roles = []string{"XAdmin", "XReadOnly", "XDev"}
+	if err := browser.AddFavorite(browser.Favorite{
+		Nickname: "y-admin", StartURL: m.ssoSessions[0].StartURL,
+		AccountID: "222222222222", AccountName: "Y", Role: "Admin",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	m.buildMethodList()
+	m.selectMethod("fav:0")
+	if len(m.roles) != 0 || len(m.accounts) != 0 {
+		t.Fatalf("stale lists survived the favorite: roles=%v accounts=%v", m.roles, m.accounts)
+	}
+	// And goBack from the action screen therefore goes home, not into a stale list.
+	m.awsSess = &awsint.Session{Label: "x", AccessKeyID: "AKIA", RoleName: "Admin"}
+	m.screen = screenAction
+	m.goBack()
+	if m.screen != screenMethod {
+		t.Fatalf("goBack = %v, want screenMethod", m.screen)
 	}
 }

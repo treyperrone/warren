@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"time"
 
 	"github.com/treyperrone/warren/internal/homedir"
 )
@@ -160,6 +161,10 @@ func SavePref(p Pref) error {
 	})
 }
 
+// errSkipWrite lets a mutator report "nothing changed" so mutateConfigDoc leaves the file
+// untouched instead of rewriting identical bytes.
+var errSkipWrite = errors.New("skip write")
+
 // mutateConfigDoc is the one writer of warren's config file: read the whole document as raw
 // JSON members, let f edit exactly the keys it owns, re-encode around everything else. Keys
 // this build has never heard of — a newer build's settings, say — survive every write
@@ -177,6 +182,9 @@ func mutateConfigDoc(f func(doc map[string]json.RawMessage) error) error {
 		doc = map[string]json.RawMessage{}
 	}
 	if err := f(doc); err != nil {
+		if errors.Is(err, errSkipWrite) {
+			return nil
+		}
 		return err
 	}
 
@@ -190,11 +198,30 @@ func mutateConfigDoc(f func(doc map[string]json.RawMessage) error) error {
 	// JSON). Rename is atomic on the same filesystem, so the file is always either the old
 	// document or the new one. 0600 like the session file: nothing here is secret today, but
 	// a config file that may grow fields later is cheaper to keep private from the start.
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, append(out, '\n'), 0o600); err != nil {
-		return fmt.Errorf("writing %s: %w", tmp, err)
+	// A UNIQUE temp name per write: this file now has writers in separate processes (the
+	// TUI, `warren creds` under some SDK, favexec's renewal), and two of them sharing one
+	// ".tmp" path can interleave write/rename and install a torn document. Unique temps
+	// make every rename atomic-or-lost; losing one whole update (last writer wins) is
+	// acceptable for preferences and observations, a spliced file is not.
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".warren_config-*.tmp")
+	if err != nil {
+		return fmt.Errorf("writing %s: %w", path, err)
 	}
-	if err := os.Rename(tmp, path); err != nil {
+	_, werr := tmp.Write(append(out, '\n'))
+	cerr := tmp.Close()
+	if werr != nil || cerr != nil {
+		_ = os.Remove(tmp.Name())
+		if werr == nil {
+			werr = cerr
+		}
+		return fmt.Errorf("writing %s: %w", path, werr)
+	}
+	if err := os.Chmod(tmp.Name(), 0o600); err != nil {
+		_ = os.Remove(tmp.Name())
+		return err
+	}
+	if err := os.Rename(tmp.Name(), path); err != nil {
+		_ = os.Remove(tmp.Name())
 		return fmt.Errorf("writing %s: %w", path, err)
 	}
 	return nil
@@ -289,4 +316,241 @@ func OpenForLogin(p Pref, url string) string {
 		return fmt.Sprintf("could not open a browser (%v) — use the URL below", err)
 	}
 	return "opening your default browser"
+}
+
+// ---- session observations ------------------------------------------------------------------
+
+// SessionObservation is what warren has LEARNED about one Identity Center session, since AWS
+// discloses none of it: when the current sign-in happened, and how long the org allowed the
+// previous one to live before silent renewal stopped working. The learned duration is the
+// only path to printing "session hard-expires in ~4h" at sign-in time — there is no grant
+// field and no non-admin API that says it.
+//
+// This lives in warren's config file because that file is warren's memory, not because a
+// session observation is a browser preference; if the file grows more tenants, the store
+// deserves its own package.
+type SessionObservation struct {
+	SignedInAt            time.Time `json:"signed_in_at,omitempty"`
+	LearnedSessionSeconds int64     `json:"learned_session_seconds,omitempty"`
+}
+
+// LearnedDuration is the observed org session length, zero when nothing has been learned yet.
+func (o SessionObservation) LearnedDuration() time.Duration {
+	return time.Duration(o.LearnedSessionSeconds) * time.Second
+}
+
+const obsKey = "sso_session_observations"
+
+func loadObservations(doc map[string]json.RawMessage) map[string]SessionObservation {
+	m := map[string]SessionObservation{}
+	if raw, ok := doc[obsKey]; ok {
+		_ = json.Unmarshal(raw, &m)
+	}
+	return m
+}
+
+// LoadObservation returns what is known about one start URL's sessions.
+func LoadObservation(startURL string) (SessionObservation, bool) {
+	doc, err := readConfigDoc()
+	if err != nil {
+		return SessionObservation{}, false
+	}
+	o, ok := loadObservations(doc)[startURL]
+	return o, ok
+}
+
+// RecordSignIn stamps the moment a device authorization succeeded. The learned duration from
+// previous sessions survives — it is the whole point of keeping it.
+func RecordSignIn(startURL string, at time.Time) error {
+	return mutateObservation(startURL, func(o *SessionObservation) { o.SignedInAt = at })
+}
+
+// RecordSessionEnd marks the moment silent renewal stopped working — the one observable
+// signal that the org's session ceiling was hit — and learns the session length from it.
+// The sign-in stamp is consumed: later failures of the already-dead session must not
+// re-learn ever-longer durations from the same start point.
+func RecordSessionEnd(startURL string, at time.Time) error {
+	return mutateObservation(startURL, func(o *SessionObservation) {
+		if o.SignedInAt.IsZero() || !at.After(o.SignedInAt) {
+			return
+		}
+		o.LearnedSessionSeconds = int64(at.Sub(o.SignedInAt) / time.Second)
+		o.SignedInAt = time.Time{}
+	})
+}
+
+func mutateObservation(startURL string, f func(*SessionObservation)) error {
+	if startURL == "" {
+		return nil
+	}
+	return mutateConfigDoc(func(doc map[string]json.RawMessage) error {
+		m := loadObservations(doc)
+		o := m[startURL]
+		before := o
+		f(&o)
+		if o == before {
+			// A no-op mutation (RecordSessionEnd with no sign-in stamp — every failed
+			// refresh after a session dies) must not stamp empty entries or churn the
+			// file with rewrites that change nothing.
+			return errSkipWrite
+		}
+		m[startURL] = o
+		raw, err := json.Marshal(m)
+		if err != nil {
+			return err
+		}
+		doc[obsKey] = raw
+		return nil
+	})
+}
+
+// ---- favorites -------------------------------------------------------------------------------
+
+// Favorite is one bookmarked account+role, pinned to the top of the picker and addressable
+// by nickname from the CLI. It exists because a 300-account Identity Center has maybe five
+// destinations a person actually lives in — the picker is for finding, favorites are for
+// returning. Keyed by start URL like everything else in this file, so renaming the
+// [sso-session] block orphans nothing.
+type Favorite struct {
+	Nickname    string `json:"nickname,omitempty"`
+	StartURL    string `json:"start_url"`
+	AccountID   string `json:"account_id"`
+	AccountName string `json:"account_name,omitempty"`
+	Role        string `json:"role"`
+	// The optional connection half: with these set, selecting the favorite carries on past
+	// credentials to an actual session — resolve the instance, start the tunnel, open the
+	// client. InstanceName is the Name TAG, never the instance id: in a range that repaves,
+	// ids are corpses within the week while names are policy, so a favorite that stored
+	// i-0abc... would quietly rot. Resolution happens at launch, against what is running.
+	InstanceName string `json:"instance_name,omitempty"`
+	ConnType     string `json:"conn_type,omitempty"` // "shell", "ssh" or "rdp"
+	SSHUser      string `json:"ssh_user,omitempty"`
+}
+
+// Connects reports whether this favorite carries a connection, or stops at credentials.
+func (f Favorite) Connects() bool { return f.ConnType != "" }
+
+// Same reports whether two favorites name the same destination — account, role, and the
+// connection half. Two favorites on the same role but different instances (or the same
+// instance over SSH and RDP) are different destinations; nickname and the account display
+// name are decoration.
+func (f Favorite) Same(o Favorite) bool {
+	return f.StartURL == o.StartURL && f.AccountID == o.AccountID && f.Role == o.Role &&
+		f.InstanceName == o.InstanceName && f.ConnType == o.ConnType && f.SSHUser == o.SSHUser
+}
+
+const favKey = "favorites"
+
+// Favorites returns the saved bookmarks in saved order — the order is the user's, made by
+// when they starred things, and reordering it for them would break spatial memory.
+func Favorites() []Favorite {
+	doc, err := readConfigDoc()
+	if err != nil {
+		return nil
+	}
+	var favs []Favorite
+	if raw, ok := doc[favKey]; ok {
+		_ = json.Unmarshal(raw, &favs)
+	}
+	return favs
+}
+
+// FindFavorite locates a saved bookmark equal to probe (Same semantics: the whole
+// destination, connection half included — a creds-only probe only matches a creds-only
+// favorite).
+func FindFavorite(probe Favorite) (Favorite, bool) {
+	for _, f := range Favorites() {
+		if f.Same(probe) {
+			return f, true
+		}
+	}
+	return Favorite{}, false
+}
+
+// AddFavorite saves a bookmark; starring the same destination twice updates the existing
+// entry in place (a rename) rather than growing a duplicate row.
+func AddFavorite(f Favorite) error {
+	return mutateFavorites(func(favs []Favorite) []Favorite {
+		for i := range favs {
+			if favs[i].Same(f) {
+				favs[i] = f
+				return favs
+			}
+		}
+		return append(favs, f)
+	})
+}
+
+// RemoveFavorite deletes the bookmark for f's destination; removing what is not there is a
+// no-op, not an error.
+func RemoveFavorite(f Favorite) error {
+	return mutateFavorites(func(favs []Favorite) []Favorite {
+		out := favs[:0]
+		for _, x := range favs {
+			if !x.Same(f) {
+				out = append(out, x)
+			}
+		}
+		return out
+	})
+}
+
+func mutateFavorites(f func([]Favorite) []Favorite) error {
+	return mutateConfigDoc(func(doc map[string]json.RawMessage) error {
+		var favs []Favorite
+		if raw, ok := doc[favKey]; ok {
+			_ = json.Unmarshal(raw, &favs)
+		}
+		favs = f(favs)
+		if len(favs) == 0 {
+			delete(doc, favKey)
+			return nil
+		}
+		raw, err := json.Marshal(favs)
+		if err != nil {
+			return err
+		}
+		doc[favKey] = raw
+		return nil
+	})
+}
+
+// ---- RDP-on-Linux acknowledgments ------------------------------------------------------------
+
+// rdpAckKey identifies one acknowledged Linux-but-RDP box: account + Name tag, never the
+// instance id, for the same repave reason favorites use names. Once the user proceeds past
+// the warning on a box, they have declared "this one runs xrdp" — showing the same warning
+// again would be warren forgetting on purpose.
+const rdpAcksKey = "rdp_linux_acks"
+
+func rdpAckKey(accountID, instanceName string) string { return accountID + "/" + instanceName }
+
+// RDPLinuxAcked reports whether this box's Linux-but-RDP warning has been accepted before.
+func RDPLinuxAcked(accountID, instanceName string) bool {
+	doc, err := readConfigDoc()
+	if err != nil {
+		return false
+	}
+	var acks map[string]bool
+	if raw, ok := doc[rdpAcksKey]; ok {
+		_ = json.Unmarshal(raw, &acks)
+	}
+	return acks[rdpAckKey(accountID, instanceName)]
+}
+
+// AckRDPLinux records that the user knowingly RDPs into this Linux-reported box.
+func AckRDPLinux(accountID, instanceName string) error {
+	return mutateConfigDoc(func(doc map[string]json.RawMessage) error {
+		acks := map[string]bool{}
+		if raw, ok := doc[rdpAcksKey]; ok {
+			_ = json.Unmarshal(raw, &acks)
+		}
+		acks[rdpAckKey(accountID, instanceName)] = true
+		raw, err := json.Marshal(acks)
+		if err != nil {
+			return err
+		}
+		doc[rdpAcksKey] = raw
+		return nil
+	})
 }

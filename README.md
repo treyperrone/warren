@@ -57,11 +57,13 @@ go install github.com/treyperrone/warren@latest
 ```sh
 warren                     # launch the interactive picker
 warren exec -- <cmd>       # pick an account and role, then run <cmd> with its credentials
-warren shell               # pick an account and role, then open a shell with its credentials
+warren shell [favorite]    # pick an account and role — or name a favorite — then open a shell
+warren exec <fav> -- <cmd> # run <cmd> as a favorited account+role, no picker
 warren ssm-shell <target>  # pick an account and role, then open an SSM shell on <target>
 warren login [identity]    # sign in without the TUI: device-code by default (URL + code + OSC 52 clipboard)
 warren login --browser     # the only way login opens a browser: saved browser/profile, or a picker
 warren login --status      # report token liveness without signing in; exit 0 live, 1 not
+warren creds ...           # credential_process provider — profiles that never go stale
 warren setup               # add an [sso-session] block to ~/.aws/config
 warren version             # print warren's version and the embedded plugin's
 warren help                # print usage
@@ -98,6 +100,24 @@ Per-session overrides are keyed by the session's start URL, so they survive rena
 Commands and shells started by warren do not get a frozen copy of the credentials. A parent process cannot reach into a child's environment, so instead of handing over keys, warren serves credentials from a loopback endpoint that the child reads through the standard AWS container-credential variables — and keeps refreshing what it serves. A shell left open past the hour keeps working rather than failing with `ExpiredToken`. The endpoint listens on `127.0.0.1` only and requires a per-run token, so nothing else on the machine can read from it.
 
 Tunnels are the exception: they are started with the credentials as they stood at launch.
+
+### S3 browsing — with drag-and-drop upload
+
+**Browse S3 buckets** on the action screen lists what the role can see; Enter drills into folder-style levels (fully paginated, `/` fuzzy-searches like every list), Enter on an object downloads it to `~/Downloads` (never overwriting — collisions get ` (2)`-style names), and **⇪ Upload to this location** opens a path box that accepts a file **dragged onto the terminal window** — terminals paste a dropped file's path, warren cleans the quoting, and the transfer manager handles multipart for big files. Esc walks up one level at a time. Single files only by design; trees are `aws s3 sync` territory, one Build-screen away.
+
+### Favorites
+
+A 300-account Identity Center has maybe five destinations you actually live in. Star one with **☆ Add to favorites** on the action screen and it is pinned to the top of the picker — `★ Corp Lab / AdminRole` — where a single Enter goes straight to credentials, skipping the account and role screens (a cold token still runs the normal sign-in flow first).
+
+Favorites can carry a whole **connection**, not just credentials: when a shell, SSH tunnel, or RDP tunnel starts, the tunnel manager offers **☆ Favorite this connection**. Selecting that pinned row later replays everything — sign-in if needed, role credentials, find the instance, start the tunnel. The instance is remembered by its **Name tag and re-resolved against what is running at launch**, never by instance id, so favorites survive ranges that rebuild their hosts; zero or ambiguous matches drop to the instance list with the reason shown. RDP tunnels also now **open your RDP client themselves** — `mstsc` on Windows, Windows App on macOS (via a generated `.rdp` file), `xfreerdp`/`remmina` on Linux when installed — with the old "point your client at localhost:PORT" line as the fallback when none is found. The star also mints a CLI nickname (`corp-lab-adminrole`), so `warren exec corp-lab-adminrole -- aws s3 ls` and `warren shell corp-lab-adminrole` work with no picker and no saved AWS profile — children still read from the auto-renewing loopback endpoint, so nothing goes stale at the hour mark. Favorites live in `~/.warren_config.json`; unstar from the same action screen row. Past four bookmarks the method screen collapses them into a single **★ Favorites (N)** row — Enter, Enter still connects the first — leading to a dedicated screen that also carries the removal flow. Anywhere a favorite row renders, **x removes it** — the row says so. Picking RDP on a box that reports as Linux warns once on the row (and pauses a favorite replay); proceeding records that the box runs xrdp — keyed by account + Name tag, repave-proof — and the warning never returns for it.
+
+Bad `[profile]` blocks can be removed without hand-editing: **✕ Remove an AWS profile** on the method screen previews the exact lines that would be deleted, takes a `.warren.bak` backup, and removes only that block — every other byte of `~/.aws/config` survives verbatim. This is the one deliberate exception to warren's append-only rule, kept safe by being textual surgery rather than a parse-and-rewrite.
+
+### Profiles that never go stale (`warren creds`)
+
+For tools warren does not launch — a plain `aws` or Terraform run in another terminal — pick **Save as AWS profile** on the action screen after choosing an account and role. It appends a `[profile]` block to `~/.aws/config` whose `credential_process = warren creds …` makes every SDK and the aws CLI call warren on demand: each call vends fresh role credentials off the silently-renewed SSO token, so a one-hour org policy never strands a long task. No daemon, and no keys written to disk. When the Identity Center session itself has ended, the profile fails with a clear instruction (`run: warren login <session>`), never a hang — `warren creds` is strictly non-interactive because its caller is an SDK holding a pipe.
+
+Sign-in output also reports lifetime as precisely as AWS allows: without a refresh token the access-token expiry **is** the hard ceiling and is printed as such; with one, the org's session ceiling is not disclosed by any API, so warren **learns** it — it records when you signed in, notices the moment silent renewal stops working, and from then on prints "org session hard-expires ~…" at sign-in and in `warren login --status`.
 
 If no SSO session or profile is configured, warren offers to create one on startup. To add another later — a prod range alongside a lab one — either run `warren setup`, or pick **+ Add SSO session** on the authentication screen (press `esc` from the account list to get there).
 

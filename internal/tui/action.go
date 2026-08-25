@@ -2,20 +2,26 @@ package tui
 
 import (
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/charmbracelet/bubbles/list"
 	tea "github.com/charmbracelet/bubbletea"
 
+	awsint "github.com/treyperrone/warren/internal/aws"
 	"github.com/treyperrone/warren/internal/awscli"
 	"github.com/treyperrone/warren/internal/awsexec"
+	"github.com/treyperrone/warren/internal/browser"
 )
 
 // Action values on the screen shown once credentials exist.
 const (
-	actionInstances = "instances"
-	actionCLI       = "cli"
-	actionBuild     = "build"
+	actionInstances   = "instances"
+	actionCLI         = "cli"
+	actionBuild       = "build"
+	actionSaveProfile = "saveprofile"
+	actionFavAdd      = "favadd"
+	actionFavRemove   = "favremove"
 )
 
 // msgCredsShellDone reports that the credentialed shell exited.
@@ -54,10 +60,45 @@ func (m *Model) buildActionList() {
 			value: actionCLI,
 		},
 		item{
+			title: "Browse S3 buckets",
+			desc:  "download objects, or upload by dragging a file into the window",
+			value: actionS3,
+		},
+		item{
 			title: "Build an AWS CLI command",
 			desc:  "pick a service and a task; edit the command before it runs" + cliNote(),
 			value: actionBuild,
 		},
+	}
+
+	// Only for the sso-session flow: the block this writes names the session, the account
+	// and the role, and a named-profile flow has no session of its own to point at (it IS
+	// already a profile).
+	if m.selSession != nil && m.selAccount != nil && m.awsSess != nil && m.awsSess.RoleName != "" {
+		items = append(items, item{
+			title: "Save as AWS profile",
+			desc: "append [profile " + profileSlug(m.selAccount.Name, m.awsSess.RoleName) +
+				"] to ~/.aws/config — credentials via `warren creds`, fresh on every use, for any AWS tool",
+			value: actionSaveProfile,
+		})
+		// The star toggles: one row, phrased by what selecting it will do. Favorites pin
+		// this exact account+role to the top of the picker and give it a CLI nickname —
+		// the returning-to answer, where the picker is the finding answer.
+		probe := browser.Favorite{StartURL: m.selSession.StartURL, AccountID: m.selAccount.ID, Role: m.awsSess.RoleName}
+		if fav, ok := browser.FindFavorite(probe); ok {
+			items = append(items, item{
+				title: "★ Remove from favorites",
+				desc:  "unpin " + fav.Nickname + " from the top of the picker",
+				value: actionFavRemove,
+			})
+		} else {
+			items = append(items, item{
+				title: "☆ Add to favorites",
+				desc: "pin to the top of the picker; usable from the CLI as: warren exec " +
+					profileSlug(m.selAccount.Name, m.awsSess.RoleName) + " -- <cmd>",
+				value: actionFavAdd,
+			})
+		}
 	}
 
 	m.list.Title = "What next?  •  " + m.credSummary() + "  •  Esc=back"
@@ -87,6 +128,50 @@ func (m *Model) credSummary() string {
 
 func (m *Model) selectAction(val string) tea.Cmd {
 	switch val {
+	case actionFavAdd:
+		fav := browser.Favorite{
+			Nickname:    profileSlug(m.selAccount.Name, m.awsSess.RoleName),
+			StartURL:    m.selSession.StartURL,
+			AccountID:   m.selAccount.ID,
+			AccountName: m.selAccount.Name,
+			Role:        m.awsSess.RoleName,
+		}
+		if err := browser.AddFavorite(fav); err != nil {
+			m.err = err
+			return nil
+		}
+		m.notice = "favorited as " + fav.Nickname + " — pinned to the picker, and: warren exec " + fav.Nickname + " -- <cmd>"
+		m.buildActionList() // the star flips in place
+		return nil
+
+	case actionFavRemove:
+		fav := browser.Favorite{StartURL: m.selSession.StartURL, AccountID: m.selAccount.ID, Role: m.awsSess.RoleName}
+		if err := browser.RemoveFavorite(fav); err != nil {
+			m.err = err
+			return nil
+		}
+		m.notice = "removed from favorites"
+		m.buildActionList()
+		return nil
+
+	case actionS3:
+		m.loading = true
+		return m.fetchS3Buckets()
+
+	case actionSaveProfile:
+		name := profileSlug(m.selAccount.Name, m.awsSess.RoleName)
+		err := awsint.AddCredentialProcessProfile(name, m.selSession.Name, m.selAccount.ID, m.awsSess.RoleName)
+		if err != nil {
+			m.err = err
+			return nil
+		}
+		m.notice = "profile " + name + " appended to ~/.aws/config — usable now: aws --profile " + name + " sts get-caller-identity"
+		// Rebuilt so the new profile appears on the method screen without a restart, the
+		// same way + Add SSO session refreshes what the picker knows.
+		if sessions, profiles, perr := awsint.ParseConfig(); perr == nil {
+			m.ssoSessions, m.profiles = sessions, profiles
+		}
+		return nil
 	case actionInstances:
 		m.loading = true
 		return m.fetchInstances()
@@ -123,4 +208,28 @@ func (m *Model) startCredsShell() tea.Cmd {
 	return tea.ExecProcess(m.wrapWithHeader(cmd, "AWS CLI"), func(error) tea.Msg {
 		return msgCredsShellDone{}
 	})
+}
+
+// profileSlug builds a config-safe profile name from what the user already recognises: the
+// account name and role. Everything outside the [profile] allowlist becomes a dash, runs
+// collapse, and the result is lowercase — "Corp Lab" + "AdminRole" -> corp-lab-adminrole.
+func profileSlug(account, role string) string {
+	slug := func(s string) string {
+		var b []rune
+		lastDash := true // also trims leading dashes
+		for _, r := range strings.ToLower(s) {
+			switch {
+			case r >= 'a' && r <= 'z', r >= '0' && r <= '9', r == '.', r == '_':
+				b = append(b, r)
+				lastDash = false
+			default:
+				if !lastDash {
+					b = append(b, '-')
+					lastDash = true
+				}
+			}
+		}
+		return strings.TrimRight(string(b), "-")
+	}
+	return slug(account) + "-" + slug(role)
 }

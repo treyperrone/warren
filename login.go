@@ -383,7 +383,43 @@ func runLogin(ctx context.Context, args []string) int {
 		return 1
 	}
 	fmt.Fprintf(os.Stderr, "%s: signed in — token cached and shared with the aws CLI\n", sess.Name)
+	fmt.Fprintf(os.Stderr, "[sso] %s\n", lifetimeLine(*pending, sess.StartURL, time.Now()))
 	return 0
+}
+
+// lifetimeLine says how long this sign-in lasts, as precisely as anything outside AWS can:
+// with no refresh token the access-token expiry IS the hard ceiling; with one, the ceiling
+// is the org's Identity Center session duration, which no grant field and no non-admin API
+// discloses — so warren reports the duration it LEARNED by watching the previous session's
+// renewal stop working, and says when it has nothing to report from yet.
+func lifetimeLine(p awsint.PendingLogin, startURL string, now time.Time) string {
+	if p.TokenExpiresAt.IsZero() {
+		return "signed in"
+	}
+	if !p.AutoRenews {
+		return "session hard-expires " + untilRound(p.TokenExpiresAt) +
+			" — no refresh token was issued, sign in again after"
+	}
+	if obs, ok := browser.LoadObservation(startURL); ok && obs.LearnedDuration() > 0 {
+		return fmt.Sprintf("token renews silently; org session hard-expires ~%s (learned from your last session)",
+			untilRound(now.Add(obs.LearnedDuration())))
+	}
+	return "token renews silently; the org session ceiling is not disclosed by AWS — warren will learn it the first time renewal stops working"
+}
+
+// untilRound renders "until 15:04 (7h58m)" — the wall-clock time is what someone plans
+// around, the duration is what they feel.
+func untilRound(t time.Time) string {
+	left := time.Until(t).Round(time.Minute)
+	// A deadline already behind us renders as a fact, not a negative countdown — a stale
+	// learned ceiling would otherwise print "until 09:23 (-125m)".
+	if left <= 0 {
+		return fmt.Sprintf("passed at %s", t.Local().Format("15:04"))
+	}
+	if h := int(left.Hours()); h > 0 {
+		return fmt.Sprintf("until %s (%dh%02dm)", t.Local().Format("15:04"), h, int(left.Minutes())%60)
+	}
+	return fmt.Sprintf("until %s (%dm)", t.Local().Format("15:04"), int(left.Minutes()))
 }
 
 // promptTargetChoice is the numbered menu for "which identity" — shown instead of exit 2
@@ -558,7 +594,22 @@ func reportTargetStatus(ctx context.Context, t loginTarget) int {
 	_, err := awsint.SilentToken(ctx, *t.sess)
 	switch {
 	case err == nil:
-		fmt.Printf("%s: signed in%s\n", t.name, covers)
+		detail := ""
+		if exp, renews, ok := awsint.TokenInfo(t.sess.StartURL); ok {
+			switch {
+			case !renews:
+				detail = fmt.Sprintf(" (token %s; no refresh token — that is the hard expiry)", untilRound(exp))
+			default:
+				detail = fmt.Sprintf(" (token %s; auto-renews)", untilRound(exp))
+				// The learned ceiling counts from the sign-in, not from now.
+				if obs, ok := browser.LoadObservation(t.sess.StartURL); ok &&
+					obs.LearnedDuration() > 0 && !obs.SignedInAt.IsZero() {
+					detail = fmt.Sprintf(" (token %s; auto-renews; org session hard-expires ~%s)",
+						untilRound(exp), untilRound(obs.SignedInAt.Add(obs.LearnedDuration())))
+				}
+			}
+		}
+		fmt.Printf("%s: signed in%s%s\n", t.name, covers, detail)
 		return 0
 	case errors.Is(err, awsint.ErrLoginRequired):
 		fmt.Printf("%s: sign-in required%s (run: warren login %s)\n", t.name, covers, t.name)

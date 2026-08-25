@@ -25,13 +25,15 @@ const usage = `warren — browse AWS accounts and connect to EC2 instances over 
 usage:
   warren                     launch the interactive picker
   warren exec -- <cmd>       pick an account and role, then run <cmd> with its credentials
-  warren shell               pick an account and role, then open a shell with its credentials
+  warren shell [favorite]    pick an account and role — or name a favorite — then open a shell
+  warren exec <fav> -- <cmd> run <cmd> as a favorited account+role, no picker
   warren ssm-shell <target>  pick an account and role, then open an SSM shell on <target>
   warren login [identity]    sign in without the TUI: device-code by default — URL + code
                              shown, URL sent to your local clipboard (OSC 52)
   warren login --browser     opt in to opening a browser (uses your saved browser/profile,
                              or asks when nothing is saved)
   warren login --status      report token liveness without signing in; exit 0 live, 1 not
+  warren creds ...           credential_process provider (see: profiles that never go stale)
   warren setup               add an [sso-session] block to ~/.aws/config
   warren version             print the version and exit
   warren help                print this message and exit
@@ -157,6 +159,11 @@ func parseArgs() invocation {
 		fmt.Print(pathhint.Hint())
 		os.Exit(0)
 
+	case "creds":
+		// The credential_process provider: called by SDKs, not people, so it bypasses all
+		// TUI plumbing and its stdout stays pure JSON.
+		os.Exit(runCreds(context.Background(), os.Args[2:]))
+
 	case "login":
 		// Handled here rather than through the TUI plumbing below: login needs no picker,
 		// no alt screen, and no instance list — that absence is its entire reason to exist.
@@ -166,6 +173,14 @@ func parseArgs() invocation {
 		return invocation{mode: modeTUI, startInSetup: true}
 
 	case "shell":
+		// `warren shell <favorite>` skips the picker for a bookmarked account+role.
+		if len(os.Args) > 2 {
+			if fav, ok := favoriteByNickname(os.Args[2]); ok {
+				os.Exit(runFavorite(context.Background(), fav, invocation{mode: modeShell, argv: awsexec.ShellArgv()}))
+			}
+			fmt.Fprintf(os.Stderr, "%q is not a favorite — star one on the action screen, or run plain `warren shell`\n", os.Args[2])
+			os.Exit(2)
+		}
 		return invocation{mode: modeShell, argv: awsexec.ShellArgv()}
 
 	case "ssm-shell":
@@ -178,6 +193,23 @@ func parseArgs() invocation {
 
 	case "exec":
 		argv := os.Args[2:]
+		// A leading exact favorite nickname routes around the picker: `warren exec
+		// corp-admin -- aws s3 ls`. Checked before the `--` strip so the nickname can never
+		// be confused with the command; anything that is not a saved nickname is the
+		// command it always was.
+		if len(argv) > 0 {
+			if f, ok := favoriteByNickname(argv[0]); ok {
+				rest := argv[1:]
+				if len(rest) > 0 && rest[0] == "--" {
+					rest = rest[1:]
+				}
+				if len(rest) == 0 {
+					fmt.Fprintf(os.Stderr, "exec needs a command to run, e.g. warren exec %s -- aws s3 ls\n", f.Nickname)
+					os.Exit(2)
+				}
+				os.Exit(runFavorite(context.Background(), f, invocation{mode: modeExec, argv: rest}))
+			}
+		}
 		// The `--` is conventional and worth accepting, but not worth requiring: it exists to
 		// stop a wrapper eating the wrapped command's flags, and nothing here parses flags
 		// after "exec" anyway.

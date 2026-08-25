@@ -17,6 +17,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/sso"
 	"github.com/aws/aws-sdk-go-v2/service/ssooidc"
+	ssooidctypes "github.com/aws/aws-sdk-go-v2/service/ssooidc/types"
 
 	"github.com/treyperrone/warren/internal/browser"
 	"github.com/treyperrone/warren/internal/homedir"
@@ -261,6 +262,153 @@ func AddSSOSession(s SSOSessionConfig) error {
 	}
 
 	path := ConfigPath()
+	scopes := strings.Join(s.scopes(), ",")
+	block := fmt.Sprintf("\n# added by warren\n[sso-session %s]\nsso_start_url = %s\nsso_region = %s\nsso_registration_scopes = %s\n",
+		s.Name, s.StartURL, s.Region, scopes)
+	return appendConfigBlock(path, block)
+}
+
+// AddCredentialProcessProfile appends a [profile] block whose credentials come from
+// `warren creds`: the SDK-standard credential_process hook, which makes every SDK and the
+// aws CLI call warren on demand and therefore never hold stale credentials. This is the
+// answer to "keep it alive for tools warren did not launch" that needs no daemon and writes
+// no keys to disk — the process IS the refresh.
+//
+// Append-only with a backup, exactly like AddSSOSession and for the same reason: this file
+// belongs to every AWS tool on the machine.
+func AddCredentialProcessProfile(name, sessionName, accountID, role string) error {
+	switch {
+	case name == "":
+		return errors.New("profile name is required")
+	// The name lands inside [profile <name>] and the rest inside a command line, so both
+	// reuse the sso-session allowlist rather than inventing escaping rules for a shared file.
+	case name == "default":
+		// [profile default] is not how default works (the CLI reads a bare [default]
+		// section), and ParseConfig deliberately drops the name — so this would append a
+		// block warren could then neither list nor remove.
+		return errors.New("\"default\" cannot be a warren-managed profile name")
+	case !validSessionName(name):
+		return errors.New("profile name can contain only letters, digits, dots, dashes and underscores")
+	// validSessionName vacuously accepts "" — it validates characters, not presence — so
+	// emptiness is its own check, or a malformed credential_process line reaches the file.
+	case sessionName == "", accountID == "", role == "":
+		return errors.New("session, account and role are all required")
+	case !validSessionName(sessionName), !validSessionName(accountID), !validSessionName(role):
+		return errors.New("session, account and role must not contain spaces or shell metacharacters")
+	}
+
+	sessions, profiles, err := ParseConfig()
+	if err != nil {
+		return err
+	}
+	for _, p := range profiles {
+		if p.Name == name {
+			return fmt.Errorf("a profile named %q already exists in ~/.aws/config", name)
+		}
+	}
+	found := false
+	for _, sess := range sessions {
+		if sess.Name == sessionName {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return fmt.Errorf("no sso-session named %q in ~/.aws/config", sessionName)
+	}
+
+	// "warren" bare, resolved through PATH like any credential_process line a person would
+	// write — an absolute path would break on the next Homebrew upgrade or RC swap.
+	block := fmt.Sprintf("\n# added by warren\n[profile %s]\ncredential_process = warren creds --session %s --account %s --role %s\n",
+		name, sessionName, accountID, role)
+	return appendConfigBlock(ConfigPath(), block)
+}
+
+// ProfileBlockText returns the exact lines a removal would delete — the [profile name]
+// header through the last line before the next section — so a confirm screen can show the
+// user precisely what is about to leave the file, not a summary of it.
+func ProfileBlockText(name string) (string, error) {
+	data, err := os.ReadFile(ConfigPath())
+	if err != nil {
+		return "", fmt.Errorf("reading ~/.aws/config: %w", err)
+	}
+	kept, removed := splitProfileBlocks(string(data), name)
+	if removed == "" {
+		return "", fmt.Errorf("no [profile %s] block in ~/.aws/config", name)
+	}
+	_ = kept
+	return removed, nil
+}
+
+// RemoveProfileBlock deletes every [profile name] section from ~/.aws/config.
+//
+// This is the one deliberate exception to "warren only ever appends to this file", and it
+// keeps the spirit of the rule by being textual surgery, not a parse-and-rewrite: every
+// byte outside the removed section — comments, ordering, keys warren has never heard of —
+// survives verbatim, because ParseConfig is lossy and round-tripping through it is exactly
+// the failure mode the append-only rule exists to prevent. A .warren.bak copy is taken
+// first, same as every other touch of this file.
+func RemoveProfileBlock(name string) error {
+	path := ConfigPath()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("reading ~/.aws/config: %w", err)
+	}
+	kept, removed := splitProfileBlocks(string(data), name)
+	if removed == "" {
+		return fmt.Errorf("no [profile %s] block in ~/.aws/config", name)
+	}
+
+	if err := os.WriteFile(path+".warren.bak", data, 0o600); err != nil {
+		return fmt.Errorf("backing up ~/.aws/config: %w", err)
+	}
+	if err := os.WriteFile(path, []byte(kept), 0o600); err != nil {
+		return fmt.Errorf("writing ~/.aws/config: %w", err)
+	}
+	return nil
+}
+
+// splitProfileBlocks partitions the file into what stays and what goes for one profile
+// name. A section runs from its header to the line before the next [header]. A "# added by
+// warren" comment sitting directly above the header goes with its block — it describes
+// nothing else — while every other comment stays, because ownership of those is unknowable.
+func splitProfileBlocks(text, name string) (kept, removed string) {
+	lines := strings.SplitAfter(text, "\n")
+	header := "[profile " + name + "]"
+	var keep, gone []string
+	removing := false
+	const warrenComment = "# added by warren"
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "[") && strings.HasSuffix(trimmed, "]") {
+			// A warren comment sitting at a section boundary belongs to the section BELOW
+			// it, on both sides of the cut: pulled out of keep when its block is about to
+			// be removed, and handed back from gone when the removed section ends and the
+			// next (kept) block's comment would otherwise vanish with it.
+			if !removing && trimmed == header &&
+				len(keep) > 0 && strings.TrimSpace(keep[len(keep)-1]) == warrenComment {
+				gone = append(gone, keep[len(keep)-1])
+				keep = keep[:len(keep)-1]
+			}
+			if removing && trimmed != header &&
+				len(gone) > 0 && strings.TrimSpace(gone[len(gone)-1]) == warrenComment {
+				keep = append(keep, gone[len(gone)-1])
+				gone = gone[:len(gone)-1]
+			}
+			removing = trimmed == header
+		}
+		if removing {
+			gone = append(gone, line)
+			continue
+		}
+		keep = append(keep, line)
+	}
+	return strings.Join(keep, ""), strings.Join(gone, "")
+}
+
+// appendConfigBlock backs up whatever exists, then strictly appends. Together with
+// RemoveProfileBlock's surgical delete, these are the only two writers of ~/.aws/config.
+func appendConfigBlock(path, block string) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return fmt.Errorf("creating ~/.aws: %w", err)
 	}
@@ -278,10 +426,6 @@ func AddSSOSession(s SSOSessionConfig) error {
 	} else if !errors.Is(err, fs.ErrNotExist) {
 		return fmt.Errorf("reading ~/.aws/config: %w", err)
 	}
-
-	scopes := strings.Join(s.scopes(), ",")
-	block := fmt.Sprintf("\n# added by warren\n[sso-session %s]\nsso_start_url = %s\nsso_region = %s\nsso_registration_scopes = %s\n",
-		s.Name, s.StartURL, s.Region, scopes)
 
 	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 	if err != nil {
@@ -393,6 +537,13 @@ type PendingLogin struct {
 	// is retyped on another device and the code entered by hand.
 	VerificationURL string
 	UserCode        string
+	// TokenExpiresAt and AutoRenews are set by Wait once the token is granted: when the
+	// access token dies, and whether a refresh token means warren renews it silently. The
+	// Identity Center SESSION ceiling — the org-set duration after which even refresh stops
+	// working — is deliberately not a field, because AWS discloses it through no grant
+	// response and no non-admin API; it is only ever discovered by a refresh failing.
+	TokenExpiresAt time.Time
+	AutoRenews     bool
 	// RegistrationWarning is set when the scoped client registration failed and the bare
 	// retry succeeded: sign-in works but silent renewal will not. It is a field, not a
 	// stderr print, because StartLogin's primary caller runs behind the TUI's alt screen,
@@ -497,6 +648,12 @@ func (p *PendingLogin) Wait(ctx context.Context) (string, error) {
 		}
 		// Persist the refresh material, not just the access token — that is what lets the
 		// next run renew silently instead of reopening the browser.
+		p.TokenExpiresAt = time.Now().Add(time.Duration(tok.ExpiresIn) * time.Second)
+		p.AutoRenews = aws.ToString(tok.RefreshToken) != ""
+		// Observation, not function: the sign-in moment is half of learning the org's
+		// session ceiling (the end is the other half, recorded when renewal stops working),
+		// so a failure to write it costs a nicety, never the login.
+		_ = browser.RecordSignIn(p.sess.StartURL, time.Now())
 		writeRecord(&tokenRecord{
 			StartURL:              p.sess.StartURL,
 			Region:                p.sess.Region,
@@ -599,6 +756,23 @@ func hashString(s string) uint32 {
 	return h
 }
 
+// TokenInfo reports the cached access token's expiry for a start URL and whether a silent
+// renewal will follow it, without any network call. ok is false when nothing usable is
+// cached. This is the most anyone can display about session lifetime: the org's Identity
+// Center session ceiling is not disclosed by any non-admin API, so "renews silently until
+// the org session ends" is as precise as AWS allows.
+func TokenInfo(startURL string) (expiresAt time.Time, renews, ok bool) {
+	rec := cachedRecord(startURL)
+	if rec == nil || rec.AccessToken == "" {
+		return time.Time{}, false, false
+	}
+	t, err := time.Parse(time.RFC3339, rec.ExpiresAt)
+	if err != nil {
+		return time.Time{}, false, false
+	}
+	return t, rec.canRefresh(), true
+}
+
 // ErrLoginRequired means the session cannot be renewed without the user completing the
 // device-auth flow. It exists so a caller that must not block — anything running in the
 // background — can tell "needs a browser" apart from a real failure and say so instead.
@@ -622,11 +796,17 @@ func SilentToken(ctx context.Context, sess SSOSessionConfig) (string, error) {
 	}
 
 	if rec.canRefresh() {
-		if token, err := refresh(ctx, sess, rec); err == nil {
+		token, err := refresh(ctx, sess, rec)
+		if err == nil {
 			return token, nil
 		}
-		// Refresh failed — revoked, rotated out from under us, or registration dead.
-		// Nothing left to salvage silently.
+		// Refresh failed. Only an AUTH rejection is the org's session ceiling — the one
+		// observable signal worth learning a session duration from. A network blip, DNS
+		// failure, or throttle also fails a refresh, and learning "your org session lasts
+		// 40 minutes" from a dropped wifi packet poisons every later hard-expires estimate.
+		if isSessionEnded(err) {
+			_ = browser.RecordSessionEnd(sess.StartURL, time.Now())
+		}
 	}
 
 	return "", ErrLoginRequired
@@ -644,6 +824,21 @@ func LiveToken(ctx context.Context, sess SSOSessionConfig) (string, error) {
 		return token, nil
 	}
 	return Login(ctx, sess)
+}
+
+// isSessionEnded distinguishes "the Identity Center session rejected this refresh token"
+// from every other way a refresh can fail. The OIDC service answers the former with
+// InvalidGrantException (dead/revoked token) or ExpiredTokenException; matched as typed
+// errors first, with the code-string fallback the rest of this file already uses for the
+// polling loop's AuthorizationPending checks.
+func isSessionEnded(err error) bool {
+	var invalidGrant *ssooidctypes.InvalidGrantException
+	var expired *ssooidctypes.ExpiredTokenException
+	if errors.As(err, &invalidGrant) || errors.As(err, &expired) {
+		return true
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "InvalidGrantException") || strings.Contains(msg, "ExpiredTokenException")
 }
 
 // validate makes the cheapest authenticated call available to prove a token still works.

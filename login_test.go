@@ -2,11 +2,13 @@ package main
 
 import (
 	"bufio"
+	"encoding/json"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	awsint "github.com/treyperrone/warren/internal/aws"
 	"github.com/treyperrone/warren/internal/browser"
@@ -343,5 +345,85 @@ func TestParseLoginArgsBrowserFlag(t *testing.T) {
 	}
 	if _, err := parseLoginArgs([]string{"--code", "--browser"}); err == nil {
 		t.Error("contradictory flags were accepted")
+	}
+}
+
+func TestParseCredsArgs(t *testing.T) {
+	inv, err := parseCredsArgs([]string{"--session", "corp", "--account", "123456789012", "--role", "Admin"})
+	if err != nil || inv != (credsInvocation{session: "corp", account: "123456789012", role: "Admin"}) {
+		t.Fatalf("got %+v, %v", inv, err)
+	}
+	for name, args := range map[string][]string{
+		"missing role":     {"--session", "corp", "--account", "1"},
+		"unknown flag":     {"--session", "corp", "--acount", "1", "--role", "r"},
+		"missing value":    {"--session"},
+		"repeated flag":    {"--session", "a", "--session", "b", "--account", "1", "--role", "r"},
+		"stray positional": {"corp"},
+	} {
+		if _, err := parseCredsArgs(args); err == nil {
+			t.Errorf("%s: accepted %v", name, args)
+		}
+	}
+}
+
+// The JSON contract is what botocore parses; a wrong field name fails every aws command
+// using the profile, with an error that blames the profile rather than warren.
+func TestEmitCredsJSON(t *testing.T) {
+	// emitCreds prints to stdout; capture via os.Pipe.
+	r, w, _ := os.Pipe()
+	old := os.Stdout
+	os.Stdout = w
+	code := emitCreds(&awsint.Session{
+		AccessKeyID: "AKIA123", SecretAccessKey: "secret", SessionToken: "tok",
+		Expires: time.Date(2026, 8, 22, 15, 0, 0, 0, time.UTC),
+	})
+	w.Close()
+	os.Stdout = old
+	out, _ := io.ReadAll(r)
+
+	if code != 0 {
+		t.Fatalf("exit %d", code)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(out, &doc); err != nil {
+		t.Fatalf("not JSON: %v\n%s", err, out)
+	}
+	for k, want := range map[string]any{
+		"Version": float64(1), "AccessKeyId": "AKIA123", "SecretAccessKey": "secret",
+		"SessionToken": "tok", "Expiration": "2026-08-22T15:00:00Z",
+	} {
+		if doc[k] != want {
+			t.Errorf("%s = %v, want %v", k, doc[k], want)
+		}
+	}
+}
+
+// The lifetime line at grant time: hard expiry when no refresh token (the token IS the
+// ceiling), the learned org ceiling when one exists, and honest ignorance before the first
+// learning cycle.
+func TestLifetimeLine(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("USERPROFILE", os.Getenv("HOME"))
+	now := time.Now()
+	const url = "https://corp.awsapps.com/start"
+
+	p := awsint.PendingLogin{TokenExpiresAt: now.Add(8 * time.Hour), AutoRenews: false}
+	if got := lifetimeLine(p, url, now); !strings.Contains(got, "hard-expires") || !strings.Contains(got, "no refresh token") {
+		t.Errorf("no-refresh line = %q", got)
+	}
+
+	p.AutoRenews = true
+	if got := lifetimeLine(p, url, now); !strings.Contains(got, "will learn it") {
+		t.Errorf("unlearned line = %q", got)
+	}
+
+	if err := browser.RecordSignIn(url, now.Add(-time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err := browser.RecordSessionEnd(url, now.Add(-time.Hour).Add(4*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if got := lifetimeLine(p, url, now); !strings.Contains(got, "hard-expires ~") || !strings.Contains(got, "learned") {
+		t.Errorf("learned line = %q", got)
 	}
 }

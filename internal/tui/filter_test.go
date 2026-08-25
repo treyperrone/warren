@@ -86,7 +86,7 @@ func TestSearchDoesNotLeakIntoTheNextScreen(t *testing.T) {
 	if m.list.IsFiltered() {
 		t.Errorf("the search survived into the action screen (term %q)", m.list.FilterValue())
 	}
-	if got, want := len(m.list.VisibleItems()), 3; got != want {
+	if got, want := len(m.list.VisibleItems()), 4; got != want {
 		t.Errorf("action screen shows %d rows, want all %d", got, want)
 	}
 }

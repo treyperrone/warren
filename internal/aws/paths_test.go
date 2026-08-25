@@ -1,6 +1,8 @@
 package aws
 
 import (
+	"errors"
+	ssooidctypes "github.com/aws/aws-sdk-go-v2/service/ssooidc/types"
 	"os"
 	"path/filepath"
 	"strings"
@@ -167,5 +169,151 @@ func TestAddSSOSessionReportsAnUnwritableConfig(t *testing.T) {
 	})
 	if err == nil {
 		t.Error("reported success writing under a regular file")
+	}
+}
+
+// The credential_process profile block: strictly appended (existing content byte-identical),
+// collisions and unknown sessions rejected, and every value restricted to the allowlist —
+// the line lands in a file every AWS tool parses AND in a command line the SDK executes.
+func TestAddCredentialProcessProfile(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("AWS_CONFIG_FILE", "")
+	if err := os.MkdirAll(filepath.Join(home, ".aws"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	existing := "# hand-written comment\n[sso-session corp]\nsso_start_url = https://corp.awsapps.com/start\nsso_region = us-east-1\n"
+	cfg := filepath.Join(home, ".aws", "config")
+	if err := os.WriteFile(cfg, []byte(existing), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := AddCredentialProcessProfile("corp-lab-admin", "corp", "123456789012", "AdminRole"); err != nil {
+		t.Fatal(err)
+	}
+	data, _ := os.ReadFile(cfg)
+	if !strings.HasPrefix(string(data), existing) {
+		t.Error("append modified existing content")
+	}
+	want := "credential_process = warren creds --session corp --account 123456789012 --role AdminRole"
+	if !strings.Contains(string(data), "[profile corp-lab-admin]") || !strings.Contains(string(data), want) {
+		t.Errorf("appended block wrong:\n%s", data)
+	}
+	// The parser must see what the writer wrote.
+	_, profiles, err := ParseConfig()
+	if err != nil || len(profiles) != 1 || profiles[0].Name != "corp-lab-admin" {
+		t.Fatalf("round trip: %v, %v", profiles, err)
+	}
+
+	if err := AddCredentialProcessProfile("corp-lab-admin", "corp", "1", "r"); err == nil {
+		t.Error("duplicate profile accepted")
+	}
+	if err := AddCredentialProcessProfile("other", "nosuch", "1", "r"); err == nil {
+		t.Error("unknown sso-session accepted")
+	}
+	if err := AddCredentialProcessProfile("bad name", "corp", "1", "r"); err == nil {
+		t.Error("space in profile name accepted")
+	}
+	if err := AddCredentialProcessProfile("ok", "corp", "1", "Role Name; rm -rf /"); err == nil {
+		t.Error("shell metacharacters in role accepted")
+	}
+}
+
+// S3Entry names are the last path segment — what a directory-style listing shows — with
+// prefixes keeping their trailing slash so they read as folders.
+func TestS3EntryName(t *testing.T) {
+	cases := []struct {
+		e    S3Entry
+		want string
+	}{
+		{S3Entry{Key: "tools/linux/", IsPrefix: true}, "linux/"},
+		{S3Entry{Key: "tools/mimi.zip"}, "mimi.zip"},
+		{S3Entry{Key: "top.txt"}, "top.txt"},
+		{S3Entry{Key: "deep/", IsPrefix: true}, "deep/"},
+	}
+	for _, c := range cases {
+		if got := c.e.Name(); got != c.want {
+			t.Errorf("Name(%q) = %q, want %q", c.e.Key, got, c.want)
+		}
+	}
+}
+
+// A warren comment at the boundary between a REMOVED block and a KEPT one belongs to the
+// kept block below it and must survive the removal.
+func TestRemoveProfileKeepsNextBlocksComment(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("AWS_CONFIG_FILE", "")
+	if err := os.MkdirAll(filepath.Join(home, ".aws"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	content := "[profile doomed]\nregion = us-east-1\n\n# added by warren\n[profile survivor]\nregion = us-west-2\n"
+	if err := os.WriteFile(filepath.Join(home, ".aws", "config"), []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := RemoveProfileBlock("doomed"); err != nil {
+		t.Fatal(err)
+	}
+	after, _ := os.ReadFile(filepath.Join(home, ".aws", "config"))
+	if !strings.Contains(string(after), "# added by warren\n[profile survivor]") {
+		t.Errorf("the surviving block lost its ownership comment:\n%s", after)
+	}
+	if strings.Contains(string(after), "doomed") {
+		t.Errorf("doomed block survived:\n%s", after)
+	}
+}
+
+// Empty values and "default" must never reach a credential_process line or a header.
+func TestAddCredentialProcessProfileRejectsEmptyAndDefault(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("AWS_CONFIG_FILE", "")
+	for name, args := range map[string][4]string{
+		"empty session": {"p", "", "1", "r"},
+		"empty account": {"p", "s", "", "r"},
+		"empty role":    {"p", "s", "1", ""},
+		"default name":  {"default", "s", "1", "r"},
+	} {
+		if err := AddCredentialProcessProfile(args[0], args[1], args[2], args[3]); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+}
+
+// Only an auth rejection means the org session ended; a network blip must not teach warren
+// a bogus session duration.
+func TestIsSessionEnded(t *testing.T) {
+	if isSessionEnded(errors.New("dial tcp: lookup oidc.us-east-1.amazonaws.com: no such host")) {
+		t.Error("DNS failure counted as a session ending")
+	}
+	if isSessionEnded(errors.New("operation error SSO OIDC: CreateToken, https response error StatusCode: 429, ThrottlingException")) {
+		t.Error("throttling counted as a session ending")
+	}
+	if !isSessionEnded(errors.New("operation error SSO OIDC: CreateToken, InvalidGrantException: invalid_grant")) {
+		t.Error("InvalidGrantException not recognized")
+	}
+	if !isSessionEnded(&ssooidctypes.InvalidGrantException{}) {
+		t.Error("typed InvalidGrantException not recognized")
+	}
+}
+
+// Keys are attacker-adjacent: whatever their last segment holds, the local name must stay
+// inside the download directory on every OS.
+func TestSafeLocalName(t *testing.T) {
+	cases := map[string]string{
+		"docs/report.pdf":             "report.pdf",
+		`docs/..\..\Startup\evil.bat`: ".._.._Startup_evil.bat",
+		"a/..":                        "object",
+		"weird/":                      "weird",
+		"":                            "object",
+		`back\slash.txt`:              "back_slash.txt",
+	}
+	for key, want := range cases {
+		if got := safeLocalName(key); got != want {
+			t.Errorf("safeLocalName(%q) = %q, want %q", key, got, want)
+		}
 	}
 }

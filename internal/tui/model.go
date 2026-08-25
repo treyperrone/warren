@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/charmbracelet/bubbles/list"
@@ -52,6 +53,13 @@ const (
 	screenLoginBrowser   // the same choice, asked inline because a sign-in is needed NOW
 	screenLoginProfile   // profile step of the inline ask
 	screenLoginRemember  // "just this once" vs "always" after an inline pick
+	screenS3Buckets      // S3 browser: pick a bucket
+	screenS3Objects      // S3 browser: one delimiter level of a bucket
+	screenS3Upload       // S3 browser: path box that accepts a dragged file
+	screenFavorites      // all favorites, when too many to inline on the method screen
+	screenFavoriteRemove // pick favorites to delete
+	screenProfileRemove  // pick an AWS profile to remove from ~/.aws/config
+	screenProfileConfirm // the exact doomed lines + keep/remove
 )
 
 // ---- list plumbing ---------------------------------------------------------
@@ -190,6 +198,38 @@ type Model struct {
 	// session may be synthesized (legacy inline SSO) and point into no slice.
 	pendingProfile   string
 	profileLoginSess awsint.SSOSessionConfig
+	// favorites is the method screen's snapshot of the saved bookmarks, indexed by the
+	// fav:N row values; pendingFavRole is the role a favorite promised, fetched the moment
+	// the token lands — favorites skip the account and role screens, that is their point.
+	favorites      []browser.Favorite
+	pendingFavRole string
+	// pendingFavConn is the connection half of a selected favorite, carried across the
+	// creds fetch: once credentials land, the flow resolves the instance by Name tag and
+	// starts the connection instead of stopping at the action screen.
+	pendingFavConn *browser.Favorite
+	// connFavCandidate is the connection that could be starred right now — built when a
+	// session/tunnel starts, offered as a row on the tunnel manager.
+	connFavCandidate *browser.Favorite
+
+	// S3 browser state: the bucket roster, the level being shown (bucket/region/prefix and
+	// its entries), and the upload screen's path box with its inline validation error.
+	s3Buckets   []string
+	s3Bucket    string
+	s3Region    string
+	s3Prefix    string
+	s3Entries   []awsint.S3Entry
+	s3Input     textinput.Model
+	s3UploadErr string
+
+	// profile removal in flight: which block, and its exact text for the confirm screen.
+	profileRemoveName  string
+	profileRemoveBlock string
+
+	// liveSess is the thread-safe mirror of awsSess for transfer goroutines: stored on the
+	// event loop, loaded from S3 credential providers mid-transfer, so a download that
+	// crosses the hour mark picks up the background renewal instead of dying on the keys
+	// it started with.
+	liveSess atomic.Value
 	// loginCancel aborts the Wait poll. Quitting is the only key the loading guard lets
 	// through while a login is pending, and without this the polling goroutine outlives the
 	// screen — m.ctx is main's context.Background and nothing ever cancels it.
@@ -372,6 +412,11 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.screen == screenBuildParams {
 			return m.updateBuildParams(msg)
 		}
+		// And the S3 upload box — where a dragged file arrives as pasted text, every byte
+		// of which belongs to the input.
+		if m.screen == screenS3Upload {
+			return m.updateS3Upload(msg)
+		}
 		// A notice has been read by the time the next key arrives; leaving it up would make it
 		// look like it applied to whatever happens next. Cleared without consuming the key,
 		// unlike an error, because it is a confirmation rather than something to acknowledge.
@@ -418,6 +463,18 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			var cmd tea.Cmd
 			m.list, cmd = m.list.Update(msg)
 			return m, cmd
+		}
+		// x on a highlighted favorite row deletes it, wherever favorites render — the row's
+		// own description advertises the key, because a keybind nobody can see is a feature
+		// nobody has. Guarded on the filter not having focus (typed search text must never
+		// delete things), which the SettingFilter branch above already ensures.
+		if (m.screen == screenMethod || m.screen == screenFavorites) && msg.String() == "x" {
+			if sel, ok := m.list.SelectedItem().(item); ok {
+				if idx, isFav := strings.CutPrefix(sel.value, "fav:"); isFav {
+					m.removeFavoriteAt(idx)
+					return m, nil
+				}
+			}
 		}
 		// screen-specific key handling
 		switch m.screen {
@@ -504,9 +561,18 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.pendingProfile = ""
 				m.selSession = nil
 			}
+			m.pendingFavRole = ""
+			m.pendingFavConn = nil
 			return m, nil
 		}
 		m.token = msg.token
+		// A favorite already names its account and role: fetch the credentials directly,
+		// skipping the account and role screens — that skip is what a favorite is.
+		if m.pendingFavRole != "" {
+			role := m.pendingFavRole
+			m.pendingFavRole = ""
+			return m, m.selectRole(role)
+		}
 		// A sign-in that ran on behalf of a profile goes back for the profile's
 		// credentials, not to the account list — accounts belong to the session flow, and
 		// the profile already names its account and role. selSession reverts to nil so
@@ -563,6 +629,11 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.credsOnly {
 			return m, tea.Quit
 		}
+		// A connection favorite is not done at credentials: go find its instance.
+		if m.pendingFavConn != nil {
+			m.loading = true
+			return m, m.fetchInstances()
+		}
 		m.loading = false
 		m.buildActionList()
 		m.screen = screenAction
@@ -593,14 +664,60 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case msgInstances:
 		m.loading = false
 		if msg.err != nil {
+			m.pendingFavConn = nil
 			m.err = msg.err
 			return m, nil
 		}
 		m.instances = msg.instances
+		// A favorite names its instance by Name TAG and resolves it here, against what is
+		// actually running — ids rot in a range that repaves, names are policy. Exactly one
+		// running match connects; zero or several drop to the list with the reason on
+		// screen, because guessing between two hosts called "kali" helps nobody.
+		if f := m.pendingFavConn; f != nil {
+			m.pendingFavConn = nil
+			var matches []awsint.Instance
+			for _, inst := range m.instances {
+				if inst.Name == f.InstanceName {
+					matches = append(matches, inst)
+				}
+			}
+			if len(matches) == 1 {
+				m.selectInstance(matches[0].ID)
+				// The one auto-connect a favorite must NOT make: RDP into a box now
+				// reporting as Linux — likely a repave changed the OS under the name.
+				// Pausing on the connection screen turns it into enter-to-continue (the
+				// RDP row carries the warning) or esc-to-cancel, instead of a tunnel to a
+				// port nothing listens on.
+				if f.ConnType == "rdp" && matches[0].Platform == "linux" &&
+					!browser.RDPLinuxAcked(m.ackAccountID(), matches[0].Name) {
+					m.notice = f.InstanceName + " reports as a Linux box — RDP favorite paused; Enter connects anyway, Esc backs out"
+					// "Enter connects anyway" is a promise about the CURSOR: park it on
+					// the RDP row, or Enter acts on whatever index the previous screen
+					// left behind.
+					m.list.Select(2) // shell, ssh, RDP
+					return m, nil    // selectInstance already built the conn-type screen
+				}
+				switch f.ConnType {
+				case "shell":
+					return m, m.startShell()
+				case "ssh":
+					return m, m.startSSH(f.SSHUser)
+				case "rdp":
+					m.connType = tunnel.KindRDP
+					return m, m.startRDP()
+				}
+			}
+			if len(matches) == 0 {
+				m.notice = "favorite target " + f.InstanceName + " is not running here — pick manually"
+			} else {
+				m.notice = fmt.Sprintf("%d running instances are named %s — pick manually", len(matches), f.InstanceName)
+			}
+		}
 		m.buildInstanceList()
 		m.screen = screenInstance
 
 	case msgShellWindowed:
+		m.noteConnFavCandidate(msg.name, "shell", "")
 		// The terminal was never handed over, so there is nothing to restore — just say where the
 		// session went and stay put. Landing back on the instance list is what makes opening a
 		// second one a single keypress, which is the whole reason for the window.
@@ -637,12 +754,63 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.manager.Add(msg.t)
+		m.noteConnFavCandidate(msg.t.InstanceName, strings.ToLower(string(msg.t.Kind)), msg.t.SSHUser)
+		if msg.t.Kind == tunnel.KindRDP {
+			// The tunnel connecting itself is the point of an RDP favorite — and of RDP
+			// tunnels generally: "now paste localhost:13389 somewhere" was the residue of
+			// not finishing the job. The note reports which client opened, or falls back
+			// to the manual instruction when none is installed.
+			m.notice = tunnel.OpenRDPClient(msg.t.LocalPort, msg.t.SSHUser)
+		}
 		m.buildMainList()
 		m.screen = screenMain
+
+	case msgS3Buckets:
+		m.loading = false
+		if msg.err != nil {
+			m.err = msg.err
+			return m, nil
+		}
+		m.s3Buckets = msg.buckets
+		m.buildS3BucketList()
+		m.screen = screenS3Buckets
+
+	case msgS3Objects:
+		m.loading = false
+		if msg.err != nil {
+			m.err = msg.err
+			return m, nil
+		}
+		m.s3Bucket, m.s3Region, m.s3Prefix = msg.bucket, msg.region, msg.prefix
+		m.s3Entries = msg.entries
+		m.buildS3ObjectList()
+		m.screen = screenS3Objects
+
+	case msgS3Done:
+		m.loading = false
+		if msg.err != nil {
+			m.err = msg.err
+			return m, nil
+		}
+		m.notice = msg.note
+		if msg.refresh {
+			// An upload changed the level on screen; relist so the new object is visible
+			// proof rather than a claim in a notice.
+			m.loading = true
+			return m, m.fetchS3Level(m.s3Bucket, m.s3Region, m.s3Prefix)
+		}
+		return m, nil
 
 	case msgError:
 		m.loading = false
 		m.err = msg.err
+		// Any error ends whatever detour was in flight. A stale pendingFavConn surviving
+		// here hijacked the NEXT credential flow into an automatic connection — in whatever
+		// account the user had moved on to — the moment its instance name happened to
+		// match. Pending state must never outlive the flow that created it.
+		m.pendingProfile = ""
+		m.pendingFavRole = ""
+		m.pendingFavConn = nil
 	}
 
 	// Non-key messages on the setup screen — cursor blink, in particular — belong to the
@@ -659,6 +827,11 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		} else if len(m.builder.inputs) > 0 {
 			m.builder.inputs[m.builder.focus], cmd = m.builder.inputs[m.builder.focus].Update(msg)
 		}
+		return m, cmd
+	}
+	if m.screen == screenS3Upload {
+		var cmd tea.Cmd
+		m.s3Input, cmd = m.s3Input.Update(msg)
 		return m, cmd
 	}
 
@@ -689,8 +862,9 @@ func (m *Model) goBack() tea.Cmd {
 		m.screen = screenAccount
 	case screenAction:
 		// Back to wherever the credentials came from. A profile is picked on the method
-		// screen and has no account or role step, and a single-role account skips the role
-		// screen (see msgRoles), so neither is a safe unconditional target.
+		// screen and has no account or role step, a single-role account skips the role
+		// screen (see msgRoles), and a favorite skips both — so nothing here is a safe
+		// unconditional target.
 		switch {
 		case m.selSession == nil:
 			m.screen = screenMethod
@@ -698,6 +872,12 @@ func (m *Model) goBack() tea.Cmd {
 		case len(m.roles) > 1:
 			m.buildRoleList()
 			m.screen = screenRole
+		case len(m.accounts) == 0:
+			// No account list was ever fetched — the favorite flow jumps straight from the
+			// method screen to credentials — so home is the method screen, and an empty
+			// account screen would be a wall.
+			m.screen = screenMethod
+			m.buildMethodList()
 		default:
 			m.buildAccountList()
 			m.screen = screenAccount
@@ -732,6 +912,8 @@ func (m *Model) goBack() tea.Cmd {
 			m.pendingProfile = ""
 			m.selSession = nil
 		}
+		m.pendingFavRole = ""
+		m.pendingFavConn = nil
 		m.screen = screenMethod
 		m.buildMethodList()
 	case screenLoginProfile:
@@ -740,6 +922,32 @@ func (m *Model) goBack() tea.Cmd {
 	case screenLoginRemember:
 		m.buildLoginBrowserList()
 		m.screen = screenLoginBrowser
+	case screenS3Buckets:
+		m.buildActionList()
+		m.screen = screenAction
+	case screenS3Objects:
+		// Esc walks up one delimiter level until the bucket root, then out to the buckets.
+		// The target is only PASSED to the fetch — m.s3Prefix commits in the msgS3Objects
+		// success handler, so a failed listing leaves the screen and the state agreeing
+		// (an upload after a failed ascent used to target a level nobody was looking at).
+		if m.s3Prefix != "" {
+			m.loading = true
+			return m.fetchS3Level(m.s3Bucket, m.s3Region, parentPrefix(m.s3Prefix))
+		}
+		m.buildS3BucketList()
+		m.screen = screenS3Buckets
+	case screenS3Upload:
+		m.buildS3ObjectList()
+		m.screen = screenS3Objects
+	case screenFavorites, screenProfileRemove:
+		m.buildMethodList()
+		m.screen = screenMethod
+	case screenFavoriteRemove:
+		m.buildFavoritesList()
+		m.screen = screenFavorites
+	case screenProfileConfirm:
+		m.buildProfileRemoveList()
+		m.screen = screenProfileRemove
 	case screenBuildService:
 		m.buildActionList()
 		m.screen = screenAction
@@ -797,6 +1005,26 @@ func (m *Model) handleSelect() tea.Cmd {
 		return m.selectLoginProfile(selected.value)
 	case screenLoginRemember:
 		return m.selectLoginRemember(selected.value)
+	case screenS3Buckets:
+		return m.selectS3Bucket(selected.value)
+	case screenS3Objects:
+		return m.selectS3Entry(selected.value)
+	case screenFavorites:
+		if selected.value == "favrm" {
+			m.buildFavoriteRemoveList()
+			m.screen = screenFavoriteRemove
+			return nil
+		}
+		if idx, ok := strings.CutPrefix(selected.value, "fav:"); ok {
+			return m.selectFavorite(idx)
+		}
+		return nil
+	case screenFavoriteRemove:
+		return m.selectFavoriteRemove(selected.value)
+	case screenProfileRemove:
+		return m.selectProfileRemove(selected.value)
+	case screenProfileConfirm:
+		return m.selectProfileConfirm(selected.value)
 	}
 	return nil
 }
@@ -812,6 +1040,19 @@ func (m *Model) selectMethod(val string) tea.Cmd {
 	}
 	if val == methodBrowserPref {
 		return m.startBrowserPref()
+	}
+	if idx, ok := strings.CutPrefix(val, "fav:"); ok {
+		return m.selectFavorite(idx)
+	}
+	if val == methodFavList {
+		m.buildFavoritesList()
+		m.screen = screenFavorites
+		return nil
+	}
+	if val == methodRemoveProfil {
+		m.buildProfileRemoveList()
+		m.screen = screenProfileRemove
+		return nil
 	}
 	// profile
 	for _, p := range m.profiles {
@@ -839,6 +1080,47 @@ func (m *Model) selectAccount(val string) tea.Cmd {
 			return m.fetchRoles()
 		}
 	}
+	return nil
+}
+
+// selectFavorite is the one-Enter path: resolve the favorite's session, stage its account
+// and role, and go get a token — the ordinary sign-in flow (ask screen, overrides, code on
+// screen) runs unchanged if the token is cold, and msgToken finishes the job by fetching
+// role credentials directly instead of listing accounts.
+func (m *Model) selectFavorite(idx string) tea.Cmd {
+	var f *browser.Favorite
+	for i := range m.favorites {
+		if fmt.Sprintf("%d", i) == idx {
+			f = &m.favorites[i]
+			break
+		}
+	}
+	if f == nil {
+		return nil
+	}
+	for i := range m.ssoSessions {
+		if m.ssoSessions[i].StartURL == f.StartURL {
+			m.selSession = &m.ssoSessions[i]
+			m.selAccount = &awsint.Account{ID: f.AccountID, Name: f.AccountName}
+			// A favorite skips the account and role screens, so any lists a PREVIOUS flow
+			// left behind are lies about this one — goBack from the action screen would
+			// otherwise offer another account's roles under this account's title.
+			m.accounts = nil
+			m.roles = nil
+			m.pendingFavRole = f.Role
+			if f.Connects() && !m.credsOnly {
+				// The connection half rides along; creds-only callers (exec/shell) stop at
+				// credentials no matter what the favorite carries.
+				fc := *f
+				m.pendingFavConn = &fc
+			}
+			m.loading = true
+			return m.fetchToken()
+		}
+	}
+	// The favorite outlived its sso-session: say what to fix rather than guessing at a
+	// start URL nothing in ~/.aws/config vouches for.
+	m.err = fmt.Errorf("favorite %s points at %s, which no [sso-session] in ~/.aws/config uses anymore", f.Nickname, f.StartURL)
 	return nil
 }
 
@@ -925,6 +1207,18 @@ func (m *Model) selectInstance(id string) tea.Cmd {
 	return nil
 }
 
+// ackAccountID is the account half of an RDP acknowledgment key: the resolved account when
+// one is known, "" in profile flows — consistent either way, which is all a key needs.
+func (m *Model) ackAccountID() string {
+	if m.awsSess != nil && m.awsSess.AccountID != "" {
+		return m.awsSess.AccountID
+	}
+	if m.selAccount != nil {
+		return m.selAccount.ID
+	}
+	return ""
+}
+
 func (m *Model) selectConnType(val string) tea.Cmd {
 	switch val {
 	case "shell":
@@ -934,6 +1228,13 @@ func (m *Model) selectConnType(val string) tea.Cmd {
 		m.buildSSHUserList()
 		m.screen = screenSSHUser
 	case "rdp":
+		// Proceeding past the Linux warning IS the "don't show this again" answer: the
+		// user just declared this box runs xrdp, and asking a second time on a box they
+		// use daily would be warren forgetting on purpose. Keyed by account + Name tag,
+		// so the acknowledgment survives repaves alongside the favorite that uses it.
+		if m.selInstance.Platform == "linux" {
+			_ = browser.AckRDPLinux(m.ackAccountID(), m.selInstance.Name)
+		}
 		m.connType = tunnel.KindRDP
 		return m.startRDP()
 	case "quit":
@@ -1248,6 +1549,16 @@ func (m *Model) handleMainSelect(val string) tea.Cmd {
 		return nil
 	}
 	switch selected.value {
+	case "favconn":
+		if c := m.connFavCandidate; c != nil {
+			if err := browser.AddFavorite(*c); err != nil {
+				m.err = err
+				return nil
+			}
+			m.notice = "favorited as " + c.Nickname + " — pinned to the picker; Enter there replays this whole connection"
+			m.buildMainList() // the row disappears once saved
+		}
+		return nil
 	case "new":
 		m.loading = true
 		return m.fetchInstances()
@@ -1331,6 +1642,28 @@ func (m *Model) fetchInstances() tea.Cmd {
 
 func (m *Model) buildMethodList() {
 	var items []list.Item
+	// Favorites first: they exist to be the first thing Enter lands on. Refreshed from disk
+	// on every build so a star toggled on the action screen shows up on the way back. Past
+	// favInlineMax they collapse into a single row — a dozen bookmarks must not bury the
+	// sessions and profiles this screen is named for.
+	m.favorites = browser.Favorites()
+	if len(m.favorites) > favInlineMax {
+		items = append(items, item{
+			title: fmt.Sprintf("★ Favorites (%d)", len(m.favorites)),
+			desc:  "your bookmarked destinations — Enter, Enter connects the first",
+			value: methodFavList,
+		})
+	} else {
+		for i, f := range m.favorites {
+			items = append(items, item{
+				title: "★ " + favTitle(f),
+				desc:  favDesc(f) + " — " + f.Nickname + ", via " + m.sessionLabelFor(f.StartURL) + "  •  x removes",
+				value: fmt.Sprintf("fav:%d", i),
+				// The nickname is invisible on the row but exactly what fingers type into "/".
+				search: f.Nickname,
+			})
+		}
+	}
 	for _, s := range m.ssoSessions {
 		items = append(items, item{
 			title: "SSO: " + s.Name,
@@ -1358,6 +1691,15 @@ func (m *Model) buildMethodList() {
 	// are when it is wrong: sign-in just opened in the wrong place, and re-selecting the
 	// session is the retry.
 	items = append(items, browserPrefRow())
+	// Removal earns a row only when there is something to remove; an always-present
+	// destructive entry on the home screen is dead weight ninety-nine days in a hundred.
+	if len(m.profiles) > 0 {
+		items = append(items, item{
+			title: "✕ Remove an AWS profile",
+			desc:  "delete a [profile] block from ~/.aws/config — preview first, backup taken",
+			value: methodRemoveProfil,
+		})
+	}
 
 	m.list.Title = "Select authentication method"
 	m.list.SetStatusBarItemName("method", "methods")
@@ -1414,10 +1756,18 @@ func (m *Model) buildInstanceList() {
 }
 
 func (m *Model) buildConnTypeList() {
+	// The mismatch note goes on the row itself, where the decision is being made: the
+	// platform in the title proved too subtle to stop an RDP pick on a Linux box. Warned,
+	// not blocked — xrdp exists — and only when the platform is positively known, because
+	// crying wolf on unknowns teaches people to ignore the warning that matters.
+	rdpDesc := "forward port 3389 → localhost:13389+"
+	if m.selInstance.Platform == "linux" && !browser.RDPLinuxAcked(m.ackAccountID(), m.selInstance.Name) {
+		rdpDesc += "  ⚠ this reports as a Linux box — RDP will fail unless it runs xrdp"
+	}
 	items := []list.Item{
 		item{title: "Shell session", desc: "interactive SSM shell (foreground)", value: "shell"},
 		item{title: "SSH tunnel", desc: "forward port 22, connect with your SSH client", value: "ssh"},
-		item{title: "RDP tunnel", desc: "forward port 3389 → localhost:13389+", value: "rdp"},
+		item{title: "RDP tunnel", desc: rdpDesc, value: "rdp"},
 		item{title: "Quit", desc: "", value: "quit"},
 	}
 	// The platform is named here, on the one screen where it changes the decision, but nothing
@@ -1430,6 +1780,7 @@ func (m *Model) buildConnTypeList() {
 	}
 	m.list.Title = title + "  •  Esc=back"
 	m.setListItems(items)
+	m.list.Select(0)
 }
 
 func (m *Model) buildSSHUserList() {
@@ -1444,6 +1795,27 @@ func (m *Model) buildSSHUserList() {
 	m.setListItems(items)
 }
 
+// noteConnFavCandidate remembers the connection that just started as something the tunnel
+// manager can offer to star — only in the sso-session flow, because a favorite replays
+// session → account → role → instance and a profile flow has no such path to replay.
+func (m *Model) noteConnFavCandidate(instanceName, connType, sshUser string) {
+	if m.selSession == nil || m.selAccount == nil || m.awsSess == nil || m.awsSess.RoleName == "" || instanceName == "" {
+		m.connFavCandidate = nil
+		return
+	}
+	m.connFavCandidate = &browser.Favorite{
+		Nickname: profileSlug(m.selAccount.Name, m.awsSess.RoleName) + "-" +
+			profileSlug(instanceName, connType),
+		StartURL:     m.selSession.StartURL,
+		AccountID:    m.selAccount.ID,
+		AccountName:  m.selAccount.Name,
+		Role:         m.awsSess.RoleName,
+		InstanceName: instanceName,
+		ConnType:     connType,
+		SSHUser:      sshUser,
+	}
+}
+
 func (m *Model) buildMainList() {
 	var items []list.Item
 	for _, t := range m.manager.Active() {
@@ -1452,6 +1824,17 @@ func (m *Model) buildMainList() {
 			desc:  t.Hint(),
 			value: fmt.Sprintf("%d", t.PID),
 		})
+	}
+	// Star the connection that just started — offered here because this screen is where a
+	// working connection lands, which is the moment the whole path is proven worth saving.
+	if c := m.connFavCandidate; c != nil {
+		if _, saved := browser.FindFavorite(*c); !saved {
+			items = append(items, item{
+				title: "☆ Favorite this connection",
+				desc:  c.InstanceName + " (" + c.ConnType + ") — one Enter from launch next time, as " + c.Nickname,
+				value: "favconn",
+			})
+		}
 	}
 	items = append(items,
 		item{title: "[n] New connection", desc: "pick account → instance → type", value: "new"},
@@ -1494,6 +1877,12 @@ func (m *Model) View() string {
 	}
 	if m.screen == screenBuildParams {
 		return m.banner() + m.builder.view(m.width)
+	}
+	if m.screen == screenS3Upload {
+		return m.s3UploadView()
+	}
+	if m.screen == screenProfileConfirm {
+		return m.profileConfirmView()
 	}
 	if m.screen == screenAbout {
 		m.resizeAbout()

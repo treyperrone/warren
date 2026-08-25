@@ -5,6 +5,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 )
 
 // isolateHome points every home-derived path at a temp dir. Both variables are set because
@@ -245,5 +246,53 @@ func TestSessionPrefSavePreservesUnknownKeys(t *testing.T) {
 	data, _ := os.ReadFile(PrefPath())
 	if !strings.Contains(string(data), "future_feature") {
 		t.Errorf("scoped save dropped an unknown key:\n%s", data)
+	}
+}
+
+// The learn cycle behind "session hard-expires in ~4h": stamp the sign-in, learn the length
+// when renewal dies, and consume the stamp so the repeated failures of an already-dead
+// session cannot re-learn ever-longer numbers.
+func TestSessionObservationLearnCycle(t *testing.T) {
+	isolateHome(t)
+	const url = "https://corp.awsapps.com/start"
+	start := time.Date(2026, 8, 22, 9, 0, 0, 0, time.UTC)
+
+	if err := RecordSignIn(url, start); err != nil {
+		t.Fatal(err)
+	}
+	// End before (or at) the start is clock skew, not a session: nothing must be learned.
+	if err := RecordSessionEnd(url, start.Add(-time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if obs, _ := LoadObservation(url); obs.LearnedDuration() != 0 {
+		t.Fatalf("learned %v from a backwards clock", obs.LearnedDuration())
+	}
+
+	if err := RecordSessionEnd(url, start.Add(4*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	obs, ok := LoadObservation(url)
+	if !ok || obs.LearnedDuration() != 4*time.Hour {
+		t.Fatalf("learned %v, want 4h", obs.LearnedDuration())
+	}
+	if !obs.SignedInAt.IsZero() {
+		t.Error("sign-in stamp not consumed — later failures would re-learn longer sessions")
+	}
+
+	// A later stray failure without a fresh sign-in must not touch the learned value.
+	if err := RecordSessionEnd(url, start.Add(9*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if obs, _ := LoadObservation(url); obs.LearnedDuration() != 4*time.Hour {
+		t.Fatalf("stray end overwrote the learned duration: %v", obs.LearnedDuration())
+	}
+
+	// The next sign-in re-arms learning while keeping the old estimate available.
+	if err := RecordSignIn(url, start.Add(24*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	obs, _ = LoadObservation(url)
+	if obs.SignedInAt.IsZero() || obs.LearnedDuration() != 4*time.Hour {
+		t.Fatalf("re-arm lost state: %+v", obs)
 	}
 }
