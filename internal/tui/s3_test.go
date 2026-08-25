@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -23,14 +24,19 @@ func TestCleanDroppedPath(t *testing.T) {
 		}
 	}
 
-	for name, raw := range map[string]string{
+	cases := map[string]string{
 		"plain":             plain,
 		"trailing space":    plain + " ",
 		"double quoted":     `"` + plain + `"`,
 		"single quoted":     "'" + plain + "'",
-		"escaped spaces":    strings.ReplaceAll(spaced, " ", `\ `),
 		"quoted with space": `"` + spaced + `"`,
-	} {
+	}
+	// Backslash-escaping is a Unix-emulator behavior (Terminal.app); on Windows a backslash
+	// is a path separator and cleanDroppedPath deliberately leaves it alone.
+	if runtime.GOOS != "windows" {
+		cases["escaped spaces"] = strings.ReplaceAll(spaced, " ", `\ `)
+	}
+	for name, raw := range cases {
 		got, err := cleanDroppedPath(raw)
 		if err != nil {
 			t.Errorf("%s: %v", name, err)

@@ -204,6 +204,9 @@ func DownloadObject(ctx context.Context, get SessionSource, bucket, region, key,
 		}
 	}
 
+	// The suggested replacement (feature/s3/transfermanager) is still a developer preview
+	// with no stability promise; migrate when it goes GA.
+	//lint:ignore SA1019 see above
 	_, err = manager.NewDownloader(client).Download(ctx, part, &s3.GetObjectInput{
 		Bucket: aws.String(bucket),
 		Key:    aws.String(key),
@@ -237,6 +240,7 @@ func UploadFile(ctx context.Context, get SessionSource, bucket, region, prefix, 
 	defer f.Close()
 
 	key := prefix + filepath.Base(path)
+	//lint:ignore SA1019 transfermanager is still a developer preview; migrate when it goes GA
 	if _, err := manager.NewUploader(client).Upload(ctx, &s3.PutObjectInput{
 		Bucket: aws.String(bucket),
 		Key:    aws.String(key),
