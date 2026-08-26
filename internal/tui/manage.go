@@ -208,5 +208,5 @@ func (m *Model) selectProfileConfirm(val string) tea.Cmd {
 func (m *Model) profileConfirmView() string {
 	return m.banner() + m.noticeLine() + m.list.View() + "\n\n" +
 		styleDim.MarginLeft(2).Render("lines to be removed:") + "\n" +
-		styleErr.MarginLeft(4).Render(strings.TrimRight(m.profileRemoveBlock, "\n")) + "\n"
+		styleErr.MarginLeft(4).Render(strings.TrimRight(m.profileRemoveBlock, "\n")) + "\n\n" + m.footer()
 }

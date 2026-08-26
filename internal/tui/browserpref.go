@@ -63,6 +63,36 @@ func browserPrefRow() item {
 	}
 }
 
+// methodRDPScreen is the sentinel value of the RDP presentation row.
+const methodRDPScreen = "= rdp screen"
+
+// rdpScreenRow is the windowed/full-screen setting for the RDP clients warren launches. A row
+// that toggles in place rather than a screen: there are two values and no sub-choices, so a
+// picker would be a screen whose only job is one Enter.
+func rdpScreenRow() item {
+	cur := browser.LoadRDPScreen()
+	return item{
+		title: "⚙ RDP sessions open in " + cur.Describe(),
+		desc:  "enter switches to " + cur.Toggle().Describe() + " — applies to the next RDP tunnel",
+		value: methodRDPScreen,
+	}
+}
+
+// toggleRDPScreen flips the setting and redraws the row so the change is visible where it
+// was made. The cursor stays on the row: flipping it back is the likeliest next keystroke.
+func (m *Model) toggleRDPScreen() tea.Cmd {
+	next := browser.LoadRDPScreen().Toggle()
+	if err := browser.SaveRDPScreen(next); err != nil {
+		m.err = err
+		return nil
+	}
+	idx := m.list.Index()
+	m.buildMethodList()
+	m.list.Select(idx)
+	m.notice = "RDP sessions will open in " + next.Describe()
+	return nil
+}
+
 // sessionLabelFor names an override by its [sso-session] block where one still points at the
 // stored start URL, and by the URL itself otherwise — an override can outlive its block, and
 // a row that cannot be identified cannot be confidently deleted.

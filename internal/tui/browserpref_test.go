@@ -838,3 +838,39 @@ func TestFavoriteClearsStaleAccountAndRoleLists(t *testing.T) {
 		t.Fatalf("goBack = %v, want screenMethod", m.screen)
 	}
 }
+
+// The RDP presentation row flips in place: Enter toggles the stored setting, the row's title
+// reflects the new value immediately, and the cursor stays on it.
+func TestRDPScreenRowTogglesInPlace(t *testing.T) {
+	m := modelWithSSOSession(t)
+	m.buildMethodList()
+	row, ok := findItem(m, methodRDPScreen)
+	if !ok || !strings.Contains(row.title, "a window") {
+		t.Fatalf("row = %+v, want the windowed default", row)
+	}
+	for i, li := range m.list.Items() {
+		if it, ok := li.(item); ok && it.value == methodRDPScreen {
+			m.list.Select(i)
+		}
+	}
+	idx := m.list.Index()
+
+	m.selectMethod(methodRDPScreen)
+	if got := browser.LoadRDPScreen(); got != browser.RDPFullscreen {
+		t.Fatalf("stored = %q after one toggle", got)
+	}
+	if row, _ = findItem(m, methodRDPScreen); !strings.Contains(row.title, "full screen") {
+		t.Errorf("row did not redraw: %q", row.title)
+	}
+	if m.list.Index() != idx || m.screen != screenMethod {
+		t.Errorf("cursor/screen moved: idx %d→%d, screen %v", idx, m.list.Index(), m.screen)
+	}
+	if !strings.Contains(m.notice, "full screen") {
+		t.Errorf("notice = %q", m.notice)
+	}
+
+	m.selectMethod(methodRDPScreen)
+	if got := browser.LoadRDPScreen(); got != browser.RDPWindowed {
+		t.Errorf("stored = %q after two toggles", got)
+	}
+}

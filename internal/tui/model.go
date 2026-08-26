@@ -760,7 +760,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// tunnels generally: "now paste localhost:13389 somewhere" was the residue of
 			// not finishing the job. The note reports which client opened, or falls back
 			// to the manual instruction when none is installed.
-			m.notice = tunnel.OpenRDPClient(msg.t.LocalPort, msg.t.SSHUser)
+			m.notice = tunnel.OpenRDPClient(msg.t.LocalPort, msg.t.SSHUser, browser.LoadRDPScreen() == browser.RDPFullscreen)
 		}
 		m.buildMainList()
 		m.screen = screenMain
@@ -1040,6 +1040,9 @@ func (m *Model) selectMethod(val string) tea.Cmd {
 	}
 	if val == methodBrowserPref {
 		return m.startBrowserPref()
+	}
+	if val == methodRDPScreen {
+		return m.toggleRDPScreen()
 	}
 	if idx, ok := strings.CutPrefix(val, "fav:"); ok {
 		return m.selectFavorite(idx)
@@ -1690,7 +1693,7 @@ func (m *Model) buildMethodList() {
 	// The sign-in browser setting sits with the sign-in methods because that is where you
 	// are when it is wrong: sign-in just opened in the wrong place, and re-selecting the
 	// session is the retry.
-	items = append(items, browserPrefRow())
+	items = append(items, browserPrefRow(), rdpScreenRow())
 	// Removal earns a row only when there is something to remove; an always-present
 	// destructive entry on the home screen is dead weight ninety-nine days in a hundred.
 	if len(m.profiles) > 0 {
@@ -1912,7 +1915,7 @@ func (m *Model) View() string {
 			styleErr.Width(width).MarginLeft(2).Render("Error: "+m.err.Error()) + "\n\n" +
 			styleDim.MarginLeft(2).Render("press any key to continue") + "\n"
 	}
-	return m.banner() + m.splash() + m.noticeLine() + m.list.View()
+	return m.banner() + m.splash() + m.noticeLine() + m.list.View() + "\n" + m.footer()
 }
 
 // noticeLine renders the transient confirmation, or nothing when there is none.

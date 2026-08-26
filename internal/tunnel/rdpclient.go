@@ -24,12 +24,17 @@ func launch(cmd *exec.Cmd) error {
 	return nil
 }
 
-func OpenRDPClient(port int, user string) string {
+// fullscreen selects the client's presentation; see browser.RDPScreen for the setting.
+func OpenRDPClient(port int, user string, fullscreen bool) string {
 	manual := fmt.Sprintf("point your RDP client at localhost:%d", port)
 	switch runtime.GOOS {
 	case "windows":
 		// mstsc ships with every Windows edition; /v is the documented connect-directly flag.
-		if err := launch(exec.Command("mstsc.exe", fmt.Sprintf("/v:localhost:%d", port))); err != nil {
+		args := []string{fmt.Sprintf("/v:localhost:%d", port)}
+		if fullscreen {
+			args = append(args, "/f")
+		}
+		if err := launch(exec.Command("mstsc.exe", args...)); err != nil {
 			return manual + fmt.Sprintf(" (mstsc failed to start: %v)", err)
 		}
 		return fmt.Sprintf("opened mstsc → localhost:%d", port)
@@ -39,7 +44,7 @@ func OpenRDPClient(port int, user string) string {
 		// open(1) survives the app's renames and URL-scheme changes across versions, which
 		// an rdp:// URL has not. The file carries no secret — an address and a username —
 		// and lands in a 0700 warren dir all the same.
-		path, err := writeRDPFile(port, user)
+		path, err := writeRDPFile(port, user, fullscreen)
 		if err != nil {
 			return manual
 		}
@@ -56,6 +61,9 @@ func OpenRDPClient(port int, user string) string {
 			if user != "" {
 				args = append(args, "/u:"+user)
 			}
+			if fullscreen {
+				args = append(args, "/f")
+			}
 			if err := launch(exec.Command(bin, args...)); err == nil {
 				return fmt.Sprintf("opened xfreerdp → localhost:%d", port)
 			}
@@ -69,24 +77,38 @@ func OpenRDPClient(port int, user string) string {
 	}
 }
 
-// rdpFileContents is the two-key .rdp document Windows App needs to connect. Split out so
+// rdpFileContents is the .rdp document Windows App (and mstsc) reads to connect. Split out so
 // the exact format — colon-typed keys, CRLF not required — is pinned by a test rather than
 // discovered on someone's Mac.
-func rdpFileContents(port int, user string) string {
-	doc := fmt.Sprintf("full address:s:localhost:%d\n", port)
+//
+// Windowed by default: with no "screen mode id" Windows App takes the whole display, which
+// on a laptop means the local desktop vanishes behind the remote one every time a tunnel
+// opens. A window at a laptop-friendly size, with smart sizing so dragging the window
+// rescales the remote desktop instead of scrolling it, is what a tunnel to one box wants.
+// Full screen is the same document with mode 2, for the people who do want that.
+func rdpFileContents(port int, user string, fullscreen bool) string {
+	doc := fmt.Sprintf("full address:s:localhost:%d\n", port) + "use multimon:i:0\n"
+	if fullscreen {
+		doc += "screen mode id:i:2\n"
+	} else {
+		doc += "screen mode id:i:1\n" + // 1 = windowed, 2 = full screen
+			"desktopwidth:i:1600\n" +
+			"desktopheight:i:1000\n" +
+			"smart sizing:i:1\n"
+	}
 	if user != "" {
 		doc += "username:s:" + user + "\n"
 	}
 	return doc
 }
 
-func writeRDPFile(port int, user string) (string, error) {
+func writeRDPFile(port int, user string, fullscreen bool) (string, error) {
 	dir := filepath.Join(os.TempDir(), "warren-rdp")
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", err
 	}
 	path := filepath.Join(dir, fmt.Sprintf("localhost-%d.rdp", port))
-	if err := os.WriteFile(path, []byte(rdpFileContents(port, user)), 0o600); err != nil {
+	if err := os.WriteFile(path, []byte(rdpFileContents(port, user, fullscreen)), 0o600); err != nil {
 		return "", err
 	}
 	return path, nil

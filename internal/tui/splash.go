@@ -116,7 +116,7 @@ func (m *Model) splash() string {
 // wordmark while it is showing. Without accounting for the wordmark the opening list overflows
 // by exactly its height.
 func (m *Model) resizeList() {
-	h := m.height - 5 - m.splashRows() // -1 banner, -4 list chrome
+	h := m.height - 6 - m.splashRows() // -1 banner, -4 list chrome, -1 key footer
 	if h < 3 {
 		h = 3
 	}
