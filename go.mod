@@ -7,9 +7,9 @@ require (
 	github.com/aws/aws-sdk-go-v2/config v1.32.38
 	github.com/aws/aws-sdk-go-v2/credentials v1.19.37
 	github.com/aws/aws-sdk-go-v2/feature/s3/manager v1.22.44
-	github.com/aws/aws-sdk-go-v2/service/ec2 v1.318.0
+	github.com/aws/aws-sdk-go-v2/service/ec2 v1.322.0
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.107.3
-	github.com/aws/aws-sdk-go-v2/service/ssm v1.73.3
+	github.com/aws/aws-sdk-go-v2/service/ssm v1.73.7
 	github.com/aws/aws-sdk-go-v2/service/sso v1.33.7
 	github.com/aws/aws-sdk-go-v2/service/ssooidc v1.38.7
 	github.com/charmbracelet/bubbles v1.0.0
