@@ -37,8 +37,11 @@ func TestRDPFileNamedForInstance(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := filepath.Base(path); got != "web-01-13389.rdp" {
-		t.Errorf("file name = %q, want web-01-13389.rdp", got)
+	if got := filepath.Base(path); got != "web-01 (localhost-13389).rdp" {
+		t.Errorf("file name = %q, want %q", got, "web-01 (localhost-13389).rdp")
+	}
+	if strings.Contains(path, ":") {
+		t.Errorf("path %q contains a colon — macOS shows that as a slash in the label", path)
 	}
 }
 
@@ -53,6 +56,17 @@ func TestRDPFileFallsBackWithoutAName(t *testing.T) {
 		if got := filepath.Base(path); got != "localhost-13389.rdp" {
 			t.Errorf("name %q: file = %q, want localhost-13389.rdp", name, got)
 		}
+	}
+}
+
+// The xfreerdp window title carries the same two facts as the .rdp filename, and may use a
+// colon since it is a CLI argument rather than a path.
+func TestRDPConnLabel(t *testing.T) {
+	if got := rdpConnLabel("web-01", 13389); got != "web-01 (localhost:13389)" {
+		t.Errorf("label = %q, want %q", got, "web-01 (localhost:13389)")
+	}
+	if got := rdpConnLabel("", 13389); got != "localhost:13389" {
+		t.Errorf("nameless label = %q, want localhost:13389", got)
 	}
 }
 

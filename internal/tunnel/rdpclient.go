@@ -115,12 +115,13 @@ func writeRDPFile(port int, user, instanceName string, fullscreen bool) (string,
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", err
 	}
-	// The base name is what Windows App shows as the connection label, so it is the
-	// instance name when there is one — with the port kept on the end so simultaneous
-	// tunnels to two hosts that share a Name tag do not fight over one file.
+	// The base name is what Windows App shows as the connection label. It carries both the
+	// instance name (so you know which host) and the local port (so you know which tunnel) —
+	// "web-01 (localhost-13389)". No colon: macOS translates ":" to "/" in display names.
+	// The port also keeps simultaneous tunnels to two hosts sharing a Name tag off one file.
 	name := fmt.Sprintf("localhost-%d", port)
 	if slug := rdpFileSlug(instanceName); slug != "" {
-		name = fmt.Sprintf("%s-%d", slug, port)
+		name = fmt.Sprintf("%s (localhost-%d)", slug, port)
 	}
 	path := filepath.Join(dir, name+".rdp")
 	if err := os.WriteFile(path, []byte(rdpFileContents(port, user, fullscreen)), 0o600); err != nil {
@@ -152,10 +153,11 @@ func rdpFileSlug(s string) string {
 }
 
 // rdpConnLabel is the window/bookmark title for clients that take one as a flag (xfreerdp
-// /t), falling back to the address when there is no usable name.
+// /t) — name and port together, the address alone when there is no usable name. A CLI arg,
+// not a filename, so the colon is fine here.
 func rdpConnLabel(instanceName string, port int) string {
 	if slug := rdpFileSlug(instanceName); slug != "" {
-		return slug
+		return fmt.Sprintf("%s (localhost:%d)", slug, port)
 	}
 	return fmt.Sprintf("localhost:%d", port)
 }
