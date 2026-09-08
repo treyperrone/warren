@@ -152,8 +152,12 @@ func (m *Model) credRefreshNote() string {
 	case m.refreshingCreds:
 		return "renewing"
 	case errors.Is(m.credRefreshErr, awsint.ErrLoginRequired):
-		// The one case with a real instruction attached: no amount of waiting fixes it, and
-		// re-selecting the session is what runs the browser flow.
+		// The one case with a real instruction attached: no amount of waiting fixes it. When
+		// warren has the context to run the sign-in itself, "r" does; otherwise the only
+		// route is re-selecting the session.
+		if m.canReauth() {
+			return "sign-in needed — press r to re-authenticate"
+		}
 		return "sign-in needed — re-select the SSO session"
 	case m.credRefreshErr != nil:
 		return "renewal failed"

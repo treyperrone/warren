@@ -93,7 +93,7 @@ When a sign-in is needed, warren shows the verification URL and the device code 
 
 On the CLI the default is always a pure device-code sign-in: the URL and code print, the URL rides OSC 52 to your local clipboard, and no browser opens — saved overrides included, which stay the TUI's business (the output says when one is being skipped). A browser opens from `warren login` only with `--browser`, which uses your saved browser/profile when one exists and offers the picker otherwise. `--code` forces device-code for one run.
 
-`warren login` covers named profiles too: an SSO-backed profile (modern `sso_session` or legacy inline `sso_start_url`) signs in through its underlying session, and a keys/assume-role profile — which has nothing to sign in to — has its credentials validated instead. The TUI does the same: selecting a profile whose SSO session has expired routes into the sign-in flow and then resolves the profile, rather than dead-ending on "login session has expired, please reauthenticate".
+`warren login` covers named profiles too: an SSO-backed profile (modern `sso_session` or legacy inline `sso_start_url`) signs in through its underlying session, and a keys/assume-role profile — which has nothing to sign in to — has its credentials validated instead. The TUI does the same: selecting a profile whose SSO session has expired routes into the sign-in flow and then resolves the profile, rather than dead-ending on "login session has expired, please reauthenticate". An SSO session that expires **mid-use** — an API call or a tunnel that fails on a stale token after the laptop has slept — is handled the same way: warren runs the sign-in, rebuilds the same account-and-role credentials, and resumes what you were doing, instead of dropping you in the error view to navigate back by hand. Only a genuinely expired session triggers this; a plain permission error still surfaces as one.
 
 Per-session overrides are keyed by the session's start URL, so they survive renaming the `[sso-session]` block, and each one is listed (and removable) on the same ⚙ screen. The choices are saved in `~/.warren_config.json` — warren's own file, following the same rule as everything else it owns: `~/.aws/config` is never written beyond the append-only session bootstrap.
 
@@ -136,6 +136,7 @@ The running version is also shown in the TUI's header bar, next to the name.
 | `enter` | select |
 | `n` | new connection (main screen) |
 | `p` | switch auth (main screen) |
+| `r` | re-authenticate — shown on any list when the background renewal has given up on the SSO session |
 | `?` | about — version, keys, and where to report a problem; works on every screen |
 | `q` | quit — active tunnels keep running |
 | `ctrl+c` | quit |
@@ -201,6 +202,11 @@ keeps the terminal, so you can have an RDP forward to a Windows box and an SSH f
 host up simultaneously — both appear on the manager screen with the port to point a client at.
 `SSH` is a forward only: warren hands you the `ssh -p <port> user@localhost` line and you run it
 wherever you like.
+
+**Enter on an active tunnel** opens a small menu rather than killing it outright. For an RDP
+tunnel it leads with **Reconnect** — the port forward is still up, so this just points your
+RDP client at it again after the window was closed, the box rebooted, or the session was
+booted — with **☆ Favorite this connection** under it and an explicit **Disconnect** last.
 
 An SSM shell is different, because it is interactive: it needs a terminal for as long as the session
 lasts. warren opens it in a **new window** where it can, and the TUI stays usable, so several

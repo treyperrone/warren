@@ -1,9 +1,12 @@
 package tui
 
 import (
+	"errors"
 	"strings"
 
 	"github.com/charmbracelet/lipgloss"
+
+	awsint "github.com/treyperrone/warren/internal/aws"
 )
 
 // The footer is the lazygit-style key strip under every list: the keys that work on THIS
@@ -58,6 +61,15 @@ func (m *Model) footerHints() []keyHint {
 		}
 	case screenConnType:
 		add("enter", "connect")
+	case screenSessionActions:
+		switch sel.value {
+		case "reconnect":
+			add("enter", "reconnect")
+		case "disconnect":
+			add("enter", "disconnect")
+		default:
+			add("enter", "select")
+		}
 	case screenFavoriteRemove:
 		add("enter", "remove")
 	case screenProfileConfirm:
@@ -75,6 +87,12 @@ func (m *Model) footerHints() []keyHint {
 	// Row-specific: the favorite under the cursor can be deleted in place.
 	if (m.screen == screenMethod || m.screen == screenFavorites) && strings.HasPrefix(sel.value, "fav:") {
 		add("x", "remove favorite")
+	}
+
+	// Offered wherever a list is shown while the background renewal has given up on the SSO
+	// session — the same condition credRefreshNote reports in the header.
+	if errors.Is(m.credRefreshErr, awsint.ErrLoginRequired) && m.canReauth() {
+		add("r", "re-authenticate")
 	}
 
 	add("/", "search")
