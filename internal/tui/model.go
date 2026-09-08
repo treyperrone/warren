@@ -835,7 +835,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// tunnels generally: "now paste localhost:13389 somewhere" was the residue of
 			// not finishing the job. The note reports which client opened, or falls back
 			// to the manual instruction when none is installed.
-			m.notice = tunnel.OpenRDPClient(msg.t.LocalPort, msg.t.SSHUser, browser.LoadRDPScreen() == browser.RDPFullscreen)
+			m.notice = tunnel.OpenRDPClient(msg.t.LocalPort, msg.t.SSHUser, msg.t.InstanceName, browser.LoadRDPScreen() == browser.RDPFullscreen)
 		}
 		m.buildMainList()
 		m.screen = screenMain
@@ -1766,7 +1766,7 @@ func (m *Model) selectSessionAction(val string) tea.Cmd {
 	case "reconnect":
 		// The same call msgTunnelReady makes when the tunnel first comes up — the port
 		// forward is still there, this just points a client at it again.
-		m.notice = tunnel.OpenRDPClient(t.LocalPort, t.SSHUser, browser.LoadRDPScreen() == browser.RDPFullscreen)
+		m.notice = tunnel.OpenRDPClient(t.LocalPort, t.SSHUser, t.InstanceName, browser.LoadRDPScreen() == browser.RDPFullscreen)
 	case "favconn":
 		if c := m.connFavCandidateFor(t.InstanceName, strings.ToLower(string(t.Kind)), t.SSHUser); c != nil {
 			if err := browser.AddFavorite(*c); err != nil {

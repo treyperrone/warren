@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 )
 
 // OpenRDPClient launches the platform's RDP client pointed at the forwarded port, so an RDP
@@ -25,7 +26,9 @@ func launch(cmd *exec.Cmd) error {
 }
 
 // fullscreen selects the client's presentation; see browser.RDPScreen for the setting.
-func OpenRDPClient(port int, user string, fullscreen bool) string {
+// instanceName is the EC2 Name tag, used to label the connection so a client's window and
+// bookmark read "web-01" instead of "localhost-13389"; "" falls back to the address.
+func OpenRDPClient(port int, user, instanceName string, fullscreen bool) string {
 	manual := fmt.Sprintf("point your RDP client at localhost:%d", port)
 	switch runtime.GOOS {
 	case "windows":
@@ -43,8 +46,10 @@ func OpenRDPClient(port int, user string, fullscreen bool) string {
 		// Windows App (né Microsoft Remote Desktop) opens .rdp documents; a temp file plus
 		// open(1) survives the app's renames and URL-scheme changes across versions, which
 		// an rdp:// URL has not. The file carries no secret — an address and a username —
-		// and lands in a 0700 warren dir all the same.
-		path, err := writeRDPFile(port, user, fullscreen)
+		// and lands in a 0700 warren dir all the same. Windows App has no display-name key
+		// in the .rdp format and labels the connection by the file's name, so the file is
+		// named for the instance.
+		path, err := writeRDPFile(port, user, instanceName, fullscreen)
 		if err != nil {
 			return manual
 		}
@@ -60,6 +65,9 @@ func OpenRDPClient(port int, user string, fullscreen bool) string {
 			args := []string{fmt.Sprintf("/v:localhost:%d", port)}
 			if user != "" {
 				args = append(args, "/u:"+user)
+			}
+			if title := rdpConnLabel(instanceName, port); title != "" {
+				args = append(args, "/t:"+title)
 			}
 			if fullscreen {
 				args = append(args, "/f")
@@ -102,14 +110,52 @@ func rdpFileContents(port int, user string, fullscreen bool) string {
 	return doc
 }
 
-func writeRDPFile(port int, user string, fullscreen bool) (string, error) {
+func writeRDPFile(port int, user, instanceName string, fullscreen bool) (string, error) {
 	dir := filepath.Join(os.TempDir(), "warren-rdp")
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", err
 	}
-	path := filepath.Join(dir, fmt.Sprintf("localhost-%d.rdp", port))
+	// The base name is what Windows App shows as the connection label, so it is the
+	// instance name when there is one — with the port kept on the end so simultaneous
+	// tunnels to two hosts that share a Name tag do not fight over one file.
+	name := fmt.Sprintf("localhost-%d", port)
+	if slug := rdpFileSlug(instanceName); slug != "" {
+		name = fmt.Sprintf("%s-%d", slug, port)
+	}
+	path := filepath.Join(dir, name+".rdp")
 	if err := os.WriteFile(path, []byte(rdpFileContents(port, user, fullscreen)), 0o600); err != nil {
 		return "", err
 	}
 	return path, nil
+}
+
+// rdpFileSlug reduces an instance name to something safe for a filename: a leading label
+// Windows App will display verbatim. Anything outside a conservative set becomes a dash,
+// runs collapse, and an empty result (a name that was all punctuation) yields "" so the
+// caller falls back to the address.
+func rdpFileSlug(s string) string {
+	var b []rune
+	lastDash := true // also trims leading dashes
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '.', r == '_':
+			b = append(b, r)
+			lastDash = false
+		default:
+			if !lastDash {
+				b = append(b, '-')
+				lastDash = true
+			}
+		}
+	}
+	return strings.Trim(string(b), "-")
+}
+
+// rdpConnLabel is the window/bookmark title for clients that take one as a flag (xfreerdp
+// /t), falling back to the address when there is no usable name.
+func rdpConnLabel(instanceName string, port int) string {
+	if slug := rdpFileSlug(instanceName); slug != "" {
+		return slug
+	}
+	return fmt.Sprintf("localhost:%d", port)
 }
