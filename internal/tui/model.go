@@ -683,6 +683,14 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch m.resume {
 		case resumeInstances:
 			m.resume = resumeNone
+			// A tunnel that outlived the timeout is the thing most worth landing on, and the
+			// manager is the only screen that shows it — its "n" gets to the instance list.
+			if len(m.manager.Active()) > 0 {
+				m.notice = "signed back in — your active tunnels are still here"
+				m.buildMainList()
+				m.screen = screenMain
+				return m, nil
+			}
 			m.loading = true
 			m.screen = screenInstance
 			return m, m.fetchInstances()
@@ -702,6 +710,12 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, m.fetchS3Buckets()
 		case resumeActionHub:
 			m.resume = resumeNone
+			if len(m.manager.Active()) > 0 {
+				m.notice = "signed back in — your active tunnels are still here"
+				m.buildMainList()
+				m.screen = screenMain
+				return m, nil
+			}
 		}
 		m.loading = false
 		m.buildActionList()
@@ -1047,11 +1061,15 @@ func (m *Model) goBack() tea.Cmd {
 		m.buildMainList()
 		m.screen = screenMain
 	case screenMain:
-		// The tunnel manager is reached by connecting, so "back" is the hub it was reached
-		// from. With no credentials there is nowhere to go, and staying put beats quitting.
+		// "Back" is the hub the manager was reached from: the action screen once credentials
+		// exist, otherwise the method screen — which the "Active tunnels" row on the method
+		// screen (persisted tunnels, no session yet) can now land here from.
 		if m.awsSess != nil {
 			m.buildActionList()
 			m.screen = screenAction
+		} else {
+			m.buildMethodList()
+			m.screen = screenMethod
 		}
 	}
 	return nil
@@ -1131,6 +1149,11 @@ func (m *Model) selectMethod(val string) tea.Cmd {
 	}
 	if val == methodAddSession {
 		return m.StartSetup()
+	}
+	if val == methodTunnels {
+		m.buildMainList()
+		m.screen = screenMain
+		return nil
 	}
 	if val == methodBrowserPref {
 		return m.startBrowserPref()
@@ -1646,7 +1669,15 @@ func (m *Model) updateMain(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 	switch msg.String() {
 	case "n":
-		// new connection — go to instance picker
+		// new connection — go to instance picker. Needs credentials; without them (the
+		// manager was opened from the method screen to reach a persisted tunnel) send the
+		// user to pick an identity first.
+		if m.awsSess == nil {
+			m.notice = "pick an authentication method first"
+			m.buildMethodList()
+			m.screen = screenMethod
+			return m, nil
+		}
 		m.loading = true
 		return m, m.fetchInstances()
 	case "p":
@@ -1691,6 +1722,12 @@ func (m *Model) handleMainSelect(val string) tea.Cmd {
 		}
 		return nil
 	case "new":
+		if m.awsSess == nil {
+			m.notice = "pick an authentication method first"
+			m.buildMethodList()
+			m.screen = screenMethod
+			return nil
+		}
 		m.loading = true
 		return m.fetchInstances()
 	case "quit":
@@ -1850,6 +1887,16 @@ func (m *Model) fetchInstances() tea.Cmd {
 
 func (m *Model) buildMethodList() {
 	var items []list.Item
+	// Active tunnels above everything when there are any: after "p" (switch auth) or a
+	// startup that inherited tunnels from a previous run, this is the only way back to the
+	// manager without connecting to something new.
+	if n := len(m.manager.Active()); n > 0 {
+		items = append(items, item{
+			title: fmt.Sprintf("Active tunnels (%d)", n),
+			desc:  "open the tunnel manager — reconnect, favorite, or disconnect a live session",
+			value: methodTunnels,
+		})
+	}
 	// Favorites first: they exist to be the first thing Enter lands on. Refreshed from disk
 	// on every build so a star toggled on the action screen shows up on the way back. Past
 	// favInlineMax they collapse into a single row — a dozen bookmarks must not bury the

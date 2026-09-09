@@ -24,6 +24,11 @@ const (
 // screen. It cannot collide with a session name, which may not contain a space.
 const methodAddSession = "+ add sso session"
 
+// methodTunnels is the sentinel value of the "Active tunnels" row, shown on the method
+// screen only when tunnels are running — it is how you get back to the manager after
+// switching auth, or at startup with tunnels persisted from a previous run.
+const methodTunnels = "= active tunnels"
+
 // defaultRegion prefills the region field. Identity Center is most often homed in us-east-1,
 // and an SSO region is a single well-known value rather than something to be discovered, so
 // offering it as an editable default costs nothing and saves typing it every time.

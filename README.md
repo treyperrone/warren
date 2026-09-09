@@ -208,6 +208,12 @@ tunnel it leads with **Reconnect** — the port forward is still up, so this jus
 RDP client at it again after the window was closed, the box rebooted, or the session was
 booted — with **☆ Favorite this connection** under it and an explicit **Disconnect** last.
 
+The manager itself was previously reachable only by starting a connection. Whenever a tunnel
+is live, an **Active tunnels (N)** row appears on the action screen and the method screen, so
+a tunnel that outlived a re-auth — or a warren restart — is always one keypress away. After
+an auto re-auth, warren lands you back on the manager rather than the picker if anything is
+still running.
+
 An SSM shell is different, because it is interactive: it needs a terminal for as long as the session
 lasts. warren opens it in a **new window** where it can, and the TUI stays usable, so several
 sessions can be open at once. What counts as a window depends on where warren is running:

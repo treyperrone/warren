@@ -3,10 +3,12 @@ package tui
 import (
 	"os/exec"
 	"runtime"
+	"strings"
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
 
+	awsint "github.com/treyperrone/warren/internal/aws"
 	"github.com/treyperrone/warren/internal/tunnel"
 )
 
@@ -119,6 +121,59 @@ func TestDisconnectEndsTheTunnel(t *testing.T) {
 	}
 	if len(m.manager.Active()) != 0 {
 		t.Error("disconnect did not end the tunnel")
+	}
+}
+
+// The manager was a connect-only dead end: a tunnel that outlived a re-auth had nowhere to
+// be seen. The action screen now carries a way in when tunnels are live.
+func TestActionScreenLinksToLiveTunnels(t *testing.T) {
+	m := tunnelManagerModel(t, tunnel.KindRDP)
+	m.buildActionList()
+
+	var row *item
+	for _, it := range m.list.Items() {
+		if i := it.(item); i.value == actionTunnels {
+			row = &i
+			break
+		}
+	}
+	if row == nil {
+		t.Fatal("no 'Active tunnels' row on the action screen while a tunnel is live")
+	}
+	if !strings.Contains(row.title, "(1)") {
+		t.Errorf("row title %q does not show the count", row.title)
+	}
+
+	m.screen = screenAction
+	m.selectAction(actionTunnels)
+	if m.screen != screenMain {
+		t.Errorf("screen = %v, want screenMain after picking Active tunnels", m.screen)
+	}
+}
+
+// With no live tunnel the row is absent — it must not be dead weight on the common path.
+func TestActionScreenHasNoTunnelRowWhenNoneActive(t *testing.T) {
+	m := mainScreenModel(t)
+	m.buildActionList()
+	for _, it := range m.list.Items() {
+		if it.(item).value == actionTunnels {
+			t.Error("'Active tunnels' row shown with no tunnel active")
+		}
+	}
+}
+
+// After a re-auth, a tunnel that survived the timeout is the thing most worth landing on.
+func TestReauthWithLiveTunnelLandsOnManager(t *testing.T) {
+	m := tunnelManagerModel(t, tunnel.KindRDP)
+	m.selSession = &awsint.SSOSessionConfig{Name: "crlab", StartURL: "https://ex.awsapps.com/start", Region: "eu-west-2"}
+	m.selAccount = &awsint.Account{ID: "111111111111", Name: "cr-lab"}
+	m.selRole = "AdminRole"
+	m.resume = resumeInstances
+
+	m.Update(msgCredsReady{})
+
+	if m.screen != screenMain {
+		t.Errorf("screen = %v, want screenMain — the live tunnel should be in view", m.screen)
 	}
 }
 
