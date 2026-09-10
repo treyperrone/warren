@@ -32,6 +32,38 @@ func sleeper(t *testing.T) int {
 	return cmd.Process.Pid
 }
 
+// pluginSleeper starts a process that isPluginProcess accepts as the real thing — a copy of
+// a long-running binary under a name containing "session-manager-plugin" — and returns its
+// pid. For tests that exercise Manager.load(), which now checks the process identity, not
+// just that some pid answers to kill(pid, 0).
+func pluginSleeper(t *testing.T) int {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("isPluginProcess on windows reads Get-Process's Path, which requires the copy below to be run from that exact path — not worth reproducing here")
+	}
+	src, err := exec.LookPath("sleep")
+	if err != nil {
+		t.Skipf("no sleep binary on PATH: %v", err)
+	}
+	data, err := os.ReadFile(src)
+	if err != nil {
+		t.Fatalf("reading %s: %v", src, err)
+	}
+	dst := filepath.Join(t.TempDir(), "session-manager-plugin-testfake")
+	if err := os.WriteFile(dst, data, 0o700); err != nil {
+		t.Fatalf("writing fake plugin: %v", err)
+	}
+	cmd := exec.Command(dst, "30")
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("starting fake plugin: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = cmd.Process.Kill()
+		_, _ = cmd.Process.Wait()
+	})
+	return cmd.Process.Pid
+}
+
 // The bug this exists for: Alive() called proc.Signal(os.Signal(nil)), which os.Process.Signal
 // rejects with "unsupported signal type" — a non-nil error — so it answered false for every
 // running tunnel. Manager.Active then pruned each one as soon as it was asked, so no tunnel ever
@@ -169,7 +201,7 @@ func TestManagerRestoresLiveTunnelsFromDisk(t *testing.T) {
 	home := t.TempDir()
 	testenv.SetHome(t, home)
 
-	pid := sleeper(t)
+	pid := pluginSleeper(t)
 	entries := fmt.Sprintf(`[{"pid":%d,"kind":"RDP","instance_id":"i-0abc",`+
 		`"instance_name":"goad-dc01","local_port":13389,"auth_label":"acct/Role"}]`, pid)
 	if err := os.WriteFile(filepath.Join(home, ".warren_sessions.json"), []byte(entries), 0o600); err != nil {
@@ -203,6 +235,79 @@ func TestManagerDropsDeadTunnelsFromDisk(t *testing.T) {
 
 	if live := NewManager().Active(); len(live) != 0 {
 		t.Errorf("restored %d dead tunnels", len(live))
+	}
+}
+
+// The case a live PID alone cannot catch: the process the persisted PID now names is real
+// and running, but it is not the plugin — the PID was reused, which happens routinely across
+// a reboot. Restoring it anyway used to show a tunnel pointing at nothing: the manager screen
+// said it was there, and pointing an RDP client at its port hung until the client's own
+// timeout, because kill(pid, 0) cannot tell a reused PID from the original process.
+func TestManagerDropsATunnelWhosePIDWasReused(t *testing.T) {
+	home := t.TempDir()
+	testenv.SetHome(t, home)
+
+	pid := sleeper(t) // alive, but not the plugin
+	entries := fmt.Sprintf(`[{"pid":%d,"kind":"RDP","instance_id":"i-0abc","local_port":13389}]`, pid)
+	if err := os.WriteFile(filepath.Join(home, ".warren_sessions.json"), []byte(entries), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if live := NewManager().Active(); len(live) != 0 {
+		t.Errorf("restored %d tunnels whose pid belongs to an unrelated process", len(live))
+	}
+}
+
+// A tunnel loaded from the state file is marked Restored — it is what Reconnect uses to
+// decide whether a tunnel can be trusted at face value, or needs rebuilding first.
+func TestRestoredTunnelIsMarkedRestored(t *testing.T) {
+	home := t.TempDir()
+	testenv.SetHome(t, home)
+
+	pid := pluginSleeper(t)
+	entries := fmt.Sprintf(`[{"pid":%d,"kind":"RDP","instance_id":"i-0abc","local_port":13389}]`, pid)
+	if err := os.WriteFile(filepath.Join(home, ".warren_sessions.json"), []byte(entries), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	live := NewManager().Active()
+	if len(live) != 1 {
+		t.Fatalf("restored %d tunnels, want 1", len(live))
+	}
+	if !live[0].Restored {
+		t.Error("Restored = false for a tunnel loaded from disk")
+	}
+}
+
+// A tunnel added this run — the ordinary path, via StartPortForward — is not Restored, and
+// its identity round-trips through a save/load cycle so a later run can still rebuild it.
+func TestAddedTunnelIsNotRestoredAndIdentityPersists(t *testing.T) {
+	home := t.TempDir()
+	testenv.SetHome(t, home)
+
+	m := NewManager()
+	live := &Tunnel{
+		PID: pluginSleeper(t), Kind: KindRDP, LocalPort: 13389, InstanceID: "i-0abc",
+		InstanceName: "win-01", StartURL: "https://ex.awsapps.com/start",
+		AccountID: "111111111111", AccountName: "cr-lab", RoleName: "AdminRole",
+	}
+	m.Add(live)
+	if live.Restored {
+		t.Error("Restored = true for a tunnel this run started")
+	}
+
+	// Round-trip: a second Manager reading the file this one just wrote.
+	m2 := NewManager()
+	got := m2.Active()
+	if len(got) != 1 {
+		t.Fatalf("second manager restored %d tunnels, want 1", len(got))
+	}
+	if got[0].StartURL != live.StartURL || got[0].AccountID != live.AccountID ||
+		got[0].AccountName != live.AccountName || got[0].RoleName != live.RoleName {
+		t.Errorf("identity did not round-trip: got %+v, want the fields on %+v", got[0], live)
+	}
+	if !got[0].Restored {
+		t.Error("Restored = false after loading from disk")
 	}
 }
 

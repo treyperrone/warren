@@ -1613,6 +1613,7 @@ func (m *Model) startSSH(user string) tea.Cmd {
 	instID := m.selInstance.ID
 	instName := m.selInstance.Name
 	authLabel := m.awsSess.Label
+	startURL, accountID, accountName, role := m.tunnelIdentity()
 	return func() tea.Msg {
 		t, err := tunnel.StartPortForward(m.ctx, instID, 22, port, m.awsSess)
 		if err != nil {
@@ -1628,6 +1629,7 @@ func (m *Model) startSSH(user string) tea.Cmd {
 		t.LocalPort = port
 		t.AuthLabel = authLabel
 		t.SSHUser = user
+		t.StartURL, t.AccountID, t.AccountName, t.RoleName = startURL, accountID, accountName, role
 		return msgTunnelReady{t: t}
 	}
 }
@@ -1639,6 +1641,7 @@ func (m *Model) startRDP() tea.Cmd {
 	instID := m.selInstance.ID
 	instName := m.selInstance.Name
 	authLabel := m.awsSess.Label
+	startURL, accountID, accountName, role := m.tunnelIdentity()
 	return func() tea.Msg {
 		t, err := tunnel.StartPortForward(m.ctx, instID, 3389, port, m.awsSess)
 		if err != nil {
@@ -1653,6 +1656,7 @@ func (m *Model) startRDP() tea.Cmd {
 		t.InstanceName = instName
 		t.LocalPort = port
 		t.AuthLabel = authLabel
+		t.StartURL, t.AccountID, t.AccountName, t.RoleName = startURL, accountID, accountName, role
 		return msgTunnelReady{t: t}
 	}
 }
@@ -1760,11 +1764,13 @@ func (m *Model) buildSessionActionsList() {
 	// it again. An SSH or Shell tunnel is a bare port forward the user drives themselves —
 	// there is nothing for warren to re-open.
 	if t.Kind == tunnel.KindRDP {
-		items = append(items, item{
-			title: "Reconnect",
-			desc:  fmt.Sprintf("re-open your RDP client on localhost:%d", t.LocalPort),
-			value: "reconnect",
-		})
+		desc := fmt.Sprintf("re-open your RDP client on localhost:%d", t.LocalPort)
+		if t.Restored {
+			// Set expectations: this one did not come up under this run of warren, so
+			// Reconnect is about to do more than open a window.
+			desc = "re-authenticate if needed and rebuild the tunnel, then open your RDP client"
+		}
+		items = append(items, item{title: "Reconnect", desc: desc, value: "reconnect"})
 	}
 
 	// Favorite this connection, when the current identity lines up with the tunnel so a
@@ -1799,11 +1805,10 @@ func (m *Model) selectSessionAction(val string) tea.Cmd {
 		m.buildMainList()
 		return nil
 	}
+	var cmd tea.Cmd
 	switch val {
 	case "reconnect":
-		// The same call msgTunnelReady makes when the tunnel first comes up — the port
-		// forward is still there, this just points a client at it again.
-		m.notice = tunnel.OpenRDPClient(t.LocalPort, t.SSHUser, t.InstanceName, browser.LoadRDPScreen() == browser.RDPFullscreen)
+		cmd = m.reconnectTunnel(t)
 	case "favconn":
 		if c := m.connFavCandidateFor(t.InstanceName, strings.ToLower(string(t.Kind)), t.SSHUser); c != nil {
 			if err := browser.AddFavorite(*c); err != nil {
@@ -1820,7 +1825,59 @@ func (m *Model) selectSessionAction(val string) tea.Cmd {
 	m.sessionActionTunnel = nil
 	m.buildMainList()
 	m.screen = screenMain
-	return nil
+	return cmd
+}
+
+// reconnectTunnel re-opens the RDP client for t, rebuilding the tunnel first when it cannot
+// be trusted at face value.
+//
+// A tunnel warren started this run (t.Restored == false) is trusted: warren watched
+// StartPortForward and WaitPort succeed for it, so this is the fast path — the same call
+// msgTunnelReady makes when the tunnel first comes up.
+//
+// A Restored tunnel survived to this launch from a previous one. Its plugin process being
+// alive proves nothing about the SSM channel behind it, which commonly dies out from under
+// an otherwise-running plugin — an expired SSO session, SSM's own idle timeout — and handing
+// that to an RDP client is what used to spin until the client's own timeout. So it is rebuilt
+// instead: reassume the identity stamped on it (session → account → role, via the ordinary
+// sign-in flow — StartReauth prints a device code if the token needs it), then a fresh
+// StartPortForward, then the client. Everything after "reassume" is the existing resumeConnect
+// path: the same code a re-auth mid-connection already uses.
+func (m *Model) reconnectTunnel(t *tunnel.Tunnel) tea.Cmd {
+	if !t.Restored {
+		m.notice = tunnel.OpenRDPClient(t.LocalPort, t.SSHUser, t.InstanceName, browser.LoadRDPScreen() == browser.RDPFullscreen)
+		return nil
+	}
+	if t.StartURL == "" || t.AccountID == "" || t.RoleName == "" {
+		// Written by an older warren before these fields existed, or a profile-flow
+		// connection, which never had a session to replay in the first place.
+		m.notice = t.InstanceName + " predates this warren session and can't be re-authenticated automatically — Disconnect it and start a new connection"
+		return nil
+	}
+	var sess *awsint.SSOSessionConfig
+	for i := range m.ssoSessions {
+		if m.ssoSessions[i].StartURL == t.StartURL {
+			sess = &m.ssoSessions[i]
+			break
+		}
+	}
+	if sess == nil {
+		m.err = fmt.Errorf("%s's SSO session is no longer in ~/.aws/config — Disconnect it and start a new connection", t.InstanceName)
+		return nil
+	}
+	// Superseded by whatever this produces, one way or another — kept around it would be a
+	// second, permanently dead row once the rebuild lands.
+	m.manager.Remove(t)
+	m.selSession = sess
+	m.selAccount = &awsint.Account{ID: t.AccountID, Name: t.AccountName}
+	// startReauth reassumes m.selRole (falling back to the CURRENT session's role otherwise),
+	// so this has to be set explicitly: the tunnel being reconnected may belong to a
+	// different account/role than whatever this Model last authenticated as.
+	m.selRole = t.RoleName
+	m.selInstance = &awsint.Instance{ID: t.InstanceID, Name: t.InstanceName}
+	m.connType = tunnel.KindRDP
+	m.resumeSSHUser = t.SSHUser
+	return m.startReauth(resumeConnect)
 }
 
 // ---- async commands --------------------------------------------------------
@@ -2074,6 +2131,17 @@ func (m *Model) connFavCandidateFor(instanceName, connType, sshUser string) *bro
 // manager can offer to star.
 func (m *Model) noteConnFavCandidate(instanceName, connType, sshUser string) {
 	m.connFavCandidate = m.connFavCandidateFor(instanceName, connType, sshUser)
+}
+
+// tunnelIdentity is the SSO session, account, and role behind the current credentials —
+// stamped onto every tunnel warren starts so a Reconnect that outlives this run of warren
+// can reassume the same identity instead of guessing. Same guard as connFavCandidateFor:
+// empty for a profile-flow connection, which has no session to replay.
+func (m *Model) tunnelIdentity() (startURL, accountID, accountName, role string) {
+	if m.selSession == nil || m.selAccount == nil || m.awsSess == nil || m.awsSess.RoleName == "" {
+		return "", "", "", ""
+	}
+	return m.selSession.StartURL, m.selAccount.ID, m.selAccount.Name, m.awsSess.RoleName
 }
 
 func (m *Model) buildMainList() {

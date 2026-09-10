@@ -177,6 +177,131 @@ func TestReauthWithLiveTunnelLandsOnManager(t *testing.T) {
 	}
 }
 
+// restoredTunnelModel is a manager with one RDP tunnel marked Restored — as if it survived
+// from a previous run of warren — optionally carrying the identity Reconnect needs to rebuild
+// it.
+func restoredTunnelModel(t *testing.T, withIdentity bool) *Model {
+	t.Helper()
+	m := mainScreenModel(t)
+	tun := &tunnel.Tunnel{
+		PID:          liveHelperPID(t),
+		Kind:         tunnel.KindRDP,
+		LocalPort:    13389,
+		InstanceID:   "i-0abc",
+		InstanceName: "win-01",
+		Restored:     true,
+	}
+	if withIdentity {
+		tun.StartURL = "https://ex.awsapps.com/start"
+		tun.AccountID = "111111111111"
+		tun.AccountName = "cr-lab"
+		tun.RoleName = "AdminRole"
+	}
+	m.manager.Add(tun)
+	m.buildMainList()
+	m.list.Select(0)
+	return m
+}
+
+// The menu says up front that Reconnect on a restored tunnel is not just re-opening a
+// window — it says so because it is about to re-authenticate.
+func TestRestoredTunnelMenuWarnsItWillReauthenticate(t *testing.T) {
+	m := restoredTunnelModel(t, true)
+	m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+
+	var reconnect item
+	for _, it := range m.list.Items() {
+		if i := it.(item); i.value == "reconnect" {
+			reconnect = i
+		}
+	}
+	if !strings.Contains(reconnect.desc, "re-authenticate") {
+		t.Errorf("reconnect row %q does not warn about re-authenticating", reconnect.desc)
+	}
+}
+
+// Without a session to reassume — an older state file, or a profile-flow connection —
+// Reconnect says so plainly instead of trying, and leaves the tunnel for a manual Disconnect.
+func TestReconnectOnRestoredTunnelWithoutIdentityExplainsItCannot(t *testing.T) {
+	m := restoredTunnelModel(t, false)
+	m.sessionActionTunnel = m.manager.Active()[0]
+
+	cmd := m.selectSessionAction("reconnect")
+
+	if cmd != nil {
+		t.Error("a command was returned with nothing to reconnect with")
+	}
+	if !strings.Contains(m.notice, "Disconnect") {
+		t.Errorf("notice %q does not point at Disconnect", m.notice)
+	}
+	if len(m.manager.Active()) != 1 {
+		t.Error("the unreconnectable tunnel was removed instead of left for a manual disconnect")
+	}
+}
+
+// With identity but no matching [sso-session] left in ~/.aws/config, Reconnect reports why
+// rather than silently doing nothing.
+func TestReconnectOnRestoredTunnelWithUnknownSessionErrors(t *testing.T) {
+	m := restoredTunnelModel(t, true)
+	m.sessionActionTunnel = m.manager.Active()[0]
+	m.ssoSessions = nil // the session named in the tunnel is not configured here
+
+	m.selectSessionAction("reconnect")
+
+	if m.err == nil {
+		t.Fatal("m.err = nil, want an explanation that the session is gone")
+	}
+	if len(m.manager.Active()) != 1 {
+		t.Error("the tunnel was removed even though nothing could replace it")
+	}
+}
+
+// The full path: a matching session is on hand, so Reconnect stages the tunnel's own
+// identity — not whatever the model last authenticated as — and starts the sign-in that
+// rebuilds it.
+func TestReconnectOnRestoredTunnelRebuildsWithItsOwnIdentity(t *testing.T) {
+	m := restoredTunnelModel(t, true)
+	tun := m.manager.Active()[0]
+	m.sessionActionTunnel = tun
+	m.ssoSessions = []awsint.SSOSessionConfig{
+		{Name: "crlab", StartURL: tun.StartURL, Region: "eu-west-2"},
+	}
+	// A different identity currently "active", to prove reconnect uses the TUNNEL's, not this.
+	m.selSession = &awsint.SSOSessionConfig{Name: "other", StartURL: "https://other.awsapps.com/start"}
+	m.selAccount = &awsint.Account{ID: "222222222222", Name: "other-account"}
+	m.selRole = "OtherRole"
+
+	cmd := m.selectSessionAction("reconnect")
+
+	if cmd == nil {
+		t.Fatal("no command returned — nothing is fetching a token")
+	}
+	if m.selSession == nil || m.selSession.StartURL != tun.StartURL {
+		t.Errorf("selSession = %+v, want the tunnel's own session", m.selSession)
+	}
+	if m.selAccount == nil || m.selAccount.ID != tun.AccountID {
+		t.Errorf("selAccount = %+v, want account %s", m.selAccount, tun.AccountID)
+	}
+	if m.selRole != tun.RoleName {
+		t.Errorf("selRole = %q, want %q", m.selRole, tun.RoleName)
+	}
+	if m.selInstance == nil || m.selInstance.ID != tun.InstanceID {
+		t.Errorf("selInstance = %+v, want instance %s", m.selInstance, tun.InstanceID)
+	}
+	if m.connType != tunnel.KindRDP {
+		t.Errorf("connType = %v, want KindRDP", m.connType)
+	}
+	if m.resume != resumeConnect {
+		t.Errorf("resume = %v, want resumeConnect", m.resume)
+	}
+	if !m.loading {
+		t.Error("loading = false while the token is being fetched")
+	}
+	if len(m.manager.Active()) != 0 {
+		t.Error("the stale tunnel is still listed — it should be superseded, not doubled up")
+	}
+}
+
 // Esc backs out of the menu to the manager, changing nothing.
 func TestEscLeavesTheTunnelMenu(t *testing.T) {
 	m := tunnelManagerModel(t, tunnel.KindRDP)

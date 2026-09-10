@@ -224,9 +224,23 @@ host up simultaneously — both appear on the manager screen with the port to po
 wherever you like.
 
 **Enter on an active tunnel** opens a small menu rather than killing it outright. For an RDP
-tunnel it leads with **Reconnect** — the port forward is still up, so this just points your
-RDP client at it again after the window was closed, the box rebooted, or the session was
-booted — with **☆ Favorite this connection** under it and an explicit **Disconnect** last.
+tunnel it leads with **Reconnect**, with **☆ Favorite this connection** under it and an
+explicit **Disconnect** last. What Reconnect does depends on whether warren watched this
+tunnel come up:
+
+- Started **this run** of warren — it just points your RDP client at the port again, after
+  the window was closed, the box rebooted, or the session was booted. The port forward is
+  still there; nothing else needs doing.
+- **Survived from a previous run** (warren remembers tunnels across restarts — see below):
+  its plugin process being alive proves nothing about the SSM channel behind it, which
+  routinely dies out from under an otherwise-running plugin — an expired SSO session, SSM's
+  own idle timeout — and used to mean the RDP client just spun until its own timeout. Reconnect
+  now rebuilds it instead: re-authenticate if the token needs it, a fresh port forward, then
+  the client. The row says which behavior to expect before you pick it.
+
+Restart-survival itself got sturdier alongside this: a persisted tunnel's process is now
+checked to actually *be* the session-manager-plugin, not just some process — a reused pid
+(routine after a reboot) used to restore as a tunnel pointing at nothing.
 
 The manager itself was previously reachable only by starting a connection. Whenever a tunnel
 is live, an **Active tunnels (N)** row appears on the action screen and the method screen, so

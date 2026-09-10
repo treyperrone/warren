@@ -37,7 +37,24 @@ type Tunnel struct {
 	LocalPort    int
 	AuthLabel    string
 	SSHUser      string
-	cmd          *exec.Cmd
+
+	// StartURL, AccountID, AccountName, and RoleName are the SSO session, account, and role
+	// this tunnel's credentials came from — everything needed to reassume them later. Empty
+	// for a profile-flow connection, which has no session to replay.
+	StartURL    string
+	AccountID   string
+	AccountName string
+	RoleName    string
+
+	// Restored is true for a tunnel that survived to this launch of warren from a previous
+	// one — loaded from the state file rather than created by this process. Reconnect uses
+	// it to decide whether the tunnel can be trusted at face value: warren watched one it
+	// started come up, but a restored one's SSM channel commonly dies out from under an
+	// otherwise-still-running plugin process (an expired SSO session, SSM's own idle
+	// timeout), with nothing here to notice until a client spins on a dead port.
+	Restored bool
+
+	cmd *exec.Cmd
 }
 
 func (t *Tunnel) Label() string {
@@ -109,6 +126,10 @@ type persistEntry struct {
 	LocalPort    int    `json:"local_port"`
 	AuthLabel    string `json:"auth_label"`
 	SSHUser      string `json:"ssh_user,omitempty"`
+	StartURL     string `json:"start_url,omitempty"`
+	AccountID    string `json:"account_id,omitempty"`
+	AccountName  string `json:"account_name,omitempty"`
+	RoleName     string `json:"role_name,omitempty"`
 }
 
 func NewManager() *Manager {
@@ -135,6 +156,14 @@ func (m *Manager) load() {
 		if !(&Tunnel{PID: e.PID}).Alive() {
 			continue
 		}
+		// A live PID is not enough: PIDs get reused, most commonly across a reboot. The
+		// process warren finds at that number may have nothing to do with the tunnel that
+		// used to be there — kill(pid, 0) cannot tell the difference, but the process's own
+		// command line can. Skipping this means a restored row that looks fine and points at
+		// nothing.
+		if !isPluginProcess(e.PID) {
+			continue
+		}
 		m.tunnels = append(m.tunnels, &Tunnel{
 			PID:          e.PID,
 			Kind:         Kind(e.Kind),
@@ -143,6 +172,11 @@ func (m *Manager) load() {
 			LocalPort:    e.LocalPort,
 			AuthLabel:    e.AuthLabel,
 			SSHUser:      e.SSHUser,
+			StartURL:     e.StartURL,
+			AccountID:    e.AccountID,
+			AccountName:  e.AccountName,
+			RoleName:     e.RoleName,
+			Restored:     true,
 		})
 	}
 }
@@ -159,6 +193,10 @@ func (m *Manager) save() {
 				LocalPort:    t.LocalPort,
 				AuthLabel:    t.AuthLabel,
 				SSHUser:      t.SSHUser,
+				StartURL:     t.StartURL,
+				AccountID:    t.AccountID,
+				AccountName:  t.AccountName,
+				RoleName:     t.RoleName,
 			})
 		}
 	}
