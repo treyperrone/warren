@@ -44,7 +44,27 @@ A scheduled workflow watches for new plugin releases and opens a PR rebuilding f
 
 ## Install
 
-Download a prebuilt binary from the [Releases](https://github.com/treyperrone/warren/releases) page, or build from source:
+### Homebrew (macOS, Linux)
+
+```sh
+brew tap treyperrone/warren
+brew install warren
+```
+
+`brew upgrade warren` later. On Homebrew 6.0+ the first install also asks you to `brew trust treyperrone/warren` — a third-party tap runs its own formula on your machine. A Homebrew install is not quarantined, so macOS does not prompt on first run.
+
+### Prebuilt binary
+
+Grab the archive for your platform from the [Releases](https://github.com/treyperrone/warren/releases) page — `warren_<version>_<os>_<arch>.tar.gz`, or `.zip` on Windows — and unpack the `warren` binary onto your `PATH`:
+
+```sh
+tar xzf warren_*_darwin_arm64.tar.gz
+sudo mv warren /usr/local/bin/        # or anywhere on PATH
+```
+
+`checksums.txt` in the same release verifies the download (`sha256sum -c checksums.txt`). If you download through a browser on macOS, Gatekeeper quarantines the file — clear it with `xattr -d com.apple.quarantine warren`. A `curl`/`scp` transfer or a Homebrew install never sets that attribute.
+
+### From source
 
 ```sh
 go install github.com/treyperrone/warren@latest
