@@ -47,11 +47,11 @@ A scheduled workflow watches for new plugin releases and opens a PR rebuilding f
 ### Homebrew (macOS, Linux)
 
 ```sh
-brew tap treyperrone/warren
+brew tap treyperrone/tap
 brew install warren
 ```
 
-`brew upgrade warren` later. On Homebrew 6.0+ the first install also asks you to `brew trust treyperrone/warren` — a third-party tap runs its own formula on your machine. A Homebrew install is not quarantined, so macOS does not prompt on first run.
+`brew upgrade warren` later. On Homebrew 6.0+ the first tap also asks you to `brew trust treyperrone/tap` — a third-party tap runs its own code on your machine. warren ships as a **cask** (`brew install --cask warren` is the explicit form; the bare name resolves to it), which strips the quarantine flag on install, so macOS does not prompt on first run.
 
 ### Prebuilt binary
 
@@ -382,14 +382,14 @@ Pushing any branch runs the full check set, and the results show up three places
 
 ### Cutting a release
 
-Tags are the trigger. Push a `v*` tag and the release workflow runs the same checks above, then goreleaser builds all five platforms and publishes a GitHub Release with archives and `checksums.txt`:
+Tags are the trigger. Push a `v*` tag and the release workflow runs the same checks above, then goreleaser builds all five platforms, publishes a GitHub Release with archives and `checksums.txt`, and regenerates `Casks/warren.rb` in [`treyperrone/homebrew-tap`](https://github.com/treyperrone/homebrew-tap):
 
 ```sh
 git tag -a v1.0.0 -m "first release"
 git push origin v1.0.0
 ```
 
-Nothing else is manual. To rehearse the whole build without publishing, run the release workflow via **workflow_dispatch** — it builds a snapshot and uploads the archives as run artifacts instead of creating a release.
+Nothing else is manual. The Homebrew cask push needs a `HOMEBREW_TAP_TOKEN` Actions secret — a fine-grained PAT with `contents: write` on the tap repo, since the workflow's default token cannot reach another repo. A pre-release tag or a **workflow_dispatch** dry run (which builds a snapshot and uploads the archives as run artifacts, publishing nothing) skips the cask push.
 
 The release is gated on the CI workflow rather than its own copy of the checks, so a tag can never publish something the checks would have rejected.
 
