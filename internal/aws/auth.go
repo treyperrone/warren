@@ -18,6 +18,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/sso"
 	"github.com/aws/aws-sdk-go-v2/service/ssooidc"
 	ssooidctypes "github.com/aws/aws-sdk-go-v2/service/ssooidc/types"
+	"github.com/aws/smithy-go"
 
 	"github.com/treyperrone/warren/internal/browser"
 	"github.com/treyperrone/warren/internal/homedir"
@@ -824,6 +825,42 @@ func LiveToken(ctx context.Context, sess SSOSessionConfig) (string, error) {
 		return token, nil
 	}
 	return Login(ctx, sess)
+}
+
+// NeedsReauth reports whether err means the SSO session can no longer be used and the
+// device-auth flow is the fix — as opposed to a network blip, a throttle, or an IAM
+// permission gap, none of which a sign-in would help.
+//
+// It is deliberately a tight allowlist. ErrLoginRequired is the signal SilentToken and the
+// background renewal already raise; the OIDC types cover a refresh token the Identity Center
+// rejected; and the STS/SSO API error codes cover a role-credential or API call made with a
+// token that has since expired. AccessDenied and UnauthorizedOperation are NOT included —
+// those are "this identity lacks the permission", which a fresh sign-in as the same identity
+// does not change, and routing them into a browser flow would burn a device code on a wall.
+func NeedsReauth(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, ErrLoginRequired) {
+		return true
+	}
+	var invalidGrant *ssooidctypes.InvalidGrantException
+	var expiredOIDC *ssooidctypes.ExpiredTokenException
+	if errors.As(err, &invalidGrant) || errors.As(err, &expiredOIDC) {
+		return true
+	}
+	var api smithy.APIError
+	if errors.As(err, &api) {
+		switch api.ErrorCode() {
+		case "ExpiredToken", "ExpiredTokenException", "UnauthorizedException", "ForbiddenException":
+			return true
+		}
+	}
+	// String fallback, matching the pattern the polling loop and isSessionEnded already use
+	// for environments where the typed error does not survive wrapping.
+	msg := err.Error()
+	return strings.Contains(msg, "ExpiredToken") ||
+		strings.Contains(msg, "InvalidGrantException")
 }
 
 // isSessionEnded distinguishes "the Identity Center session rejected this refresh token"

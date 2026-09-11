@@ -58,6 +58,11 @@ jobs:
           args: ${{ startsWith(github.ref, 'refs/tags/') && 'release --clean' || 'release --clean --snapshot' }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Lets goreleaser's brews: block commit the regenerated formula to
+          # treyperrone/homebrew-tap, which GITHUB_TOKEN cannot reach. A fine-grained PAT
+          # with contents:write on that repo, added as a repo Actions secret. On a snapshot
+          # dry run the brews step is skipped (skip_upload: auto), so an empty value is fine.
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
 
       # Keeps the artifacts reachable for dispatch runs, which publish nothing.
       - uses: actions/upload-artifact@v4

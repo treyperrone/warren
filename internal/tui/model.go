@@ -60,6 +60,20 @@ const (
 	screenFavoriteRemove // pick favorites to delete
 	screenProfileRemove  // pick an AWS profile to remove from ~/.aws/config
 	screenProfileConfirm // the exact doomed lines + keep/remove
+	screenSessionActions // what to do with an active tunnel: reconnect / favorite / disconnect
+)
+
+// resumeKind is what a successful re-authentication should do once it has rebuilt
+// credentials — pick up the action that hit the expired session, rather than dumping the
+// user back at the method screen to re-navigate.
+type resumeKind int
+
+const (
+	resumeNone      resumeKind = iota
+	resumeActionHub            // the "what next?" screen
+	resumeInstances            // re-list EC2 instances
+	resumeConnect              // re-run the connection: selInstance + connType (+ resumeSSHUser)
+	resumeS3Buckets            // re-list S3 buckets
 )
 
 // ---- list plumbing ---------------------------------------------------------
@@ -172,6 +186,7 @@ type Model struct {
 	accounts    []awsint.Account
 	selAccount  *awsint.Account
 	roles       []string
+	selRole     string // the role most recently chosen, kept so a re-auth can rebuild the same credentials
 	awsSess     *awsint.Session
 
 	// browser preference for SSO sign-in
@@ -242,6 +257,16 @@ type Model struct {
 
 	// tunnel manager
 	manager *tunnel.Manager
+
+	// sessionActionTunnel is the active tunnel whose row was opened on the manager screen —
+	// the target of a reconnect, favorite, or disconnect on screenSessionActions.
+	sessionActionTunnel *tunnel.Tunnel
+
+	// resume is what a successful re-auth should do once credentials are rebuilt, and
+	// resumeSSHUser is the username to reconnect an SSH tunnel as. Set by startReauth,
+	// consumed in the msgCredsReady handler.
+	resume        resumeKind
+	resumeSSHUser string
 
 	// last instance connected to (for banner)
 	lastInstance string
@@ -464,6 +489,13 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.list, cmd = m.list.Update(msg)
 			return m, cmd
 		}
+		// r re-authenticates when the background renewal has given up on the SSO session
+		// (ErrLoginRequired). The credentials on hand may still have minutes left, so this is
+		// offered rather than forced — the header note advertises the key.
+		if msg.String() == "r" && errors.Is(m.credRefreshErr, awsint.ErrLoginRequired) && m.canReauth() {
+			m.credRefreshErr = nil
+			return m, m.startReauth(resumeActionHub)
+		}
 		// x on a highlighted favorite row deletes it, wherever favorites render — the row's
 		// own description advertises the key, because a keybind nobody can see is a feature
 		// nobody has. Guarded on the filter not having focus (typed search text must never
@@ -563,6 +595,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.pendingFavRole = ""
 			m.pendingFavConn = nil
+			m.resume = resumeNone
 			return m, nil
 		}
 		m.token = msg.token
@@ -601,7 +634,13 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case msgAccounts:
 		m.loading = false
+		m.resume = resumeNone
 		if msg.err != nil {
+			if awsint.NeedsReauth(msg.err) && m.selSession != nil {
+				m.err = nil
+				m.loading = true
+				return m, m.fetchToken()
+			}
 			m.err = msg.err
 			return m, nil
 		}
@@ -613,6 +652,11 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case msgRoles:
 		m.loading = false
 		if msg.err != nil {
+			if awsint.NeedsReauth(msg.err) && m.selSession != nil {
+				m.err = nil
+				m.loading = true
+				return m, m.fetchToken()
+			}
 			m.err = msg.err
 			return m, nil
 		}
@@ -633,6 +677,45 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.pendingFavConn != nil {
 			m.loading = true
 			return m, m.fetchInstances()
+		}
+		// A re-auth rebuilt these credentials to pick up something that was interrupted by an
+		// expired session — resume it rather than dumping the user on the action hub.
+		switch m.resume {
+		case resumeInstances:
+			m.resume = resumeNone
+			// A tunnel that outlived the timeout is the thing most worth landing on, and the
+			// manager is the only screen that shows it — its "n" gets to the instance list.
+			if len(m.manager.Active()) > 0 {
+				m.notice = "signed back in — your active tunnels are still here"
+				m.buildMainList()
+				m.screen = screenMain
+				return m, nil
+			}
+			m.loading = true
+			m.screen = screenInstance
+			return m, m.fetchInstances()
+		case resumeConnect:
+			m.resume = resumeNone
+			if m.selInstance != nil {
+				switch m.connType {
+				case tunnel.KindRDP:
+					return m, m.startRDP()
+				case tunnel.KindSSH:
+					return m, m.startSSH(m.resumeSSHUser)
+				}
+			}
+		case resumeS3Buckets:
+			m.resume = resumeNone
+			m.loading = true
+			return m, m.fetchS3Buckets()
+		case resumeActionHub:
+			m.resume = resumeNone
+			if len(m.manager.Active()) > 0 {
+				m.notice = "signed back in — your active tunnels are still here"
+				m.buildMainList()
+				m.screen = screenMain
+				return m, nil
+			}
 		}
 		m.loading = false
 		m.buildActionList()
@@ -665,6 +748,9 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.loading = false
 		if msg.err != nil {
 			m.pendingFavConn = nil
+			if awsint.NeedsReauth(msg.err) && m.canReauth() {
+				return m, m.startReauth(resumeInstances)
+			}
 			m.err = msg.err
 			return m, nil
 		}
@@ -750,6 +836,9 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case msgTunnelReady:
 		m.loading = false
 		if msg.err != nil {
+			if awsint.NeedsReauth(msg.err) && m.canReauth() {
+				return m, m.startReauth(resumeConnect)
+			}
 			m.err = msg.err
 			return m, nil
 		}
@@ -760,7 +849,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// tunnels generally: "now paste localhost:13389 somewhere" was the residue of
 			// not finishing the job. The note reports which client opened, or falls back
 			// to the manual instruction when none is installed.
-			m.notice = tunnel.OpenRDPClient(msg.t.LocalPort, msg.t.SSHUser, browser.LoadRDPScreen() == browser.RDPFullscreen)
+			m.notice = tunnel.OpenRDPClient(msg.t.LocalPort, msg.t.SSHUser, msg.t.InstanceName, browser.LoadRDPScreen() == browser.RDPFullscreen)
 		}
 		m.buildMainList()
 		m.screen = screenMain
@@ -803,6 +892,18 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case msgError:
 		m.loading = false
+		// An expired SSO session that surfaces here — a failed GetRoleCredentials, an S3 call
+		// on a stale token — is recoverable: run the sign-in and pick up where we left off,
+		// rather than dead-ending on "press any key". resumeConnect is not offered from here
+		// because a raw msgError carries no instance context; the tunnel path has its own hook.
+		if awsint.NeedsReauth(msg.err) && m.canReauth() {
+			what := resumeActionHub
+			if m.screen == screenS3Buckets || m.screen == screenS3Objects || m.screen == screenS3Upload {
+				what = resumeS3Buckets
+			}
+			m.pendingFavConn = nil
+			return m, m.startReauth(what)
+		}
 		m.err = msg.err
 		// Any error ends whatever detour was in flight. A stale pendingFavConn surviving
 		// here hijacked the NEXT credential flow into an automatic connection — in whatever
@@ -811,6 +912,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.pendingProfile = ""
 		m.pendingFavRole = ""
 		m.pendingFavConn = nil
+		m.resume = resumeNone
 	}
 
 	// Non-key messages on the setup screen — cursor blink, in particular — belong to the
@@ -954,12 +1056,20 @@ func (m *Model) goBack() tea.Cmd {
 	case screenBuildTask:
 		m.buildServiceList()
 		m.screen = screenBuildService
+	case screenSessionActions:
+		m.sessionActionTunnel = nil
+		m.buildMainList()
+		m.screen = screenMain
 	case screenMain:
-		// The tunnel manager is reached by connecting, so "back" is the hub it was reached
-		// from. With no credentials there is nowhere to go, and staying put beats quitting.
+		// "Back" is the hub the manager was reached from: the action screen once credentials
+		// exist, otherwise the method screen — which the "Active tunnels" row on the method
+		// screen (persisted tunnels, no session yet) can now land here from.
 		if m.awsSess != nil {
 			m.buildActionList()
 			m.screen = screenAction
+		} else {
+			m.buildMethodList()
+			m.screen = screenMethod
 		}
 	}
 	return nil
@@ -993,6 +1103,8 @@ func (m *Model) handleSelect() tea.Cmd {
 		return m.startSSH(selected.value)
 	case screenMain:
 		return m.handleMainSelect(selected.value)
+	case screenSessionActions:
+		return m.selectSessionAction(selected.value)
 	case screenRegion:
 		return m.selectRegion(selected.value)
 	case screenBrowser:
@@ -1037,6 +1149,11 @@ func (m *Model) selectMethod(val string) tea.Cmd {
 	}
 	if val == methodAddSession {
 		return m.StartSetup()
+	}
+	if val == methodTunnels {
+		m.buildMainList()
+		m.screen = screenMain
+		return nil
 	}
 	if val == methodBrowserPref {
 		return m.startBrowserPref()
@@ -1179,6 +1296,7 @@ func (m *Model) Session() *awsint.Session {
 
 func (m *Model) selectRole(role string) tea.Cmd {
 	m.loading = true
+	m.selRole = role
 	return func() tea.Msg {
 		creds, err := awsint.GetRoleCredentials(m.ctx, *m.selSession, m.token, m.selAccount.ID, role)
 		if err != nil {
@@ -1189,6 +1307,36 @@ func (m *Model) selectRole(role string) tea.Cmd {
 		m.awsSess = creds
 		return msgCredsReady{}
 	}
+}
+
+// startReauth runs the interactive device-auth flow for the SSO session behind the current
+// credentials, then rebuilds role credentials and resumes `what`. It is the sso-session
+// counterpart of the profile flow's msgProfileLoginNeeded recovery: an expired session that
+// surfaces as an API error used to be a dead end ("press any key") with esc-esc-esc back to
+// the method screen as the only way forward.
+//
+// It reuses the ordinary sign-in path — fetchToken renders the code on screen and honours
+// the per-session browser override — and the pendingFavRole branch in the msgToken handler,
+// which already knows how to turn a fresh token straight into role credentials.
+func (m *Model) startReauth(what resumeKind) tea.Cmd {
+	m.err = nil
+	m.resume = what
+	role := m.selRole
+	if role == "" && m.awsSess != nil {
+		role = m.awsSess.RoleName
+	}
+	// With a role to reassume, msgToken fetches its credentials directly and msgCredsReady
+	// runs the resume. Without one — an expired token caught while still on the account or
+	// role screen — the plain cold-token path lands back on the account list.
+	m.pendingFavRole = role
+	m.loading = true
+	return m.fetchToken()
+}
+
+// canReauth reports whether startReauth has enough context to rebuild the current identity:
+// a known SSO session and account. Without both, an expired-session error stays an error.
+func (m *Model) canReauth() bool {
+	return m.selSession != nil && m.selAccount != nil
 }
 
 func (m *Model) selectInstance(id string) tea.Cmd {
@@ -1458,10 +1606,14 @@ func writeTmuxConf(conf string) (string, error) {
 func (m *Model) startSSH(user string) tea.Cmd {
 	m.loading = true
 	m.lastInstance = m.selInstance.Name
+	// Remembered so a re-auth triggered by an expired session mid-connect can reconnect the
+	// SSH tunnel as the same user without asking again.
+	m.resumeSSHUser = user
 	port := tunnel.FreePort(2222)
 	instID := m.selInstance.ID
 	instName := m.selInstance.Name
 	authLabel := m.awsSess.Label
+	startURL, accountID, accountName, role := m.tunnelIdentity()
 	return func() tea.Msg {
 		t, err := tunnel.StartPortForward(m.ctx, instID, 22, port, m.awsSess)
 		if err != nil {
@@ -1477,6 +1629,7 @@ func (m *Model) startSSH(user string) tea.Cmd {
 		t.LocalPort = port
 		t.AuthLabel = authLabel
 		t.SSHUser = user
+		t.StartURL, t.AccountID, t.AccountName, t.RoleName = startURL, accountID, accountName, role
 		return msgTunnelReady{t: t}
 	}
 }
@@ -1488,6 +1641,7 @@ func (m *Model) startRDP() tea.Cmd {
 	instID := m.selInstance.ID
 	instName := m.selInstance.Name
 	authLabel := m.awsSess.Label
+	startURL, accountID, accountName, role := m.tunnelIdentity()
 	return func() tea.Msg {
 		t, err := tunnel.StartPortForward(m.ctx, instID, 3389, port, m.awsSess)
 		if err != nil {
@@ -1502,6 +1656,7 @@ func (m *Model) startRDP() tea.Cmd {
 		t.InstanceName = instName
 		t.LocalPort = port
 		t.AuthLabel = authLabel
+		t.StartURL, t.AccountID, t.AccountName, t.RoleName = startURL, accountID, accountName, role
 		return msgTunnelReady{t: t}
 	}
 }
@@ -1518,7 +1673,15 @@ func (m *Model) updateMain(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 	switch msg.String() {
 	case "n":
-		// new connection — go to instance picker
+		// new connection — go to instance picker. Needs credentials; without them (the
+		// manager was opened from the method screen to reach a persisted tunnel) send the
+		// user to pick an identity first.
+		if m.awsSess == nil {
+			m.notice = "pick an authentication method first"
+			m.buildMethodList()
+			m.screen = screenMethod
+			return m, nil
+		}
 		m.loading = true
 		return m, m.fetchInstances()
 	case "p":
@@ -1563,22 +1726,158 @@ func (m *Model) handleMainSelect(val string) tea.Cmd {
 		}
 		return nil
 	case "new":
+		if m.awsSess == nil {
+			m.notice = "pick an authentication method first"
+			m.buildMethodList()
+			m.screen = screenMethod
+			return nil
+		}
 		m.loading = true
 		return m.fetchInstances()
 	case "quit":
 		return tea.Quit
 	default:
-		// kill tunnel by PID stored in value
+		// A tunnel row. Enter used to kill it outright, which is a surprising amount of
+		// destruction for the default action — and no help at all when an RDP client window
+		// was closed but the tunnel behind it is fine. Open a small menu instead: reconnect
+		// (re-open the client), favorite, or an explicit disconnect.
 		for _, t := range m.manager.Active() {
 			if fmt.Sprintf("%d", t.PID) == selected.value {
-				t.Kill()
-				m.manager.Remove(t)
-				m.buildMainList()
+				m.sessionActionTunnel = t
+				m.buildSessionActionsList()
+				m.screen = screenSessionActions
 				return nil
 			}
 		}
 	}
 	return nil
+}
+
+// buildSessionActionsList is the menu shown when Enter opens an active tunnel on the manager
+// screen. Reconnect leads — it is the reason the menu exists — with favorite under it and a
+// deliberate, spelled-out Disconnect last.
+func (m *Model) buildSessionActionsList() {
+	t := m.sessionActionTunnel
+	var items []list.Item
+
+	// Reconnect only means something for RDP: warren launched a client there and can launch
+	// it again. An SSH or Shell tunnel is a bare port forward the user drives themselves —
+	// there is nothing for warren to re-open.
+	if t.Kind == tunnel.KindRDP {
+		desc := fmt.Sprintf("re-open your RDP client on localhost:%d", t.LocalPort)
+		if t.Restored {
+			// Set expectations: this one did not come up under this run of warren, so
+			// Reconnect is about to do more than open a window.
+			desc = "re-authenticate if needed and rebuild the tunnel, then open your RDP client"
+		}
+		items = append(items, item{title: "Reconnect", desc: desc, value: "reconnect"})
+	}
+
+	// Favorite this connection, when the current identity lines up with the tunnel so a
+	// favorite could actually replay it. A local candidate, not m.connFavCandidate: opening
+	// this menu must not disturb the star offered on the manager screen itself.
+	if c := m.connFavCandidateFor(t.InstanceName, strings.ToLower(string(t.Kind)), t.SSHUser); c != nil {
+		if _, saved := browser.FindFavorite(*c); !saved {
+			items = append(items, item{
+				title: "☆ Favorite this connection",
+				desc:  c.InstanceName + " (" + c.ConnType + ") — one Enter from launch next time, as " + c.Nickname,
+				value: "favconn",
+			})
+		}
+	}
+
+	items = append(items, item{
+		title: "Disconnect",
+		desc:  "end this tunnel and remove it from the list",
+		value: "disconnect",
+	})
+
+	m.list.Title = t.Label() + "  •  Esc=back"
+	m.setListItems(items)
+	m.list.Select(0)
+}
+
+// selectSessionAction handles a pick on the active-tunnel menu.
+func (m *Model) selectSessionAction(val string) tea.Cmd {
+	t := m.sessionActionTunnel
+	if t == nil {
+		m.screen = screenMain
+		m.buildMainList()
+		return nil
+	}
+	var cmd tea.Cmd
+	switch val {
+	case "reconnect":
+		cmd = m.reconnectTunnel(t)
+	case "favconn":
+		if c := m.connFavCandidateFor(t.InstanceName, strings.ToLower(string(t.Kind)), t.SSHUser); c != nil {
+			if err := browser.AddFavorite(*c); err != nil {
+				m.err = err
+				return nil
+			}
+			m.notice = "favorited as " + c.Nickname + " — pinned to the picker; Enter there replays this whole connection"
+		}
+	case "disconnect":
+		t.Kill()
+		m.manager.Remove(t)
+		m.notice = t.InstanceName + " tunnel disconnected"
+	}
+	m.sessionActionTunnel = nil
+	m.buildMainList()
+	m.screen = screenMain
+	return cmd
+}
+
+// reconnectTunnel re-opens the RDP client for t, rebuilding the tunnel first when it cannot
+// be trusted at face value.
+//
+// A tunnel warren started this run (t.Restored == false) is trusted: warren watched
+// StartPortForward and WaitPort succeed for it, so this is the fast path — the same call
+// msgTunnelReady makes when the tunnel first comes up.
+//
+// A Restored tunnel survived to this launch from a previous one. Its plugin process being
+// alive proves nothing about the SSM channel behind it, which commonly dies out from under
+// an otherwise-running plugin — an expired SSO session, SSM's own idle timeout — and handing
+// that to an RDP client is what used to spin until the client's own timeout. So it is rebuilt
+// instead: reassume the identity stamped on it (session → account → role, via the ordinary
+// sign-in flow — StartReauth prints a device code if the token needs it), then a fresh
+// StartPortForward, then the client. Everything after "reassume" is the existing resumeConnect
+// path: the same code a re-auth mid-connection already uses.
+func (m *Model) reconnectTunnel(t *tunnel.Tunnel) tea.Cmd {
+	if !t.Restored {
+		m.notice = tunnel.OpenRDPClient(t.LocalPort, t.SSHUser, t.InstanceName, browser.LoadRDPScreen() == browser.RDPFullscreen)
+		return nil
+	}
+	if t.StartURL == "" || t.AccountID == "" || t.RoleName == "" {
+		// Written by an older warren before these fields existed, or a profile-flow
+		// connection, which never had a session to replay in the first place.
+		m.notice = t.InstanceName + " predates this warren session and can't be re-authenticated automatically — Disconnect it and start a new connection"
+		return nil
+	}
+	var sess *awsint.SSOSessionConfig
+	for i := range m.ssoSessions {
+		if m.ssoSessions[i].StartURL == t.StartURL {
+			sess = &m.ssoSessions[i]
+			break
+		}
+	}
+	if sess == nil {
+		m.err = fmt.Errorf("%s's SSO session is no longer in ~/.aws/config — Disconnect it and start a new connection", t.InstanceName)
+		return nil
+	}
+	// Superseded by whatever this produces, one way or another — kept around it would be a
+	// second, permanently dead row once the rebuild lands.
+	m.manager.Remove(t)
+	m.selSession = sess
+	m.selAccount = &awsint.Account{ID: t.AccountID, Name: t.AccountName}
+	// startReauth reassumes m.selRole (falling back to the CURRENT session's role otherwise),
+	// so this has to be set explicitly: the tunnel being reconnected may belong to a
+	// different account/role than whatever this Model last authenticated as.
+	m.selRole = t.RoleName
+	m.selInstance = &awsint.Instance{ID: t.InstanceID, Name: t.InstanceName}
+	m.connType = tunnel.KindRDP
+	m.resumeSSHUser = t.SSHUser
+	return m.startReauth(resumeConnect)
 }
 
 // ---- async commands --------------------------------------------------------
@@ -1645,6 +1944,16 @@ func (m *Model) fetchInstances() tea.Cmd {
 
 func (m *Model) buildMethodList() {
 	var items []list.Item
+	// Active tunnels above everything when there are any: after "p" (switch auth) or a
+	// startup that inherited tunnels from a previous run, this is the only way back to the
+	// manager without connecting to something new.
+	if n := len(m.manager.Active()); n > 0 {
+		items = append(items, item{
+			title: fmt.Sprintf("Active tunnels (%d)", n),
+			desc:  "open the tunnel manager — reconnect, favorite, or disconnect a live session",
+			value: methodTunnels,
+		})
+	}
 	// Favorites first: they exist to be the first thing Enter lands on. Refreshed from disk
 	// on every build so a star toggled on the action screen shows up on the way back. Past
 	// favInlineMax they collapse into a single row — a dozen bookmarks must not bury the
@@ -1798,15 +2107,14 @@ func (m *Model) buildSSHUserList() {
 	m.setListItems(items)
 }
 
-// noteConnFavCandidate remembers the connection that just started as something the tunnel
-// manager can offer to star — only in the sso-session flow, because a favorite replays
-// session → account → role → instance and a profile flow has no such path to replay.
-func (m *Model) noteConnFavCandidate(instanceName, connType, sshUser string) {
+// connFavCandidateFor builds the favorite that would replay this connection, or nil when the
+// current identity cannot describe it — only the sso-session flow can, because a favorite
+// replays session → account → role → instance and a profile flow has no such path.
+func (m *Model) connFavCandidateFor(instanceName, connType, sshUser string) *browser.Favorite {
 	if m.selSession == nil || m.selAccount == nil || m.awsSess == nil || m.awsSess.RoleName == "" || instanceName == "" {
-		m.connFavCandidate = nil
-		return
+		return nil
 	}
-	m.connFavCandidate = &browser.Favorite{
+	return &browser.Favorite{
 		Nickname: profileSlug(m.selAccount.Name, m.awsSess.RoleName) + "-" +
 			profileSlug(instanceName, connType),
 		StartURL:     m.selSession.StartURL,
@@ -1817,6 +2125,23 @@ func (m *Model) noteConnFavCandidate(instanceName, connType, sshUser string) {
 		ConnType:     connType,
 		SSHUser:      sshUser,
 	}
+}
+
+// noteConnFavCandidate remembers the connection that just started as something the tunnel
+// manager can offer to star.
+func (m *Model) noteConnFavCandidate(instanceName, connType, sshUser string) {
+	m.connFavCandidate = m.connFavCandidateFor(instanceName, connType, sshUser)
+}
+
+// tunnelIdentity is the SSO session, account, and role behind the current credentials —
+// stamped onto every tunnel warren starts so a Reconnect that outlives this run of warren
+// can reassume the same identity instead of guessing. Same guard as connFavCandidateFor:
+// empty for a profile-flow connection, which has no session to replay.
+func (m *Model) tunnelIdentity() (startURL, accountID, accountName, role string) {
+	if m.selSession == nil || m.selAccount == nil || m.awsSess == nil || m.awsSess.RoleName == "" {
+		return "", "", "", ""
+	}
+	return m.selSession.StartURL, m.selAccount.ID, m.selAccount.Name, m.awsSess.RoleName
 }
 
 func (m *Model) buildMainList() {

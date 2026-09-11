@@ -8,6 +8,19 @@ and opening SSM sessions — interactive shells, SSH tunnels, or RDP tunnels —
 without needing the `aws` CLI, `session-manager-plugin` installed separately,
 `fzf`, or `jq`.
 
+## Install
+
+**macOS or Linux, the fast way:**
+
+```sh
+brew tap treyperrone/tap
+brew install warren
+```
+
+That's it — run `warren`. (First tap on Homebrew 6.0+ also asks you to `brew trust treyperrone/tap`, since a third-party tap runs its own code on your machine. Later, `brew upgrade warren`.)
+
+No Homebrew, or on Windows? See [other install options](#other-ways-to-install) below.
+
 ## Why "warren"
 
 > **warren** *(n.)* — a network of burrows and connecting passages, with many entrances and no obvious front door. From Anglo-French *warenne*, an enclosed ground where animals were kept.
@@ -42,9 +55,22 @@ Which version is recorded in `internal/plugin/version.txt` and printed by `warre
 
 A scheduled workflow watches for new plugin releases and opens a PR rebuilding from the new tag, so "embedded" does not quietly become "frozen".
 
-## Install
+## Other ways to install
 
-Download a prebuilt binary from the [Releases](https://github.com/treyperrone/warren/releases) page, or build from source:
+The Homebrew tap covers macOS and Linux — see the top of this README if you skipped it. warren ships as a **cask** (`brew install --cask warren` is the explicit form; the bare name resolves to it), which strips the quarantine flag on install, so macOS does not prompt on first run.
+
+### Prebuilt binary (any platform, including Windows)
+
+Grab the archive for your platform from the [Releases](https://github.com/treyperrone/warren/releases) page — `warren_<version>_<os>_<arch>.tar.gz`, or `.zip` on Windows — and unpack the `warren` binary onto your `PATH`:
+
+```sh
+tar xzf warren_*_darwin_arm64.tar.gz
+sudo mv warren /usr/local/bin/        # or anywhere on PATH
+```
+
+`checksums.txt` in the same release verifies the download (`sha256sum -c checksums.txt`). If you download through a browser on macOS, Gatekeeper quarantines the file — clear it with `xattr -d com.apple.quarantine warren`. A `curl`/`scp` transfer or a Homebrew install never sets that attribute.
+
+### From source
 
 ```sh
 go install github.com/treyperrone/warren@latest
@@ -93,7 +119,7 @@ When a sign-in is needed, warren shows the verification URL and the device code 
 
 On the CLI the default is always a pure device-code sign-in: the URL and code print, the URL rides OSC 52 to your local clipboard, and no browser opens — saved overrides included, which stay the TUI's business (the output says when one is being skipped). A browser opens from `warren login` only with `--browser`, which uses your saved browser/profile when one exists and offers the picker otherwise. `--code` forces device-code for one run.
 
-`warren login` covers named profiles too: an SSO-backed profile (modern `sso_session` or legacy inline `sso_start_url`) signs in through its underlying session, and a keys/assume-role profile — which has nothing to sign in to — has its credentials validated instead. The TUI does the same: selecting a profile whose SSO session has expired routes into the sign-in flow and then resolves the profile, rather than dead-ending on "login session has expired, please reauthenticate".
+`warren login` covers named profiles too: an SSO-backed profile (modern `sso_session` or legacy inline `sso_start_url`) signs in through its underlying session, and a keys/assume-role profile — which has nothing to sign in to — has its credentials validated instead. The TUI does the same: selecting a profile whose SSO session has expired routes into the sign-in flow and then resolves the profile, rather than dead-ending on "login session has expired, please reauthenticate". An SSO session that expires **mid-use** — an API call or a tunnel that fails on a stale token after the laptop has slept — is handled the same way: warren runs the sign-in, rebuilds the same account-and-role credentials, and resumes what you were doing, instead of dropping you in the error view to navigate back by hand. Only a genuinely expired session triggers this; a plain permission error still surfaces as one.
 
 Per-session overrides are keyed by the session's start URL, so they survive renaming the `[sso-session]` block, and each one is listed (and removable) on the same ⚙ screen. The choices are saved in `~/.warren_config.json` — warren's own file, following the same rule as everything else it owns: `~/.aws/config` is never written beyond the append-only session bootstrap.
 
@@ -109,7 +135,7 @@ Tunnels are the exception: they are started with the credentials as they stood a
 
 A 300-account Identity Center has maybe five destinations you actually live in. Star one with **☆ Add to favorites** on the action screen and it is pinned to the top of the picker — `★ Corp Lab / AdminRole` — where a single Enter goes straight to credentials, skipping the account and role screens (a cold token still runs the normal sign-in flow first).
 
-Favorites can carry a whole **connection**, not just credentials: when a shell, SSH tunnel, or RDP tunnel starts, the tunnel manager offers **☆ Favorite this connection**. Selecting that pinned row later replays everything — sign-in if needed, role credentials, find the instance, start the tunnel. The instance is remembered by its **Name tag and re-resolved against what is running at launch**, never by instance id, so favorites survive ranges that rebuild their hosts; zero or ambiguous matches drop to the instance list with the reason shown. RDP tunnels also now **open your RDP client themselves** — `mstsc` on Windows, Windows App on macOS (via a generated `.rdp` file), `xfreerdp`/`remmina` on Linux when installed — with the old "point your client at localhost:PORT" line as the fallback when none is found. Clients open **in a window** by default (1600×1000, smart-sized so dragging the window rescales the desktop) rather than taking over the display; the **⚙ RDP sessions open in…** row on the method screen toggles that to full screen, stored as `rdp_screen` in `~/.warren_config.json`. The star also mints a CLI nickname (`corp-lab-adminrole`), so `warren exec corp-lab-adminrole -- aws s3 ls` and `warren shell corp-lab-adminrole` work with no picker and no saved AWS profile — children still read from the auto-renewing loopback endpoint, so nothing goes stale at the hour mark. Favorites live in `~/.warren_config.json`; unstar from the same action screen row. Past four bookmarks the method screen collapses them into a single **★ Favorites (N)** row — Enter, Enter still connects the first — leading to a dedicated screen that also carries the removal flow. Anywhere a favorite row renders, **x removes it** — the row says so. Picking RDP on a box that reports as Linux warns once on the row (and pauses a favorite replay); proceeding records that the box runs xrdp — keyed by account + Name tag, repave-proof — and the warning never returns for it.
+Favorites can carry a whole **connection**, not just credentials: when a shell, SSH tunnel, or RDP tunnel starts, the tunnel manager offers **☆ Favorite this connection**. Selecting that pinned row later replays everything — sign-in if needed, role credentials, find the instance, start the tunnel. The instance is remembered by its **Name tag and re-resolved against what is running at launch**, never by instance id, so favorites survive ranges that rebuild their hosts; zero or ambiguous matches drop to the instance list with the reason shown. RDP tunnels also now **open your RDP client themselves** — `mstsc` on Windows, Windows App on macOS (via a generated `.rdp` file), `xfreerdp`/`remmina` on Linux when installed — with the old "point your client at localhost:PORT" line as the fallback when none is found. The connection is labelled with the instance's Name tag and the local port, so the client's window and bookmark read `web-01 (localhost-13389)` rather than `localhost-13389` — the name tells you which host, the port which tunnel. Clients open **in a window** by default (1600×1000, smart-sized so dragging the window rescales the desktop) rather than taking over the display; the **⚙ RDP sessions open in…** row on the method screen toggles that to full screen, stored as `rdp_screen` in `~/.warren_config.json`. The star also mints a CLI nickname (`corp-lab-adminrole`), so `warren exec corp-lab-adminrole -- aws s3 ls` and `warren shell corp-lab-adminrole` work with no picker and no saved AWS profile — children still read from the auto-renewing loopback endpoint, so nothing goes stale at the hour mark. Favorites live in `~/.warren_config.json`; unstar from the same action screen row. Past four bookmarks the method screen collapses them into a single **★ Favorites (N)** row — Enter, Enter still connects the first — leading to a dedicated screen that also carries the removal flow. Anywhere a favorite row renders, **x removes it** — the row says so. Picking RDP on a box that reports as Linux warns once on the row (and pauses a favorite replay); proceeding records that the box runs xrdp — keyed by account + Name tag, repave-proof — and the warning never returns for it.
 
 Bad `[profile]` blocks can be removed without hand-editing: **✕ Remove an AWS profile** on the method screen previews the exact lines that would be deleted, takes a `.warren.bak` backup, and removes only that block — every other byte of `~/.aws/config` survives verbatim. This is the one deliberate exception to warren's append-only rule, kept safe by being textual surgery rather than a parse-and-rewrite.
 
@@ -136,6 +162,7 @@ The running version is also shown in the TUI's header bar, next to the name.
 | `enter` | select |
 | `n` | new connection (main screen) |
 | `p` | switch auth (main screen) |
+| `r` | re-authenticate — shown on any list when the background renewal has given up on the SSO session |
 | `?` | about — version, keys, and where to report a problem; works on every screen |
 | `q` | quit — active tunnels keep running |
 | `ctrl+c` | quit |
@@ -201,6 +228,31 @@ keeps the terminal, so you can have an RDP forward to a Windows box and an SSH f
 host up simultaneously — both appear on the manager screen with the port to point a client at.
 `SSH` is a forward only: warren hands you the `ssh -p <port> user@localhost` line and you run it
 wherever you like.
+
+**Enter on an active tunnel** opens a small menu rather than killing it outright. For an RDP
+tunnel it leads with **Reconnect**, with **☆ Favorite this connection** under it and an
+explicit **Disconnect** last. What Reconnect does depends on whether warren watched this
+tunnel come up:
+
+- Started **this run** of warren — it just points your RDP client at the port again, after
+  the window was closed, the box rebooted, or the session was booted. The port forward is
+  still there; nothing else needs doing.
+- **Survived from a previous run** (warren remembers tunnels across restarts — see below):
+  its plugin process being alive proves nothing about the SSM channel behind it, which
+  routinely dies out from under an otherwise-running plugin — an expired SSO session, SSM's
+  own idle timeout — and used to mean the RDP client just spun until its own timeout. Reconnect
+  now rebuilds it instead: re-authenticate if the token needs it, a fresh port forward, then
+  the client. The row says which behavior to expect before you pick it.
+
+Restart-survival itself got sturdier alongside this: a persisted tunnel's process is now
+checked to actually *be* the session-manager-plugin, not just some process — a reused pid
+(routine after a reboot) used to restore as a tunnel pointing at nothing.
+
+The manager itself was previously reachable only by starting a connection. Whenever a tunnel
+is live, an **Active tunnels (N)** row appears on the action screen and the method screen, so
+a tunnel that outlived a re-auth — or a warren restart — is always one keypress away. After
+an auto re-auth, warren lands you back on the manager rather than the picker if anything is
+still running.
 
 An SSM shell is different, because it is interactive: it needs a terminal for as long as the session
 lasts. warren opens it in a **new window** where it can, and the TUI stays usable, so several
@@ -350,14 +402,14 @@ Pushing any branch runs the full check set, and the results show up three places
 
 ### Cutting a release
 
-Tags are the trigger. Push a `v*` tag and the release workflow runs the same checks above, then goreleaser builds all five platforms and publishes a GitHub Release with archives and `checksums.txt`:
+Tags are the trigger. Push a `v*` tag and the release workflow runs the same checks above, then goreleaser builds all five platforms, publishes a GitHub Release with archives and `checksums.txt`, and regenerates `Casks/warren.rb` in [`treyperrone/homebrew-tap`](https://github.com/treyperrone/homebrew-tap):
 
 ```sh
 git tag -a v1.0.0 -m "first release"
 git push origin v1.0.0
 ```
 
-Nothing else is manual. To rehearse the whole build without publishing, run the release workflow via **workflow_dispatch** — it builds a snapshot and uploads the archives as run artifacts instead of creating a release.
+Nothing else is manual. The Homebrew cask push needs a `HOMEBREW_TAP_TOKEN` Actions secret — a fine-grained PAT with `contents: write` on the tap repo, since the workflow's default token cannot reach another repo. A pre-release tag or a **workflow_dispatch** dry run (which builds a snapshot and uploads the archives as run artifacts, publishing nothing) skips the cask push.
 
 The release is gated on the CI workflow rather than its own copy of the checks, so a tag can never publish something the checks would have rejected.
 

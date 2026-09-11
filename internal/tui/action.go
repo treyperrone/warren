@@ -22,6 +22,7 @@ const (
 	actionSaveProfile = "saveprofile"
 	actionFavAdd      = "favadd"
 	actionFavRemove   = "favremove"
+	actionTunnels     = "tunnels"
 )
 
 // msgCredsShellDone reports that the credentialed shell exited.
@@ -46,7 +47,20 @@ func cliNote() string {
 // room for it. Without this screen `exec` and `shell` are real but invisible, reachable only
 // by someone who already read the help.
 func (m *Model) buildActionList() {
-	items := []list.Item{
+	var items []list.Item
+
+	// Active tunnels lead when there are any: they are time-sensitive, and the manager —
+	// where you reconnect or tear one down — was otherwise reachable only by starting a new
+	// connection, so a tunnel that outlived a re-auth had nowhere to be seen.
+	if n := len(m.manager.Active()); n > 0 {
+		items = append(items, item{
+			title: fmt.Sprintf("Active tunnels (%d)", n),
+			desc:  "open the tunnel manager — reconnect, favorite, or disconnect a live session",
+			value: actionTunnels,
+		})
+	}
+
+	items = append(items,
 		// First, and therefore the default: connecting to a host is still what the tool is
 		// mostly for, so the established flow costs one extra keystroke and no thought.
 		item{
@@ -69,7 +83,7 @@ func (m *Model) buildActionList() {
 			desc:  "pick a service and a task; edit the command before it runs" + cliNote(),
 			value: actionBuild,
 		},
-	}
+	)
 
 	// Only for the sso-session flow: the block this writes names the session, the account
 	// and the role, and a named-profile flow has no session of its own to point at (it IS
@@ -171,6 +185,10 @@ func (m *Model) selectAction(val string) tea.Cmd {
 		if sessions, profiles, perr := awsint.ParseConfig(); perr == nil {
 			m.ssoSessions, m.profiles = sessions, profiles
 		}
+		return nil
+	case actionTunnels:
+		m.buildMainList()
+		m.screen = screenMain
 		return nil
 	case actionInstances:
 		m.loading = true

@@ -53,3 +53,38 @@ archives:
 
 checksum:
   name_template: checksums.txt
+
+homebrew_casks:
+  # The Homebrew package the tap serves. goreleaser regenerates Casks/warren.rb and commits
+  # it to the tap on every tagged release, so it can never fall behind the way the hand-edited
+  # formula did — the archive names, their sha256s, and the version all come from this build.
+  #
+  # A cask, not a formula: goreleaser deprecated `brews` (it only ever generated "hackyish
+  # formulas" for prebuilt binaries) in favour of casks. `brew install warren` still resolves
+  # to it; `brew install --cask warren` is the explicit form.
+  - name: warren
+    binaries: [warren]
+    repository:
+      owner: treyperrone
+      name: homebrew-tap
+      branch: main
+      # A PAT with contents:write on treyperrone/homebrew-tap. The workflow's default
+      # GITHUB_TOKEN is scoped to this repo alone and cannot push to the tap; this reads the
+      # HOMEBREW_TAP_TOKEN Actions secret instead.
+      token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
+    directory: Casks
+    homepage: "https://github.com/treyperrone/warren"
+    description: "Browse AWS accounts and connect to EC2 instances over SSM"
+    # Only a real vX.Y.Z release moves the cask: "auto" skips the tap push on snapshots
+    # (the workflow_dispatch dry run) and on pre-release tags.
+    skip_upload: "auto"
+    # The binary is not signed or notarised, so macOS quarantines it on a plain download.
+    # Strip that on install — the same thing a `curl`/`scp` transfer avoids entirely — so
+    # `brew install warren` gives a binary that just runs. Proper fix is an Apple Developer
+    # ID and notarisation.
+    hooks:
+      post:
+        install: |
+          if OS.mac?
+            system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{staged_path}/warren"]
+          end

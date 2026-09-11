@@ -45,9 +45,10 @@ func TestQOnMainScreenStillQuits(t *testing.T) {
 	}
 }
 
-// With nothing authenticated there is nowhere to go back to, and quitting would be worse than
-// staying put.
-func TestEscOnMainScreenWithoutCredentialsStaysPut(t *testing.T) {
+// With nothing authenticated, the manager was reached from the method screen (its "Active
+// tunnels" row, for a tunnel that outlived the session) — so esc goes back there. It must
+// still never quit: q and ctrl+c are the only ways out.
+func TestEscOnMainScreenWithoutCredentialsGoesToMethod(t *testing.T) {
 	m := newFormModel(t)
 	m.awsSess = nil
 	m.buildMainList()
@@ -56,10 +57,10 @@ func TestEscOnMainScreenWithoutCredentialsStaysPut(t *testing.T) {
 	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
 
 	if isQuit(t, cmd) {
-		t.Error("esc quit the program when there was nowhere to go back to")
+		t.Error("esc quit the program from the manager")
 	}
-	if m.screen != screenMain {
-		t.Errorf("screen = %v, want to stay on screenMain", m.screen)
+	if m.screen != screenMethod {
+		t.Errorf("screen = %v, want screenMethod — esc goes back to where the manager was opened from", m.screen)
 	}
 }
 
