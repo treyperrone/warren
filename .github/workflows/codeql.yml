@@ -19,7 +19,7 @@ jobs:
   analyze:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Explicit setup-go rather than leaving it to autobuild, so the toolchain matches go.mod
       # and CodeQL analyses the same code the release builds.
