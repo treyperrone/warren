@@ -8,6 +8,19 @@ and opening SSM sessions — interactive shells, SSH tunnels, or RDP tunnels —
 without needing the `aws` CLI, `session-manager-plugin` installed separately,
 `fzf`, or `jq`.
 
+## Install
+
+**macOS or Linux, the fast way:**
+
+```sh
+brew tap treyperrone/tap
+brew install warren
+```
+
+That's it — run `warren`. (First tap on Homebrew 6.0+ also asks you to `brew trust treyperrone/tap`, since a third-party tap runs its own code on your machine. Later, `brew upgrade warren`.)
+
+No Homebrew, or on Windows? See [other install options](#other-ways-to-install) below.
+
 ## Why "warren"
 
 > **warren** *(n.)* — a network of burrows and connecting passages, with many entrances and no obvious front door. From Anglo-French *warenne*, an enclosed ground where animals were kept.
@@ -42,18 +55,11 @@ Which version is recorded in `internal/plugin/version.txt` and printed by `warre
 
 A scheduled workflow watches for new plugin releases and opens a PR rebuilding from the new tag, so "embedded" does not quietly become "frozen".
 
-## Install
+## Other ways to install
 
-### Homebrew (macOS, Linux)
+The Homebrew tap covers macOS and Linux — see the top of this README if you skipped it. warren ships as a **cask** (`brew install --cask warren` is the explicit form; the bare name resolves to it), which strips the quarantine flag on install, so macOS does not prompt on first run.
 
-```sh
-brew tap treyperrone/tap
-brew install warren
-```
-
-`brew upgrade warren` later. On Homebrew 6.0+ the first tap also asks you to `brew trust treyperrone/tap` — a third-party tap runs its own code on your machine. warren ships as a **cask** (`brew install --cask warren` is the explicit form; the bare name resolves to it), which strips the quarantine flag on install, so macOS does not prompt on first run.
-
-### Prebuilt binary
+### Prebuilt binary (any platform, including Windows)
 
 Grab the archive for your platform from the [Releases](https://github.com/treyperrone/warren/releases) page — `warren_<version>_<os>_<arch>.tar.gz`, or `.zip` on Windows — and unpack the `warren` binary onto your `PATH`:
 
