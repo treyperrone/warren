@@ -37,11 +37,12 @@ func TestRDPFileNamedForInstance(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := filepath.Base(path); got != "web-01 (localhost-13389).rdp" {
+	got := filepath.Base(path)
+	if got != "web-01 (localhost-13389).rdp" {
 		t.Errorf("file name = %q, want %q", got, "web-01 (localhost-13389).rdp")
 	}
-	if strings.Contains(path, ":") {
-		t.Errorf("path %q contains a colon — macOS shows that as a slash in the label", path)
+	if strings.Contains(got, ":") {
+		t.Errorf("file name %q contains a colon — macOS shows that as a slash in the label", got)
 	}
 }
 
