@@ -23,7 +23,7 @@ jobs:
 
       # Explicit setup-go rather than leaving it to autobuild, so the toolchain matches go.mod
       # and CodeQL analyses the same code the release builds.
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
           cache: true
