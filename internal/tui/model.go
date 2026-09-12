@@ -857,6 +857,9 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case msgS3Buckets:
 		m.loading = false
 		if msg.err != nil {
+			if awsint.NeedsReauth(msg.err) && m.canReauth() {
+				return m, m.startReauth(resumeS3Buckets)
+			}
 			m.err = msg.err
 			return m, nil
 		}
@@ -867,6 +870,11 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case msgS3Objects:
 		m.loading = false
 		if msg.err != nil {
+			if awsint.NeedsReauth(msg.err) && m.canReauth() {
+				// Lands back on the bucket list rather than the exact prefix — resumeS3Buckets
+				// has no way to carry a bucket/prefix through the sign-in round trip today.
+				return m, m.startReauth(resumeS3Buckets)
+			}
 			m.err = msg.err
 			return m, nil
 		}
@@ -878,6 +886,9 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case msgS3Done:
 		m.loading = false
 		if msg.err != nil {
+			if awsint.NeedsReauth(msg.err) && m.canReauth() {
+				return m, m.startReauth(resumeS3Buckets)
+			}
 			m.err = msg.err
 			return m, nil
 		}
