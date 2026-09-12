@@ -9,6 +9,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/treyperrone/warren/internal/testenv"
 )
@@ -276,6 +277,67 @@ func TestRestoredTunnelIsMarkedRestored(t *testing.T) {
 	}
 	if !live[0].Restored {
 		t.Error("Restored = false for a tunnel loaded from disk")
+	}
+}
+
+// Kill() on a tunnel with no cmd handle (loaded from disk, not spawned by this process) must
+// re-verify the PID is still the plugin before signaling it — the same PID-reuse window
+// isPluginProcess already closes at load() can reopen at any point afterward (the plugin
+// exiting on its own, or SSM's idle timeout), and Kill() is the one place a wrong guess here
+// does real damage: SIGKILL to an unrelated process.
+func TestKillRefusesAPIDThatIsNoLongerThePlugin(t *testing.T) {
+	pid := sleeper(t) // alive, but not the plugin
+	tun := &Tunnel{PID: pid}
+
+	if err := tun.Kill(); err != nil {
+		t.Errorf("Kill() = %v, want nil — refusing to signal is not itself an error", err)
+	}
+	if !aliveByPID(pid) {
+		t.Error("Kill() signaled a process that was never the plugin")
+	}
+}
+
+// The ordinary case: a restored tunnel whose PID genuinely is still the plugin process must
+// still be killable. Uses its own fake-plugin process (rather than pluginSleeper) so the test
+// can Wait() on it directly — kill(pid, 0), what aliveByPID checks, still reports a killed but
+// unreaped child as alive, which would make this test flaky/hang rather than prove anything.
+func TestKillSignalsAGenuineRestoredPlugin(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("isPluginProcess on windows reads Get-Process's Path, which requires the copy below to be run from that exact path — not worth reproducing here")
+	}
+	src, err := exec.LookPath("sleep")
+	if err != nil {
+		t.Skipf("no sleep binary on PATH: %v", err)
+	}
+	data, err := os.ReadFile(src)
+	if err != nil {
+		t.Fatalf("reading %s: %v", src, err)
+	}
+	dst := filepath.Join(t.TempDir(), "session-manager-plugin-testfake")
+	if err := os.WriteFile(dst, data, 0o700); err != nil {
+		t.Fatalf("writing fake plugin: %v", err)
+	}
+	cmd := exec.Command(dst, "30")
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("starting fake plugin: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = cmd.Process.Kill()
+		_, _ = cmd.Process.Wait()
+	})
+
+	tun := &Tunnel{PID: cmd.Process.Pid}
+	if err := tun.Kill(); err != nil {
+		t.Fatalf("Kill() = %v, want nil", err)
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	select {
+	case <-done:
+		// Exited — Kill() actually reached it.
+	case <-time.After(2 * time.Second):
+		t.Fatal("Kill() returned nil but the plugin process was never signaled")
 	}
 }
 
