@@ -220,6 +220,18 @@ func parseArgs() invocation {
 			fmt.Fprintf(os.Stderr, "exec needs a command to run, e.g. warren exec -- aws s3 ls\n\n%s", usage)
 			os.Exit(2)
 		}
+		// Reject a leading flag before the picker/SSO round-trip. Otherwise
+		// `warren exec --help` treats "--help" as the command and only fails later
+		// in LookPath (or with an opaque TTY error when there is no terminal).
+		if argv[0] == "--help" || argv[0] == "-h" {
+			fmt.Print(usage)
+			fmt.Print(pathhint.Hint())
+			os.Exit(0)
+		}
+		if err := rejectExecArgv0(argv[0]); err != nil {
+			fmt.Fprintf(os.Stderr, "%v\n\n%s", err, usage)
+			os.Exit(2)
+		}
 		return invocation{mode: modeExec, argv: argv}
 
 	default:
@@ -242,6 +254,15 @@ func parseArgs() invocation {
 // all, such as the ecs:cluster_task_container form used for ECS exec, so an allowlist of i-/mi-
 // would reject valid targets the moment warren grows to cover them. AWS is the authority on
 // whether a target exists; this only catches arguments that cannot be targets at all.
+// rejectExecArgv0 catches a mistyped flag passed as the command to `warren exec`.
+// Mirrored on parseTarget's leading-"-" check so the error arrives before the picker.
+func rejectExecArgv0(cmd string) error {
+	if strings.HasPrefix(cmd, "-") {
+		return fmt.Errorf("%q looks like a flag, not a command; exec takes no flags", cmd)
+	}
+	return nil
+}
+
 func parseTarget(args []string) (string, error) {
 	if len(args) == 0 {
 		return "", errors.New("ssm-shell needs a target, e.g. warren ssm-shell i-0123456789abcdef0")

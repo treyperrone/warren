@@ -169,3 +169,19 @@ func TestStripInheritedNeutralizationIsANoOpWithNeitherSet(t *testing.T) {
 		t.Errorf("AWS_SHARED_CREDENTIALS_FILE = %q, want it to remain unset", v)
 	}
 }
+
+func TestRejectExecArgv0RejectsFlags(t *testing.T) {
+	for _, cmd := range []string{"--help", "-h", "--region", "-x"} {
+		if err := rejectExecArgv0(cmd); err == nil {
+			t.Errorf("rejectExecArgv0(%q) accepted a flag", cmd)
+		}
+	}
+}
+
+func TestRejectExecArgv0AcceptsCommands(t *testing.T) {
+	for _, cmd := range []string{"aws", "bash", "./bin/tool", "s3"} {
+		if err := rejectExecArgv0(cmd); err != nil {
+			t.Errorf("rejectExecArgv0(%q) = %v, want nil", cmd, err)
+		}
+	}
+}
