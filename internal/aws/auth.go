@@ -1023,12 +1023,27 @@ func GetRoleCredentials(ctx context.Context, sess SSOSessionConfig, token, accou
 		SessionToken:    aws.ToString(out.RoleCredentials.SessionToken),
 		Region:          sess.Region,
 	}
-	// Expiration is epoch milliseconds, and 0 means the API did not say. Left zero in that
-	// case rather than becoming 1970, which would render as "expired".
-	if out.RoleCredentials.Expiration != 0 {
-		s.Expires = time.UnixMilli(out.RoleCredentials.Expiration)
-	}
+	s.Expires = roleCredentialExpiry(out.RoleCredentials.Expiration)
 	return s, nil
+}
+
+// unknownRoleExpiryFallback is the synthetic deadline roleCredentialExpiry assigns when AWS's
+// response omits Expiration. Short enough that a caller re-asks well before the underlying
+// one-hour STS credentials could actually be expired.
+const unknownRoleExpiryFallback = 15 * time.Minute
+
+// roleCredentialExpiry converts the SDK's raw epoch-millisecond Expiration into the Expires
+// value a Session carries. Expiration is 0 when AWS's response did not say — these are still
+// one-hour STS credentials regardless, so a zero here must not read as "never expires" to
+// every consumer of a Session: the TUI's background renewal (internal/tui/creds.go) and the
+// loopback credential server (internal/credserver.KeepFresh) both treat a zero Expires as
+// exactly that and would stop renewing forever. A conservative synthetic deadline keeps them
+// re-asking instead of riding dead keys until something downstream fails outright.
+func roleCredentialExpiry(epochMillis int64) time.Time {
+	if epochMillis != 0 {
+		return time.UnixMilli(epochMillis)
+	}
+	return time.Now().Add(unknownRoleExpiryFallback)
 }
 
 // defaultProfileRegion is used when a named profile sets no region of its own. It matches
