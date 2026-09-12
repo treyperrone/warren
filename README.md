@@ -403,6 +403,23 @@ Pushing any branch runs the full check set, and the results show up three places
 | `go mod verify` | dependency checksums |
 | CodeQL | `security-and-quality`, plus weekly so improved queries reach unchanged code |
 
+### Running checks locally
+
+Building from source needs the Go version in `go.mod` (currently 1.26.6) or newer — Go's toolchain directive fetches it automatically if your installed `go` is older, so this is rarely something to think about, but it explains a build behaving oddly on an old, manually-managed Go install. Everything CI runs can be reproduced locally:
+
+```sh
+go test ./...                # what "go test" checks
+go test ./... -race          # what "go test -race" checks
+gofmt -l .                   # unformatted files, if any (no exit code of its own)
+go vet ./...
+go install honnef.co/go/tools/cmd/staticcheck@v0.7.0 && staticcheck ./...
+go install golang.org/x/vuln/cmd/govulncheck@v1.1.4 && govulncheck ./...
+go install github.com/securego/gosec/v2/cmd/gosec@v2.22.10 && gosec -exclude=G104,G204,G304 -severity=medium ./...
+go mod verify
+```
+
+The tool versions above are pinned to match `.github/workflows/ci.yml` exactly — a newer release of any of them can find something the CI run at HEAD does not, and vice versa.
+
 ### Cutting a release
 
 Tags are the trigger. Push a `v*` tag and the release workflow runs the same checks above, then goreleaser builds all five platforms, publishes a GitHub Release with archives and `checksums.txt`, and regenerates `Casks/warren.rb` in [`treyperrone/homebrew-tap`](https://github.com/treyperrone/homebrew-tap):
