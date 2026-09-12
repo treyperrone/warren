@@ -3,6 +3,7 @@
 package tunnel
 
 import (
+	"os"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -19,9 +20,15 @@ import (
 // plugin package ("…/session-manager-plugin-<hash>") regardless of how warren was launched,
 // so a substring match is reliable without hardcoding that path here.
 func isPluginProcess(pid int) bool {
-	out, err := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "command=").Output()
-	if err != nil {
-		return false
+	if out, err := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "command=").Output(); err == nil {
+		return strings.Contains(string(out), "session-manager-plugin")
 	}
-	return strings.Contains(string(out), "session-manager-plugin")
+	// ps itself may simply not be installed — procps is not part of every minimal container
+	// base image. Rather than that failing closed and dropping every restored tunnel on
+	// load() with no diagnostic, fall back to /proc, the same place ps reads this from on
+	// Linux: present whenever ps would have worked anyway, so this only ever helps.
+	if data, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/cmdline"); err == nil {
+		return strings.Contains(string(data), "session-manager-plugin")
+	}
+	return false
 }
