@@ -153,7 +153,12 @@ func ParseConfig() ([]SSOSessionConfig, []ProfileConfig, error) {
 		}
 		switch {
 		case strings.HasPrefix(curHeader, "sso-session "):
-			name := strings.TrimPrefix(curHeader, "sso-session ")
+			// TrimSpace, not just TrimPrefix: the line-level trim above only strips outside
+			// the brackets, so a hand-edited "[sso-session foo ]" would otherwise name a
+			// session literally called "foo " — invisible, and unreachable by anything that
+			// later matches on this name (a profile's sso_session, or AddSSOSession's
+			// duplicate check), with no error surfaced anywhere.
+			name := strings.TrimSpace(strings.TrimPrefix(curHeader, "sso-session "))
 			var scopes []string
 			for _, s := range strings.Split(cur["sso_registration_scopes"], ",") {
 				if s = strings.TrimSpace(s); s != "" {
@@ -167,7 +172,7 @@ func ParseConfig() ([]SSOSessionConfig, []ProfileConfig, error) {
 				Scopes:   scopes,
 			})
 		case strings.HasPrefix(curHeader, "profile "):
-			name := strings.TrimPrefix(curHeader, "profile ")
+			name := strings.TrimSpace(strings.TrimPrefix(curHeader, "profile ")) // same trailing-space gap as sso-session, above
 			if name != "default" {
 				profiles = append(profiles, ProfileConfig{
 					Name:        name,
@@ -901,10 +906,14 @@ func NeedsReauth(err error) bool {
 		}
 	}
 	// String fallback, matching the pattern the polling loop and isSessionEnded already use
-	// for environments where the typed error does not survive wrapping.
+	// for environments where the typed error does not survive wrapping. Kept in sync with the
+	// smithy.APIError codes above — "ExpiredToken" also matches "ExpiredTokenException" as a
+	// substring, so only the other two needed adding here.
 	msg := err.Error()
 	return strings.Contains(msg, "ExpiredToken") ||
-		strings.Contains(msg, "InvalidGrantException")
+		strings.Contains(msg, "InvalidGrantException") ||
+		strings.Contains(msg, "UnauthorizedException") ||
+		strings.Contains(msg, "ForbiddenException")
 }
 
 // isSessionEnded distinguishes "the Identity Center session rejected this refresh token"

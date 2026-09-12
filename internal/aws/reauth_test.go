@@ -22,6 +22,8 @@ func TestNeedsReauth(t *testing.T) {
 		{"SSO UnauthorizedException", &smithy.GenericAPIError{Code: "UnauthorizedException"}, true},
 		{"SSO ForbiddenException", &smithy.GenericAPIError{Code: "ForbiddenException"}, true},
 		{"string fallback ExpiredToken", errors.New("operation error SSM: StartSession, ExpiredToken: ..."), true},
+		{"string fallback UnauthorizedException", errors.New("operation error SSO: ListAccounts, UnauthorizedException: ..."), true},
+		{"string fallback ForbiddenException", errors.New("operation error SSO: ListAccounts, ForbiddenException: ..."), true},
 
 		// The near misses that must NOT loop into a browser: a fresh sign-in as the same
 		// identity does not grant a permission it never had.

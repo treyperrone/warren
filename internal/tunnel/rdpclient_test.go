@@ -1,9 +1,12 @@
 package tunnel
 
 import (
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
+	"time"
 )
 
 // The .rdp document format is what Windows App parses; a wrong key silently opens the
@@ -86,6 +89,57 @@ func TestRDPFileSlug(t *testing.T) {
 			t.Errorf("rdpFileSlug(%q) = %q, want %q", in, got, want)
 		}
 	}
+}
+
+// A launcher that exits non-zero right away (macOS's `open` with no handler for the file, a
+// binary that can't actually run) must be reported as a failure, not "opened" — Start()
+// succeeding only means the binary exists and is executable, not that it did anything.
+func TestLaunchReportsAFastFailure(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("sh -c is unix-specific")
+	}
+	start := time.Now()
+	err := launch(exec.Command("sh", "-c", "exit 7"))
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("launch() = nil, want an error for a process that exited non-zero")
+	}
+	if elapsed >= launchGrace {
+		t.Errorf("took %s to report a fast failure — a full grace-period wait, not a fast one", elapsed)
+	}
+}
+
+// A launcher that hands off and exits 0 quickly (open(1) successfully handing a .rdp file to
+// Windows App, which is a separate process) is the ordinary success case, not a failure.
+func TestLaunchReportsSuccessForAQuickCleanExit(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("sh -c is unix-specific")
+	}
+	if err := launch(exec.Command("sh", "-c", "exit 0")); err != nil {
+		t.Errorf("launch() = %v, want nil for a clean exit", err)
+	}
+}
+
+// The overwhelmingly common case: a real GUI client that is still running well past the grace
+// period. launch() must wait it out and report success, not mistake "hasn't exited yet" for
+// failure.
+func TestLaunchReportsSuccessForAStillRunningProcess(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("sleep is unix-specific")
+	}
+	cmd := exec.Command("sleep", "2")
+	start := time.Now()
+	err := launch(cmd)
+	elapsed := time.Since(start)
+
+	if err != nil {
+		t.Errorf("launch() = %v, want nil for a process still running", err)
+	}
+	if elapsed < launchGrace {
+		t.Errorf("returned after %s, want it to wait out the full %s grace period", elapsed, launchGrace)
+	}
+	_ = cmd.Process.Kill() // launch()'s own goroutine will Wait() it; this just ends it early
 }
 
 // The full-screen variant is mode 2 with no fixed geometry — the display decides.

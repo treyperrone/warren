@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 )
 
 // OpenRDPClient launches the platform's RDP client pointed at the forwarded port, so an RDP
@@ -14,15 +15,31 @@ import (
 // The returned note says what happened either way — including the no-client case, where the
 // old manual instruction is still the right answer. Launch failures degrade to that note
 // rather than an error: the tunnel is up and usable, which is the part that matters.
-// launch starts a client and reaps it in the background: warren keeps running to manage
-// the tunnel, and a Start without Wait leaves the exited client a zombie for that whole
-// lifetime on unix.
+// launchGrace is how long launch waits to see whether the child exited immediately, before
+// deciding it's a real, still-running client rather than a fast failure — long enough to catch
+// "the file has no registered handler" (macOS's open) or "the binary can't actually run" (no
+// DISPLAY, a missing shared library), short enough that no real client's own startup time is
+// ever mistaken for one.
+const launchGrace = 500 * time.Millisecond
+
+// launch starts a client and reaps it in the background: warren keeps running to manage the
+// tunnel, and a Start without Wait leaves the exited client a zombie for that whole lifetime on
+// unix. It also waits briefly to catch a fast failure a Start-only check cannot see — the
+// binary existing and being executable is not the same as it actually opening a session — and
+// reports that as an error so the caller falls back to the manual instruction instead of
+// claiming "opened" over what silently failed.
 func launch(cmd *exec.Cmd) error {
 	if err := cmd.Start(); err != nil {
 		return err
 	}
-	go func() { _ = cmd.Wait() }()
-	return nil
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(launchGrace):
+		return nil // still running after the grace period — the ordinary, successful case
+	}
 }
 
 // fullscreen selects the client's presentation; see browser.RDPScreen for the setting.

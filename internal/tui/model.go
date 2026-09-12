@@ -2144,9 +2144,8 @@ func (m *Model) connFavCandidateFor(instanceName, connType, sshUser string) *bro
 	if m.selSession == nil || m.selAccount == nil || m.awsSess == nil || m.awsSess.RoleName == "" || instanceName == "" {
 		return nil
 	}
-	return &browser.Favorite{
-		Nickname: profileSlug(m.selAccount.Name, m.awsSess.RoleName) + "-" +
-			profileSlug(instanceName, connType),
+	base := profileSlug(m.selAccount.Name, m.awsSess.RoleName) + "-" + profileSlug(instanceName, connType)
+	fav := browser.Favorite{
 		StartURL:     m.selSession.StartURL,
 		AccountID:    m.selAccount.ID,
 		AccountName:  m.selAccount.Name,
@@ -2155,6 +2154,8 @@ func (m *Model) connFavCandidateFor(instanceName, connType, sshUser string) *bro
 		ConnType:     connType,
 		SSHUser:      sshUser,
 	}
+	fav.Nickname = browser.UniqueNickname(base, fav)
+	return &fav
 }
 
 // noteConnFavCandidate remembers the connection that just started as something the tunnel
