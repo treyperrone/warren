@@ -139,16 +139,23 @@ func NewManager() *Manager {
 	return m
 }
 
-func (m *Manager) load() {
-	data, err := os.ReadFile(m.file)
+// readEntries reads and parses the state file, returning (nil, nil) if it doesn't exist yet or
+// is unreadable/corrupt — a crash mid-write is the ordinary way to produce the latter, and it
+// must read as "nothing persisted" rather than propagate a parse error nobody would act on.
+func readEntries(file string) []persistEntry {
+	data, err := os.ReadFile(file)
 	if err != nil {
-		return
+		return nil
 	}
 	var entries []persistEntry
 	if json.Unmarshal(data, &entries) != nil {
-		return
+		return nil
 	}
-	for _, e := range entries {
+	return entries
+}
+
+func (m *Manager) load() {
+	for _, e := range readEntries(m.file) {
 		// aliveByPID, not proc.Signal(os.Signal(nil)) — that returns "unsupported signal type"
 		// for every process, so this loop discarded every persisted tunnel and warren came back
 		// up believing it had none. The same mistake was fixed in Alive(); this copy survived it,
@@ -183,6 +190,7 @@ func (m *Manager) load() {
 
 func (m *Manager) save() {
 	var entries []persistEntry
+	seen := make(map[int]bool, len(m.tunnels))
 	for _, t := range m.tunnels {
 		if t.Alive() {
 			entries = append(entries, persistEntry{
@@ -198,10 +206,50 @@ func (m *Manager) save() {
 				AccountName:  t.AccountName,
 				RoleName:     t.RoleName,
 			})
+			seen[t.PID] = true
 		}
 	}
+	// A second warren process on the same box has its own in-memory tunnel list and calls
+	// save() independently — a plain overwrite here would silently drop whatever it persisted
+	// since this process last loaded. Folding in still-live entries already on disk turns
+	// "whoever saves last wins" into "the union survives" without needing a cross-process
+	// lock for the common case.
+	for _, e := range readEntries(m.file) {
+		if seen[e.PID] {
+			continue
+		}
+		if !(&Tunnel{PID: e.PID}).Alive() {
+			continue
+		}
+		entries = append(entries, e)
+		seen[e.PID] = true
+	}
 	data, _ := json.MarshalIndent(entries, "", "  ")
-	_ = os.WriteFile(m.file, data, 0600)
+	writeFileAtomic(m.file, data, 0600)
+}
+
+// writeFileAtomic writes to a temp file in the same directory and renames it into place, so a
+// crash or a concurrent reader never observes a truncated or half-written state file — the
+// rename is what os.WriteFile's truncate-then-write cannot offer.
+func writeFileAtomic(path string, data []byte, perm os.FileMode) {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, ".warren_sessions-*.tmp")
+	if err != nil {
+		return
+	}
+	defer os.Remove(tmp.Name()) // no-op once the rename below succeeds
+	if err := tmp.Chmod(perm); err != nil {
+		_ = tmp.Close()
+		return
+	}
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return
+	}
+	if tmp.Close() != nil {
+		return
+	}
+	_ = os.Rename(tmp.Name(), path)
 }
 
 func (m *Manager) Add(t *Tunnel) {
