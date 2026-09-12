@@ -135,6 +135,43 @@ func TestRKeyReauthenticatesWhenRenewalGaveUp(t *testing.T) {
 	}
 }
 
+// r pressed while browsing instances must resume the instance list, not drop to the action
+// hub — the whole point of pressing it there instead of backing out first.
+func TestRKeyFromInstanceListResumesThere(t *testing.T) {
+	m := reauthReadyModel(t)
+	m.credRefreshErr = awsint.ErrLoginRequired
+	m.instances = []awsint.Instance{{ID: "i-0aaa", Name: "win-01"}}
+	m.buildInstanceList()
+	m.screen = screenInstance
+
+	_, cmd := m.Update(keyRunes('r'))
+
+	if cmd == nil {
+		t.Fatal("r did nothing while a sign-in was needed")
+	}
+	if m.resume != resumeInstances {
+		t.Errorf("m.resume = %v, want resumeInstances", m.resume)
+	}
+}
+
+// Same, for the S3 bucket/object screens.
+func TestRKeyFromS3BucketsResumesThere(t *testing.T) {
+	m := reauthReadyModel(t)
+	m.credRefreshErr = awsint.ErrLoginRequired
+	m.s3Buckets = []string{"b1"}
+	m.buildS3BucketList()
+	m.screen = screenS3Buckets
+
+	_, cmd := m.Update(keyRunes('r'))
+
+	if cmd == nil {
+		t.Fatal("r did nothing while a sign-in was needed")
+	}
+	if m.resume != resumeS3Buckets {
+		t.Errorf("m.resume = %v, want resumeS3Buckets", m.resume)
+	}
+}
+
 // r is inert when there is nothing to re-authenticate — it is an ordinary key then.
 func TestRKeyDoesNothingWithoutAPendingSignIn(t *testing.T) {
 	m := reauthReadyModel(t)
