@@ -1866,7 +1866,10 @@ func (m *Model) reconnectTunnel(t *tunnel.Tunnel) tea.Cmd {
 		return nil
 	}
 	// Superseded by whatever this produces, one way or another — kept around it would be a
-	// second, permanently dead row once the rebuild lands.
+	// second, permanently dead row once the rebuild lands. Kill it first: Remove alone only
+	// drops it from the manager's list, leaving the old session-manager-plugin process (and
+	// its bound port) running and untracked forever.
+	_ = t.Kill()
 	m.manager.Remove(t)
 	m.selSession = sess
 	m.selAccount = &awsint.Account{ID: t.AccountID, Name: t.AccountName}
