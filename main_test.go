@@ -138,6 +138,13 @@ func TestUsageDocumentsSSMShell(t *testing.T) {
 	}
 }
 
+// --code is a real, working flag (parseLoginArgs, login.go) that `warren help` never mentioned.
+func TestUsageDocumentsLoginCodeFlag(t *testing.T) {
+	if !strings.Contains(usage, "warren login --code") {
+		t.Error("usage text does not mention warren login --code")
+	}
+}
+
 // The bug this guards: `warren shell`/`exec` set AWS_CONFIG_FILE and AWS_SHARED_CREDENTIALS_FILE
 // on the child to a sentinel so that child's own AWS calls cannot see an ambient [default]
 // profile — see internal/awsexec.Env. That child, for `warren shell`, is an ordinary interactive

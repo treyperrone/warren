@@ -34,6 +34,7 @@ usage:
                              shown, URL sent to your local clipboard (OSC 52)
   warren login --browser     opt in to opening a browser (uses your saved browser/profile,
                              or asks when nothing is saved)
+  warren login --code        force device-code for this run even with a saved browser default
   warren login --status      report token liveness without signing in; exit 0 live, 1 not
   warren creds ...           credential_process provider (see: profiles that never go stale)
   warren setup               add an [sso-session] block to ~/.aws/config

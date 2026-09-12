@@ -87,6 +87,7 @@ warren ssm-shell <target>       # pick an account and role, then open an SSM she
 warren ssm-shell <fav> <target> # open an SSM shell on <target> as a favorited account+role, no picker
 warren login [identity]    # sign in without the TUI: device-code by default (URL + code + OSC 52 clipboard)
 warren login --browser     # the only way login opens a browser: saved browser/profile, or a picker
+warren login --code        # force device-code for this run even with a saved browser default
 warren login --status      # report token liveness without signing in; exit 0 live, 1 not
 warren creds ...           # credential_process provider — profiles that never go stale
 warren setup               # add an [sso-session] block to ~/.aws/config
