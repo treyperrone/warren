@@ -104,6 +104,15 @@ func (t *Tunnel) Kill() error {
 	if t.cmd != nil && t.cmd.Process != nil {
 		return t.cmd.Process.Kill()
 	}
+	// No cmd handle means this tunnel was loaded from disk, not spawned by this process — its
+	// PID was verified to be the plugin once, at load() time, but could have been reused by an
+	// unrelated process any time since (the plugin exiting on its own, or SSM's idle timeout).
+	// Re-check right before signaling: kill(pid, 0) can't tell a reused PID from the original,
+	// but the process's own command line still can, and getting this wrong means SIGKILL-ing
+	// whatever now holds that number.
+	if !isPluginProcess(t.PID) {
+		return nil
+	}
 	proc, err := os.FindProcess(t.PID)
 	if err != nil {
 		return err

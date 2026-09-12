@@ -1,7 +1,9 @@
 package tui
 
 import (
+	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
@@ -303,24 +305,58 @@ func TestReconnectOnRestoredTunnelRebuildsWithItsOwnIdentity(t *testing.T) {
 	}
 }
 
-// The full rebuild path must not just drop the superseded tunnel from the manager's list — it
-// must kill the underlying process, or every rebuilt reconnect leaks one session-manager-plugin
-// process (and its bound port) forever.
-func TestReconnectOnRestoredTunnelKillsTheOldProcess(t *testing.T) {
-	m := mainScreenModel(t)
+// fakePluginProcess starts a long-lived process whose command line/path contains
+// "session-manager-plugin", so it passes isPluginProcess the same way the real plugin would —
+// needed because Kill() (fixed alongside issue #15) now refuses to signal a Restored tunnel's
+// PID unless it still looks like the plugin.
+func fakePluginProcess(t *testing.T) *exec.Cmd {
+	t.Helper()
+	var src string
+	var err error
+	if runtime.GOOS == "windows" {
+		src = os.Getenv("COMSPEC") // cmd.exe
+		if src == "" {
+			src = "C:\\Windows\\System32\\cmd.exe"
+		}
+	} else {
+		src, err = exec.LookPath("sleep")
+		if err != nil {
+			t.Skipf("no sleep binary on PATH: %v", err)
+		}
+	}
+	data, err := os.ReadFile(src)
+	if err != nil {
+		t.Fatalf("reading %s: %v", src, err)
+	}
+	dst := filepath.Join(t.TempDir(), "session-manager-plugin-testfake")
+	if runtime.GOOS == "windows" {
+		dst += ".exe"
+	}
+	if err := os.WriteFile(dst, data, 0o700); err != nil {
+		t.Fatalf("writing fake plugin: %v", err)
+	}
 	var cmd *exec.Cmd
 	if runtime.GOOS == "windows" {
-		cmd = exec.Command("cmd.exe", "/C", "ping -n 30 127.0.0.1 > NUL")
+		cmd = exec.Command(dst, "/C", "ping -n 30 127.0.0.1 > NUL")
 	} else {
-		cmd = exec.Command("sleep", "30")
+		cmd = exec.Command(dst, "30")
 	}
 	if err := cmd.Start(); err != nil {
-		t.Fatalf("starting a helper process: %v", err)
+		t.Fatalf("starting fake plugin: %v", err)
 	}
 	t.Cleanup(func() {
 		_ = cmd.Process.Kill()
 		_, _ = cmd.Process.Wait()
 	})
+	return cmd
+}
+
+// The full rebuild path must not just drop the superseded tunnel from the manager's list — it
+// must kill the underlying process, or every rebuilt reconnect leaks one session-manager-plugin
+// process (and its bound port) forever.
+func TestReconnectOnRestoredTunnelKillsTheOldProcess(t *testing.T) {
+	m := mainScreenModel(t)
+	cmd := fakePluginProcess(t)
 
 	tun := &tunnel.Tunnel{
 		PID:          cmd.Process.Pid,
