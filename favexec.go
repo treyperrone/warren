@@ -84,6 +84,10 @@ func runFavorite(ctx context.Context, fav browser.Favorite, run invocation) int 
 		who += "  •  credentials expire in " + left
 	}
 	fmt.Fprintf(os.Stderr, "%s\n", who)
+
+	if run.mode == modeSSMShell {
+		return runSSMShell(ctx, sess, run.target)
+	}
 	if run.mode == modeShell {
 		fmt.Fprintf(os.Stderr, "%s is set; exit the shell to return.\n", awsexec.SessionLabelVar)
 	}
