@@ -152,16 +152,12 @@ func emitCreds(s *awsint.Session) int {
 		SecretAccessKey: s.SecretAccessKey,
 		SessionToken:    s.SessionToken,
 	}
-	// Expiration is what tells the SDK when to call again; the contract reads a missing
-	// field as LONG-TERM credentials, cached for the process's life. These are one-hour STS
-	// credentials whatever the API said, so when it did not say (Expiration==0), a
-	// conservative synthetic deadline keeps callers re-asking instead of riding dead keys.
-	exp := s.Expires
-	if exp.IsZero() && s.SessionToken != "" {
-		exp = time.Now().Add(15 * time.Minute)
-	}
-	if !exp.IsZero() {
-		out.Expiration = exp.UTC().Format(time.RFC3339)
+	// Expiration is what tells the SDK when to call again; the contract reads a missing field
+	// as LONG-TERM credentials, cached for the process's life. GetRoleCredentials always sets
+	// Expires — synthesizing a conservative deadline itself when AWS's response omits one — so
+	// there is nothing to guard against here beyond the type's own zero value.
+	if !s.Expires.IsZero() {
+		out.Expiration = s.Expires.UTC().Format(time.RFC3339)
 	}
 	data, err := json.Marshal(out)
 	if err != nil {

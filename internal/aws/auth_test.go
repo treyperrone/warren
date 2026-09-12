@@ -40,6 +40,31 @@ func writeCacheFile(t *testing.T, dir, name string, rec tokenRecord) {
 	}
 }
 
+// roleCredentialExpiry is what stops a zero Expiration from AWS reading as "never expires" to
+// every consumer of a Session — internal/tui/creds.go's needsCredRefresh and
+// internal/credserver.KeepFresh both treat a zero Expires exactly that way and would stop
+// renewing an otherwise real one-hour STS credential forever.
+func TestRoleCredentialExpiryUsesTheRealValue(t *testing.T) {
+	want := time.Date(2026, 3, 4, 12, 0, 0, 0, time.UTC)
+	got := roleCredentialExpiry(want.UnixMilli())
+	if !got.Equal(want) {
+		t.Errorf("roleCredentialExpiry(%d) = %v, want %v", want.UnixMilli(), got, want)
+	}
+}
+
+func TestRoleCredentialExpirySynthesizesAFallbackWhenAWSOmitsIt(t *testing.T) {
+	before := time.Now()
+	got := roleCredentialExpiry(0)
+	after := time.Now()
+
+	if got.IsZero() {
+		t.Fatal("got the zero value — every downstream consumer reads that as \"never expires\"")
+	}
+	if got.Before(before.Add(unknownRoleExpiryFallback)) || got.After(after.Add(unknownRoleExpiryFallback)) {
+		t.Errorf("got = %v, want roughly now+%s", got, unknownRoleExpiryFallback)
+	}
+}
+
 func TestLive(t *testing.T) {
 	tests := []struct {
 		name string
