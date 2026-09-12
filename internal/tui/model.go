@@ -491,10 +491,12 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		// r re-authenticates when the background renewal has given up on the SSO session
 		// (ErrLoginRequired). The credentials on hand may still have minutes left, so this is
-		// offered rather than forced — the header note advertises the key.
+		// offered rather than forced — the header note advertises the key. Resumes wherever
+		// this key was actually pressed — browsing instances or an S3 bucket — rather than
+		// always dropping back to the action hub, the same mapping msgError uses below.
 		if msg.String() == "r" && errors.Is(m.credRefreshErr, awsint.ErrLoginRequired) && m.canReauth() {
 			m.credRefreshErr = nil
-			return m, m.startReauth(resumeActionHub)
+			return m, m.startReauth(m.resumeKindForCurrentScreen())
 		}
 		// x on a highlighted favorite row deletes it, wherever favorites render — the row's
 		// own description advertises the key, because a keybind nobody can see is a feature
@@ -908,12 +910,8 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// rather than dead-ending on "press any key". resumeConnect is not offered from here
 		// because a raw msgError carries no instance context; the tunnel path has its own hook.
 		if awsint.NeedsReauth(msg.err) && m.canReauth() {
-			what := resumeActionHub
-			if m.screen == screenS3Buckets || m.screen == screenS3Objects || m.screen == screenS3Upload {
-				what = resumeS3Buckets
-			}
 			m.pendingFavConn = nil
-			return m, m.startReauth(what)
+			return m, m.startReauth(m.resumeKindForCurrentScreen())
 		}
 		m.err = msg.err
 		// Any error ends whatever detour was in flight. A stale pendingFavConn surviving
@@ -1348,6 +1346,24 @@ func (m *Model) startReauth(what resumeKind) tea.Cmd {
 // a known SSO session and account. Without both, an expired-session error stays an error.
 func (m *Model) canReauth() bool {
 	return m.selSession != nil && m.selAccount != nil
+}
+
+// resumeKindForCurrentScreen maps the screen a reauth was triggered from to what should be
+// resumed afterward, so both the automatic path (msgError) and the manual one (the "r" key)
+// land back where the user actually was instead of always dropping to the action hub.
+//
+// Deliberately does not attempt resumeConnect for the connection-type/SSH-user screens: unlike
+// an instance list or an S3 bucket, a connection in progress has no committed target yet to
+// resume — landing on the action hub there is a fallback, not a regression this introduces.
+func (m *Model) resumeKindForCurrentScreen() resumeKind {
+	switch m.screen {
+	case screenInstance:
+		return resumeInstances
+	case screenS3Buckets, screenS3Objects, screenS3Upload:
+		return resumeS3Buckets
+	default:
+		return resumeActionHub
+	}
 }
 
 func (m *Model) selectInstance(id string) tea.Cmd {
