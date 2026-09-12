@@ -102,6 +102,72 @@ func TestParentPrefix(t *testing.T) {
 	}
 }
 
+// An expired token surfacing on any S3 call must run the sign-in and come back to the bucket
+// list, not dead-end in the error view — the same recovery every other AWS call already gets.
+func TestS3BucketsExpiredTokenTriggersReauth(t *testing.T) {
+	m := reauthReadyModel(t)
+
+	_, cmd := m.Update(msgS3Buckets{err: awsint.ErrLoginRequired})
+
+	if m.err != nil {
+		t.Fatalf("m.err = %v, want nil — the error should have become a re-auth", m.err)
+	}
+	if m.resume != resumeS3Buckets {
+		t.Errorf("m.resume = %v, want resumeS3Buckets", m.resume)
+	}
+	if cmd == nil {
+		t.Error("no command returned — nothing is fetching the token")
+	}
+}
+
+func TestS3ObjectsExpiredTokenTriggersReauth(t *testing.T) {
+	m := reauthReadyModel(t)
+
+	_, cmd := m.Update(msgS3Objects{err: awsint.ErrLoginRequired})
+
+	if m.err != nil {
+		t.Fatalf("m.err = %v, want nil — the error should have become a re-auth", m.err)
+	}
+	if m.resume != resumeS3Buckets {
+		t.Errorf("m.resume = %v, want resumeS3Buckets", m.resume)
+	}
+	if cmd == nil {
+		t.Error("no command returned — nothing is fetching the token")
+	}
+}
+
+func TestS3DoneExpiredTokenTriggersReauth(t *testing.T) {
+	m := reauthReadyModel(t)
+
+	_, cmd := m.Update(msgS3Done{err: awsint.ErrLoginRequired})
+
+	if m.err != nil {
+		t.Fatalf("m.err = %v, want nil — the error should have become a re-auth", m.err)
+	}
+	if m.resume != resumeS3Buckets {
+		t.Errorf("m.resume = %v, want resumeS3Buckets", m.resume)
+	}
+	if cmd == nil {
+		t.Error("no command returned — nothing is fetching the token")
+	}
+}
+
+// A genuine permission error on an S3 call must NOT loop into re-auth — same rule as every
+// other AWS call.
+func TestS3PermissionErrorDoesNotTriggerReauth(t *testing.T) {
+	m := reauthReadyModel(t)
+	permErr := errors.New("AccessDenied: not authorized to perform s3:ListBucket")
+
+	m.Update(msgS3Buckets{err: permErr})
+
+	if m.err == nil {
+		t.Fatal("m.err = nil, want the permission error to surface")
+	}
+	if m.resume != resumeNone {
+		t.Errorf("m.resume = %v, want resumeNone — a permission error must not queue a resume", m.resume)
+	}
+}
+
 // Esc from a nested level walks up one prefix — but the coordinates only COMMIT when the
 // parent's listing arrives. A failed ascent must leave state and screen agreeing on the
 // level actually shown, or an upload after a network blip targets a level nobody saw.
