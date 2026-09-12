@@ -62,6 +62,16 @@ func main() {
 	stripInheritedNeutralization()
 	run := parseArgs()
 
+	// Every invocation that reaches this point launches the interactive picker one way or
+	// another — a favorite-nickname shortcut for exec/shell/ssm-shell already exited inside
+	// parseArgs without it. Without stdin, bubbletea's own "could not open a new TTY" (or a
+	// bare OS error) is what a script sees instead — accurate, but useless: it names neither
+	// warren nor the fix.
+	if !canOpenTerminal() {
+		fmt.Fprintln(os.Stderr, noTTYMessage(run))
+		os.Exit(2)
+	}
+
 	ctx := context.Background()
 
 	m, err := tui.New(ctx)
@@ -104,6 +114,26 @@ func main() {
 	// Printed last, and only while it is still true: once the directory is on PATH the
 	// hint disappears on its own, so this cannot become a permanent nag.
 	fmt.Print(pathhint.Hint())
+}
+
+// noTTYMessage names the actual command and, where one exists, the non-interactive
+// alternative — a favorite nickname skips the picker entirely for exec/shell/ssm-shell, but
+// none exists yet for setup or the bare picker (see issue #11).
+func noTTYMessage(run invocation) string {
+	const noTerminal = "needs an interactive terminal — run it somewhere one is attached"
+	if run.startInSetup {
+		return "warren setup " + noTerminal
+	}
+	switch run.mode {
+	case modeExec:
+		return "warren exec " + noTerminal + ", or use a favorite: warren exec <favorite> -- cmd"
+	case modeShell:
+		return "warren shell " + noTerminal + ", or use a favorite: warren shell <favorite>"
+	case modeSSMShell:
+		return "warren ssm-shell " + noTerminal + ", or use a favorite: warren ssm-shell <favorite> <target>"
+	default:
+		return "warren " + noTerminal + " — see `warren exec`, `warren shell`, or `warren creds` for non-interactive use"
+	}
 }
 
 // stripInheritedNeutralization undoes, at the start of every warren process, what a warren-spawned

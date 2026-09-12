@@ -103,6 +103,33 @@ func TestParseTargetRejectsAFlag(t *testing.T) {
 
 // ssm-shell has to be reachable, and the usage text is the only place it is discoverable from the
 // command line. It also documents the tmux one-liner, which is the point of the subcommand.
+// noTTYMessage is what a script actually sees when it runs warren without a terminal attached
+// — issue #20: before this, it was a raw bubbletea/OS error ("could not open a new TTY") that
+// named neither warren nor the fix.
+func TestNoTTYMessageNamesTheCommandAndAlternative(t *testing.T) {
+	cases := []struct {
+		name string
+		run  invocation
+		want []string // all substrings must appear
+	}{
+		{"exec", invocation{mode: modeExec}, []string{"warren exec", "warren exec <favorite> -- cmd"}},
+		{"shell", invocation{mode: modeShell}, []string{"warren shell", "warren shell <favorite>"}},
+		{"ssm-shell", invocation{mode: modeSSMShell}, []string{"warren ssm-shell", "warren ssm-shell <favorite> <target>"}},
+		{"setup", invocation{startInSetup: true}, []string{"warren setup"}},
+		{"bare picker", invocation{mode: modeTUI}, []string{"warren needs an interactive terminal"}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := noTTYMessage(c.run)
+			for _, want := range c.want {
+				if !strings.Contains(got, want) {
+					t.Errorf("noTTYMessage(%+v) = %q, want it to contain %q", c.run, got, want)
+				}
+			}
+		})
+	}
+}
+
 func TestUsageDocumentsSSMShell(t *testing.T) {
 	for _, want := range []string{"warren ssm-shell <target>", "tmux new-window warren ssm-shell"} {
 		if !strings.Contains(usage, want) {
