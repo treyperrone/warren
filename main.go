@@ -170,15 +170,34 @@ func parseArgs() invocation {
 		os.Exit(runLogin(context.Background(), os.Args[2:]))
 
 	case "setup":
+		// setup opens the TUI setup screen and takes no arguments. Without this check,
+		// `warren setup --help` and `warren setup garbage` both silently launched the
+		// same interactive screen — the opposite of how every other subcommand treats
+		// unknown args.
+		help, err := parseSetupArgs(os.Args[2:])
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "%v\n\n%s", err, usage)
+			os.Exit(2)
+		}
+		if help {
+			fmt.Print(usage)
+			fmt.Print(pathhint.Hint())
+			os.Exit(0)
+		}
 		return invocation{mode: modeTUI, startInSetup: true}
 
 	case "shell":
 		// `warren shell <favorite>` skips the picker for a bookmarked account+role.
-		if len(os.Args) > 2 {
-			if fav, ok := favoriteByNickname(os.Args[2]); ok {
+		nick, err := parseShellArgs(os.Args[2:])
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "%v\n\n%s", err, usage)
+			os.Exit(2)
+		}
+		if nick != "" {
+			if fav, ok := favoriteByNickname(nick); ok {
 				os.Exit(runFavorite(context.Background(), fav, invocation{mode: modeShell, argv: awsexec.ShellArgv()}))
 			}
-			fmt.Fprintf(os.Stderr, "%q is not a favorite — star one on the action screen, or run plain `warren shell`\n", os.Args[2])
+			fmt.Fprintf(os.Stderr, "%q is not a favorite — star one on the action screen, or run plain `warren shell`\n", nick)
 			os.Exit(2)
 		}
 		return invocation{mode: modeShell, argv: awsexec.ShellArgv()}
@@ -228,6 +247,32 @@ func parseArgs() invocation {
 	}
 
 	panic("unreachable")
+}
+
+// parseSetupArgs validates arguments after `warren setup`. Empty means open the setup
+// screen; a lone --help/-h/help means print usage. Anything else is an error — setup
+// previously ignored os.Args[2:] entirely and launched the TUI for every typo.
+func parseSetupArgs(args []string) (help bool, err error) {
+	if len(args) == 0 {
+		return false, nil
+	}
+	if len(args) == 1 && (args[0] == "--help" || args[0] == "-h" || args[0] == "help") {
+		return true, nil
+	}
+	return false, fmt.Errorf("setup takes no arguments, got %s", strings.Join(args, " "))
+}
+
+// parseShellArgs validates arguments after `warren shell`. An empty nickname means the
+// interactive picker; a single token is a favorite nickname. Extra tokens after a name
+// used to be silently dropped (only os.Args[2] was read).
+func parseShellArgs(args []string) (nickname string, err error) {
+	if len(args) == 0 {
+		return "", nil
+	}
+	if len(args) > 1 {
+		return "", fmt.Errorf("shell takes at most one favorite name, got extra: %s", strings.Join(args[1:], " "))
+	}
+	return args[0], nil
 }
 
 // parseTarget validates the SSM target for `warren ssm-shell`.

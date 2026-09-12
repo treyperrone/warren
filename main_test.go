@@ -169,3 +169,49 @@ func TestStripInheritedNeutralizationIsANoOpWithNeitherSet(t *testing.T) {
 		t.Errorf("AWS_SHARED_CREDENTIALS_FILE = %q, want it to remain unset", v)
 	}
 }
+
+func TestParseSetupArgsAcceptsBare(t *testing.T) {
+	help, err := parseSetupArgs(nil)
+	if err != nil || help {
+		t.Fatalf("parseSetupArgs(nil) = help=%v err=%v, want help=false nil", help, err)
+	}
+}
+
+func TestParseSetupArgsHelp(t *testing.T) {
+	for _, a := range []string{"--help", "-h", "help"} {
+		help, err := parseSetupArgs([]string{a})
+		if err != nil || !help {
+			t.Errorf("parseSetupArgs(%q) = help=%v err=%v, want help=true nil", a, help, err)
+		}
+	}
+}
+
+func TestParseSetupArgsRejectsGarbage(t *testing.T) {
+	for _, args := range [][]string{{"garbage"}, {"--non-interactive"}, {"a", "b"}} {
+		help, err := parseSetupArgs(args)
+		if err == nil || help {
+			t.Errorf("parseSetupArgs(%v) = help=%v err=%v, want error", args, help, err)
+		}
+	}
+}
+
+func TestParseShellArgsAcceptsBareAndOneFavorite(t *testing.T) {
+	nick, err := parseShellArgs(nil)
+	if err != nil || nick != "" {
+		t.Fatalf("parseShellArgs(nil) = %q, %v", nick, err)
+	}
+	nick, err = parseShellArgs([]string{"corp-admin"})
+	if err != nil || nick != "corp-admin" {
+		t.Fatalf("parseShellArgs([corp-admin]) = %q, %v", nick, err)
+	}
+}
+
+func TestParseShellArgsRejectsExtra(t *testing.T) {
+	_, err := parseShellArgs([]string{"corp-admin", "--extra"})
+	if err == nil {
+		t.Fatal("parseShellArgs accepted trailing args after a favorite")
+	}
+	if !strings.Contains(err.Error(), "extra") {
+		t.Errorf("error %q should mention the extra args", err)
+	}
+}
