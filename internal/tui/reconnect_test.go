@@ -5,6 +5,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 
@@ -299,6 +300,55 @@ func TestReconnectOnRestoredTunnelRebuildsWithItsOwnIdentity(t *testing.T) {
 	}
 	if len(m.manager.Active()) != 0 {
 		t.Error("the stale tunnel is still listed — it should be superseded, not doubled up")
+	}
+}
+
+// The full rebuild path must not just drop the superseded tunnel from the manager's list — it
+// must kill the underlying process, or every rebuilt reconnect leaks one session-manager-plugin
+// process (and its bound port) forever.
+func TestReconnectOnRestoredTunnelKillsTheOldProcess(t *testing.T) {
+	m := mainScreenModel(t)
+	var cmd *exec.Cmd
+	if runtime.GOOS == "windows" {
+		cmd = exec.Command("cmd.exe", "/C", "ping -n 30 127.0.0.1 > NUL")
+	} else {
+		cmd = exec.Command("sleep", "30")
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("starting a helper process: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = cmd.Process.Kill()
+		_, _ = cmd.Process.Wait()
+	})
+
+	tun := &tunnel.Tunnel{
+		PID:          cmd.Process.Pid,
+		Kind:         tunnel.KindRDP,
+		LocalPort:    13389,
+		InstanceID:   "i-0abc",
+		InstanceName: "win-01",
+		Restored:     true,
+		StartURL:     "https://ex.awsapps.com/start",
+		AccountID:    "111111111111",
+		AccountName:  "cr-lab",
+		RoleName:     "AdminRole",
+	}
+	m.manager.Add(tun)
+	m.sessionActionTunnel = tun
+	m.ssoSessions = []awsint.SSOSessionConfig{
+		{Name: "crlab", StartURL: tun.StartURL, Region: "eu-west-2"},
+	}
+
+	m.selectSessionAction("reconnect")
+
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	select {
+	case <-done:
+		// The process exited — Kill reached it, whatever its final Wait error says.
+	case <-time.After(2 * time.Second):
+		t.Fatal("reconnect superseded the tunnel without killing its process — it leaks")
 	}
 }
 
