@@ -64,6 +64,31 @@ jobs:
           # dry run the brews step is skipped (skip_upload: auto), so an empty value is fine.
           HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
 
+      # The GitHub Release publishes in an earlier goreleaser stage than the Homebrew cask push.
+      # If HOMEBREW_TAP_TOKEN has expired (fine-grained PATs do) or the push otherwise fails, the
+      # release still looks complete on the Releases page — this is what turns that into a red,
+      # investigable job instead of a quiet drift between what shipped and what brew installs.
+      - name: verify the Homebrew cask actually updated
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          ok=""
+          for attempt in 1 2 3; do
+            formula="$(gh api repos/treyperrone/homebrew-tap/contents/Casks/warren.rb --jq '.content' | base64 -d)"
+            if grep -q "version \"$tag\"" <<<"$formula"; then
+              ok=1
+              break
+            fi
+            sleep 5
+          done
+          if [ -z "$ok" ]; then
+            echo "::error::treyperrone/homebrew-tap's Casks/warren.rb does not show version $tag after 3 attempts — the cask push likely failed (check HOMEBREW_TAP_TOKEN hasn't expired). The GitHub Release published fine; only the Homebrew formula is out of date."
+            exit 1
+          fi
+          echo "confirmed: Casks/warren.rb is at version $tag"
+
       # Keeps the artifacts reachable for dispatch runs, which publish nothing.
       - uses: actions/upload-artifact@v4
         if: ${{ !startsWith(github.ref, 'refs/tags/') }}

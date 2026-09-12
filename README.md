@@ -413,6 +413,8 @@ git push origin v1.0.0
 
 Nothing else is manual. The Homebrew cask push needs a `HOMEBREW_TAP_TOKEN` Actions secret — a fine-grained PAT with `contents: write` on the tap repo, since the workflow's default token cannot reach another repo. A pre-release tag or a **workflow_dispatch** dry run (which builds a snapshot and uploads the archives as run artifacts, publishing nothing) skips the cask push.
 
+A GitHub Release publishes before the cask push runs, so if `HOMEBREW_TAP_TOKEN` has expired or the push otherwise fails, the release still looks complete on the Releases page — a separate workflow step checks `Casks/warren.rb` in the tap actually shows the new version and fails the job (in red, after the fact) if it doesn't. If that happens, the archives and checksums already published are fine as-is — no need for a new tag. Rotate the token, then either bring `Casks/warren.rb` in the tap up to date by hand for that one release, or re-run goreleaser locally against the existing tag, skipping the stages that already succeeded.
+
 The release is gated on the CI workflow rather than its own copy of the checks, so a tag can never publish something the checks would have rejected.
 
 ## License
