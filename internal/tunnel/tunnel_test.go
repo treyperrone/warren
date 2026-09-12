@@ -311,6 +311,63 @@ func TestAddedTunnelIsNotRestoredAndIdentityPersists(t *testing.T) {
 	}
 }
 
+// Two warren processes on the same box each hold their own in-memory tunnel list. Before the
+// merge-on-save fix, whichever process called save() last silently overwrote the other's
+// tunnel out of the state file — its plugin process kept running, but no warren instance knew
+// about it anymore.
+func TestSaveMergesTunnelsPersistedByAnotherProcess(t *testing.T) {
+	home := t.TempDir()
+	testenv.SetHome(t, home)
+
+	// Two managers created before either has written anything — as if two warren processes
+	// started around the same time, each with an empty view of the state file.
+	m1 := NewManager()
+	m2 := NewManager()
+
+	a := &Tunnel{PID: pluginSleeper(t), Kind: KindRDP, LocalPort: 13389, InstanceID: "i-0aaa", InstanceName: "a"}
+	m1.Add(a) // disk now has [a]; m2 never reloaded, so its in-memory list is still empty
+
+	b := &Tunnel{PID: pluginSleeper(t), Kind: KindRDP, LocalPort: 13390, InstanceID: "i-0bbb", InstanceName: "b"}
+	m2.Add(b) // must not clobber a's entry on disk
+
+	entries := readEntries(filepath.Join(home, ".warren_sessions.json"))
+	if len(entries) != 2 {
+		t.Fatalf("state file has %d entries, want 2 (a and b) — one process's save() clobbered the other's", len(entries))
+	}
+	var gotA, gotB bool
+	for _, e := range entries {
+		gotA = gotA || e.PID == a.PID
+		gotB = gotB || e.PID == b.PID
+	}
+	if !gotA || !gotB {
+		t.Errorf("entries = %+v, want both pid %d and pid %d present", entries, a.PID, b.PID)
+	}
+}
+
+// A crash or a concurrent reader must never observe a truncated state file — save() writes to
+// a temp file and renames it into place rather than truncating in place.
+func TestSaveWritesAtomically(t *testing.T) {
+	home := t.TempDir()
+	testenv.SetHome(t, home)
+
+	m := NewManager()
+	m.Add(&Tunnel{PID: pluginSleeper(t), Kind: KindRDP, LocalPort: 13389, InstanceID: "i-0abc", InstanceName: "a"})
+
+	dir := home
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), ".warren_sessions-") && strings.HasSuffix(e.Name(), ".tmp") {
+			t.Errorf("leftover temp file %q — writeFileAtomic did not clean up or the rename never happened", e.Name())
+		}
+	}
+	if got := readEntries(filepath.Join(home, ".warren_sessions.json")); len(got) != 1 {
+		t.Fatalf("state file has %d entries after Add, want 1", len(got))
+	}
+}
+
 // Tunnels must outlive warren, which is what the Quit row promises. ctrl-c sends SIGINT to the whole
 // foreground process group, so a plugin sharing warren's group died with it — see internal/procgroup.
 func TestBackgroundPluginIsDetachedFromWarrensProcessGroup(t *testing.T) {
