@@ -140,6 +140,43 @@ region = us-east-1
 	}
 }
 
+// A hand-edited config with trailing whitespace inside the header brackets — "[sso-session
+// foo ]" — used to name a session literally called "foo " (a trailing space): invisible,
+// unmatchable against a profile's sso_session, and unreachable by anything that later
+// compares names, with no error surfaced anywhere.
+func TestParseConfigTrimsHeaderNameWhitespace(t *testing.T) {
+	home := t.TempDir()
+	testenv.SetHome(t, home)
+	if err := os.MkdirAll(filepath.Join(home, ".aws"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	cfg := "[sso-session foo ]\n" +
+		"sso_start_url = https://one.example.com/start\n" +
+		"sso_region = us-east-1\n" +
+		"\n" +
+		"[profile bar ]\n" +
+		"sso_session = foo\n" +
+		"sso_account_id = 111111111111\n" +
+		"sso_role_name = Admin\n"
+	if err := os.WriteFile(filepath.Join(home, ".aws", "config"), []byte(cfg), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	sessions, profiles, err := ParseConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sessions) != 1 || sessions[0].Name != "foo" {
+		t.Fatalf("sessions = %+v, want exactly one named %q", sessions, "foo")
+	}
+	if len(profiles) != 1 || profiles[0].Name != "bar" {
+		t.Fatalf("profiles = %+v, want exactly one named %q", profiles, "bar")
+	}
+	if profiles[0].SSOSession != "foo" {
+		t.Errorf("profile's SSOSession = %q, want it to match the trimmed session name", profiles[0].SSOSession)
+	}
+}
+
 func TestCanRefresh(t *testing.T) {
 	full := tokenRecord{
 		RefreshToken:          "rt",

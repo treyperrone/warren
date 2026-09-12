@@ -439,6 +439,31 @@ func (f Favorite) Same(o Favorite) bool {
 		f.InstanceName == o.InstanceName && f.ConnType == o.ConnType && f.SSHUser == o.SSHUser
 }
 
+// UniqueNickname returns base, or base with a numeric suffix appended, so it does not collide
+// with an existing favorite for a different destination. Two destinations differing only in
+// case or punctuation (an account or instance named "Web-01" vs "web 01", say) slug to the same
+// base — harmless for the picker, which matches by full destination, but ambiguous for `warren
+// exec/shell <nickname>`, which matches by nickname alone. Re-favoriting the SAME destination
+// deliberately keeps the same base: AddFavorite's own Same(dest) check updates that entry in
+// place rather than creating a second one, so this must not disambiguate away from it.
+func UniqueNickname(base string, dest Favorite) string {
+	existing := Favorites()
+	name := base
+	for i := 2; ; i++ {
+		collision := false
+		for _, f := range existing {
+			if f.Nickname == name && !f.Same(dest) {
+				collision = true
+				break
+			}
+		}
+		if !collision {
+			return name
+		}
+		name = fmt.Sprintf("%s-%d", base, i)
+	}
+}
+
 const favKey = "favorites"
 
 // Favorites returns the saved bookmarks in saved order — the order is the user's, made by

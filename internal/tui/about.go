@@ -33,6 +33,7 @@ var keyHelp = [][2]string{
 	{"esc", "clear an active search, otherwise go back a screen"},
 	{"n", "new connection (main screen)"},
 	{"p", "switch account or role (main screen)"},
+	{"r", "re-authenticate (shown when a sign-in is needed)"},
 	{"ctrl+e", "edit the built command (command builder)"},
 	{"?", "this screen"},
 	{"q", "quit — active tunnels keep running"},

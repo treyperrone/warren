@@ -144,12 +144,12 @@ func (m *Model) selectAction(val string) tea.Cmd {
 	switch val {
 	case actionFavAdd:
 		fav := browser.Favorite{
-			Nickname:    profileSlug(m.selAccount.Name, m.awsSess.RoleName),
 			StartURL:    m.selSession.StartURL,
 			AccountID:   m.selAccount.ID,
 			AccountName: m.selAccount.Name,
 			Role:        m.awsSess.RoleName,
 		}
+		fav.Nickname = browser.UniqueNickname(profileSlug(m.selAccount.Name, m.awsSess.RoleName), fav)
 		if err := browser.AddFavorite(fav); err != nil {
 			m.err = err
 			return nil

@@ -123,7 +123,7 @@ func TestAboutListsTheKeysThatActuallyExist(t *testing.T) {
 	for _, kv := range keyHelp {
 		listed[kv[0]] = true
 	}
-	for _, want := range []string{"/", "enter", "esc", "n", "p", "q", "ctrl+c", "?"} {
+	for _, want := range []string{"/", "enter", "esc", "n", "p", "r", "q", "ctrl+c", "?"} {
 		if !listed[want] {
 			t.Errorf("keyHelp does not document %q", want)
 		}
