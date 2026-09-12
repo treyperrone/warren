@@ -745,7 +745,28 @@ func writeRecord(rec *tokenRecord) {
 	}
 	// hash of the start URL as filename, mirroring the AWS CLI convention
 	name := fmt.Sprintf("warren-%x.json", hashString(rec.StartURL))
-	_ = os.WriteFile(filepath.Join(dir, name), data, 0600)
+	// Temp file + rename, not a direct WriteFile: two warren processes can both be refreshing
+	// this start URL near expiry (see the re-read in SilentToken below), and a concurrent
+	// reader must never observe a half-written file — a truncated read here silently reads as
+	// "nothing cached" (cachedRecord's json.Unmarshal failure), which is only self-healing if
+	// nobody needed that token in the same instant.
+	tmp, err := os.CreateTemp(dir, "warren-*.json.tmp")
+	if err != nil {
+		return
+	}
+	defer os.Remove(tmp.Name()) // no-op once the rename below succeeds
+	if err := tmp.Chmod(0600); err != nil {
+		_ = tmp.Close()
+		return
+	}
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return
+	}
+	if tmp.Close() != nil {
+		return
+	}
+	_ = os.Rename(tmp.Name(), filepath.Join(dir, name))
 }
 
 func hashString(s string) uint32 {
@@ -806,11 +827,34 @@ func SilentToken(ctx context.Context, sess SSOSessionConfig) (string, error) {
 		// failure, or throttle also fails a refresh, and learning "your org session lasts
 		// 40 minutes" from a dropped wifi packet poisons every later hard-expires estimate.
 		if isSessionEnded(err) {
+			// Before believing the session actually ended: a refresh token AWS accepts is
+			// single-use and warren isn't the only reader of this cache file — the CLI and a
+			// second warren process on the same box both read and refresh from it too. If one
+			// of them won this exact race, it already rotated the refresh token and wrote a
+			// fresh access token here; ours failing with the same InvalidGrantException a truly
+			// dead session produces is then a benign collision, not an ended session.
+			if token, raced := staleRefreshRace(sess.StartURL, rec.AccessToken); raced {
+				return token, nil
+			}
 			_ = browser.RecordSessionEnd(sess.StartURL, time.Now())
 		}
 	}
 
 	return "", ErrLoginRequired
+}
+
+// staleRefreshRace settles, without any lock, whether a refresh that just failed with an
+// AUTH rejection actually means the session ended, or only means someone else — the AWS CLI,
+// or a second warren process on the same box — already refreshed this exact start URL first
+// and rotated the single-use refresh token out from under this call. A live re-read tells the
+// two apart: if the cache now holds a different, still-live access token, that refresh
+// succeeded and the session is obviously not dead, so its token is used instead of failing.
+func staleRefreshRace(startURL, priorAccessToken string) (freshToken string, raced bool) {
+	fresh := cachedRecord(startURL)
+	if fresh != nil && fresh.AccessToken != "" && fresh.AccessToken != priorAccessToken && live(fresh.ExpiresAt) {
+		return fresh.AccessToken, true
+	}
+	return "", false
 }
 
 // LiveToken returns a usable access token, escalating as far as it must — including the full

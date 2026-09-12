@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -264,6 +265,80 @@ func TestWriteRecordRoundTrip(t *testing.T) {
 	}
 	if !out.canRefresh() {
 		t.Error("round-tripped record should be refreshable")
+	}
+}
+
+// writeRecord must not leave a temp file behind, and a concurrent reader mid-write must never
+// see a truncated file — proven indirectly here by checking no .tmp survives and the final
+// content round-trips, which a truncate-in-place WriteFile cannot guarantee under a crash.
+func TestWriteRecordLeavesNoTempFile(t *testing.T) {
+	cache := fakeHome(t)
+	writeRecord(&tokenRecord{StartURL: "https://one.example.com/start", AccessToken: "at", ExpiresAt: stamp(time.Hour)})
+
+	entries, err := os.ReadDir(cache)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".tmp") {
+			t.Errorf("leftover temp file %q — the rename never happened or cleanup was skipped", e.Name())
+		}
+	}
+}
+
+// The bug: two readers/writers of the same cache file (the AWS CLI, or a second warren
+// process) can both try to refresh a start URL near expiry. The loser's refresh token is
+// already rotated out from under it, so AWS rejects it with the same InvalidGrantException a
+// truly-dead session would produce — staleRefreshRace is what tells the two apart before
+// SilentToken poisons the learned session-ceiling estimate or hands the caller a spurious
+// re-auth prompt over what was actually a benign race.
+func TestStaleRefreshRaceDetectsAWinningConcurrentRefresh(t *testing.T) {
+	cache := fakeHome(t)
+	const url = "https://one.example.com/start"
+	writeCacheFile(t, cache, "fresh.json", tokenRecord{
+		StartURL: url, AccessToken: "winner-token", ExpiresAt: stamp(time.Hour),
+	})
+
+	token, raced := staleRefreshRace(url, "loser-token")
+
+	if !raced {
+		t.Fatal("raced = false, want true — a different, live token is now cached")
+	}
+	if token != "winner-token" {
+		t.Errorf("token = %q, want winner-token", token)
+	}
+}
+
+func TestStaleRefreshRaceIgnoresItsOwnStaleToken(t *testing.T) {
+	cache := fakeHome(t)
+	const url = "https://one.example.com/start"
+	// The cache still holds exactly the token this call started with — nobody else won a
+	// race, the session really did end.
+	writeCacheFile(t, cache, "same.json", tokenRecord{
+		StartURL: url, AccessToken: "mine", ExpiresAt: stamp(time.Hour),
+	})
+
+	if _, raced := staleRefreshRace(url, "mine"); raced {
+		t.Error("raced = true for the caller's own unchanged token")
+	}
+}
+
+func TestStaleRefreshRaceIgnoresAnExpiredWinner(t *testing.T) {
+	cache := fakeHome(t)
+	const url = "https://one.example.com/start"
+	writeCacheFile(t, cache, "expired.json", tokenRecord{
+		StartURL: url, AccessToken: "also-dead", ExpiresAt: stamp(-time.Hour),
+	})
+
+	if _, raced := staleRefreshRace(url, "loser-token"); raced {
+		t.Error("raced = true for a token that is itself already expired")
+	}
+}
+
+func TestStaleRefreshRaceNoCache(t *testing.T) {
+	fakeHome(t)
+	if _, raced := staleRefreshRace("https://one.example.com/start", "loser-token"); raced {
+		t.Error("raced = true with nothing cached at all")
 	}
 }
 
