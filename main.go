@@ -202,12 +202,24 @@ func parseArgs() invocation {
 		os.Exit(runLogin(context.Background(), os.Args[2:]))
 
 	case "setup":
+		if len(os.Args) > 2 {
+			if os.Args[2] == "--help" || os.Args[2] == "-h" {
+				fmt.Print(usage)
+				os.Exit(0)
+			}
+			fmt.Fprintf(os.Stderr, "setup takes no arguments, got %q\n\n%s", strings.Join(os.Args[2:], " "), usage)
+			os.Exit(2)
+		}
 		return invocation{mode: modeTUI, startInSetup: true}
 
 	case "shell":
 		// `warren shell <favorite>` skips the picker for a bookmarked account+role.
 		if len(os.Args) > 2 {
 			if fav, ok := favoriteByNickname(os.Args[2]); ok {
+				if len(os.Args) > 3 {
+					fmt.Fprintf(os.Stderr, "shell takes one favorite, got extra argument(s): %s\n", strings.Join(os.Args[3:], " "))
+					os.Exit(2)
+				}
 				os.Exit(runFavorite(context.Background(), fav, invocation{mode: modeShell, argv: awsexec.ShellArgv()}))
 			}
 			fmt.Fprintf(os.Stderr, "%q is not a favorite — star one on the action screen, or run plain `warren shell`\n", os.Args[2])
