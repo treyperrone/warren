@@ -39,6 +39,15 @@ jobs:
       - name: test
         run: go test ./... -count=1
 
+      # goreleaser builds every release with CGO_ENABLED=0 (.goreleaser.yaml) — the default,
+      # cgo-enabled toolchain above is not what actually ships. A behavioral difference between
+      # the two (os/user and DNS resolution are the usual suspects) would pass every run of this
+      # job and only ever surface when a real release cross-compiles, at tag time.
+      - name: test (CGO_ENABLED=0, matches the release build)
+        run: go test ./... -count=1
+        env:
+          CGO_ENABLED: 0
+
       # Separate from the plain run: -race roughly triples the runtime, and the credential
       # endpoint plus its renewal goroutine are the parts most worth checking it against.
       - name: test -race
