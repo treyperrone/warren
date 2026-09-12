@@ -79,12 +79,20 @@ type processCreds struct {
 // auth from here would hang every aws command on the machine behind an invisible prompt.
 // When the SSO session itself has ended, the only honest move is a clear instruction on
 // stderr — which the aws CLI surfaces verbatim — and a non-zero exit.
+// credsTimeout bounds every AWS call warren creds makes. Its caller is an SDK holding a pipe
+// open, waiting on stdout — "strictly non-interactive, never a hang" only holds if a stalled
+// network call can't block that pipe forever the way a browser prompt already can't.
+const credsTimeout = 15 * time.Second
+
 func runCreds(ctx context.Context, args []string) int {
 	inv, err := parseCredsArgs(args)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "%v\n", err)
 		return 2
 	}
+
+	ctx, cancel := context.WithTimeout(ctx, credsTimeout)
+	defer cancel()
 
 	sessions, _, err := awsint.ParseConfig()
 	if err != nil {
@@ -104,21 +112,35 @@ func runCreds(ctx context.Context, args []string) int {
 	}
 
 	token, err := awsint.SilentToken(ctx, *sess)
-	if errors.Is(err, awsint.ErrLoginRequired) {
-		fmt.Fprintf(os.Stderr, "warren creds: the %s session needs a sign-in — run: warren login %s\n", sess.Name, sess.Name)
-		return 1
-	}
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "warren creds: %v\n", err)
+		fmt.Fprintln(os.Stderr, credsErrorMessage(sess.Name, err))
 		return 1
 	}
 
 	role, err := awsint.GetRoleCredentials(ctx, *sess, token, inv.account, inv.role)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "warren creds: %v\n", err)
+		fmt.Fprintln(os.Stderr, credsErrorMessage(sess.Name, err))
 		return 1
 	}
 	return emitCreds(role)
+}
+
+// credsErrorMessage classifies an AWS error from the creds path into the line printed on
+// stderr, so a script sees why it failed instead of a raw SDK error it has no way to act on.
+// Both call sites above funnel through this: NeedsReauth already matches ErrLoginRequired (the
+// sentinel SilentToken always falls back to — deliberately, since it collapses every failure,
+// network blips included, rather than risk mistaking one for the org's session ceiling, see
+// SilentToken's own comment), and a deadline is only ever reachable from GetRoleCredentials,
+// which unlike SilentToken lets a context error surface as itself.
+func credsErrorMessage(sessName string, err error) string {
+	switch {
+	case awsint.NeedsReauth(err):
+		return fmt.Sprintf("warren creds: the %s session needs a sign-in — run: warren login %s", sessName, sessName)
+	case errors.Is(err, context.DeadlineExceeded):
+		return fmt.Sprintf("warren creds: timed out reaching AWS after %s — check network/VPN connectivity", credsTimeout)
+	default:
+		return fmt.Sprintf("warren creds: %v", err)
+	}
 }
 
 // emitCreds writes the JSON document to stdout — the ONLY thing that may reach stdout in
