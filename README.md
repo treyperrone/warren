@@ -83,7 +83,8 @@ warren                     # launch the interactive picker
 warren exec -- <cmd>       # pick an account and role, then run <cmd> with its credentials
 warren shell [favorite]    # pick an account and role — or name a favorite — then open a shell
 warren exec <fav> -- <cmd> # run <cmd> as a favorited account+role, no picker
-warren ssm-shell <target>  # pick an account and role, then open an SSM shell on <target>
+warren ssm-shell <target>       # pick an account and role, then open an SSM shell on <target>
+warren ssm-shell <fav> <target> # open an SSM shell on <target> as a favorited account+role, no picker
 warren login [identity]    # sign in without the TUI: device-code by default (URL + code + OSC 52 clipboard)
 warren login --browser     # the only way login opens a browser: saved browser/profile, or a picker
 warren login --status      # report token liveness without signing in; exit 0 live, 1 not
@@ -297,7 +298,10 @@ tmux new-window warren ssm-shell i-abcdef0123456789a
 warren ssm-shell i-0123456789abcdef0
 ```
 
-It also makes SSM shells scriptable, which they weren't when the only way in was the picker.
+`warren ssm-shell <favorite> <target>` skips the account/role picker too, the same way `exec`
+and `shell` do — the target still has to be named explicitly, since a favorite bookmarks an
+account+role, not an instance. Between the two, ssm-shell is fully scriptable: no picker,
+either way.
 
 Each concurrent shell is a real Session Manager session: it counts against your account's
 concurrent-session limit and appears in Session Manager history.

@@ -28,6 +28,8 @@ usage:
   warren shell [favorite]    pick an account and role — or name a favorite — then open a shell
   warren exec <fav> -- <cmd> run <cmd> as a favorited account+role, no picker
   warren ssm-shell <target>  pick an account and role, then open an SSM shell on <target>
+  warren ssm-shell <fav> <target>
+                             open an SSM shell on <target> as a favorited account+role, no picker
   warren login [identity]    sign in without the TUI: device-code by default — URL + code
                              shown, URL sent to your local clipboard (OSC 52)
   warren login --browser     opt in to opening a browser (uses your saved browser/profile,
@@ -184,6 +186,19 @@ func parseArgs() invocation {
 		return invocation{mode: modeShell, argv: awsexec.ShellArgv()}
 
 	case "ssm-shell":
+		// `warren ssm-shell <favorite> <target>` skips the picker for a bookmarked
+		// account+role, same as shell/exec — the target is still required explicitly, since
+		// a favorite names an account+role, not an instance.
+		if len(os.Args) > 2 {
+			if fav, ok := favoriteByNickname(os.Args[2]); ok {
+				target, err := parseTarget(os.Args[3:])
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "%v\n\n%s", err, usage)
+					os.Exit(2)
+				}
+				os.Exit(runFavorite(context.Background(), fav, invocation{mode: modeSSMShell, target: target}))
+			}
+		}
 		target, err := parseTarget(os.Args[2:])
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "%v\n\n%s", err, usage)
