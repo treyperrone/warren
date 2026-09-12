@@ -94,9 +94,14 @@ func TestSSHTunnelMenuHasNoReconnect(t *testing.T) {
 	}
 }
 
-// Reconnect re-opens the client and returns to the manager with the tunnel intact.
+// Reconnect returns to the manager with the tunnel intact even when no RDP client is available.
 func TestReconnectKeepsTheTunnel(t *testing.T) {
 	m := tunnelManagerModel(t, tunnel.KindRDP)
+	// Hide desktop clients after starting the helper process (which needs cmd.exe or sleep).
+	// Otherwise this test launches the developer's real RDP client against localhost:13389.
+	t.Setenv("PATH", t.TempDir())
+	// macOS writes a connection file before looking for the client.
+	t.Setenv("TMPDIR", t.TempDir())
 	m.Update(tea.KeyMsg{Type: tea.KeyEnter}) // open menu, cursor on "reconnect"
 
 	m.Update(tea.KeyMsg{Type: tea.KeyEnter}) // pick it
@@ -107,8 +112,8 @@ func TestReconnectKeepsTheTunnel(t *testing.T) {
 	if len(m.manager.Active()) != 1 {
 		t.Error("reconnect dropped the tunnel")
 	}
-	if m.notice == "" {
-		t.Error("no notice after reconnect — the user is told nothing happened")
+	if !strings.HasPrefix(m.notice, "point your RDP client at localhost:13389") {
+		t.Errorf("notice = %q, want the manual connection fallback", m.notice)
 	}
 }
 
