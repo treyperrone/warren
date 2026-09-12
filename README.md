@@ -10,16 +10,37 @@ without needing the `aws` CLI, `session-manager-plugin` installed separately,
 
 ## Install
 
-**macOS or Linux, the fast way:**
+### macOS or Linux — Homebrew
 
 ```sh
 brew tap treyperrone/tap
-brew install warren
+brew install --cask warren
 ```
 
-That's it — run `warren`. (First tap on Homebrew 6.0+ also asks you to `brew trust treyperrone/tap`, since a third-party tap runs its own code on your machine. Later, `brew upgrade warren`.)
+That's it — run `warren`. (First tap on Homebrew 6.0+ also asks you to `brew trust treyperrone/tap`, since a third-party tap runs its own code on your machine. Later, `brew upgrade warren`.) warren ships as a cask, which strips the quarantine flag on install, so macOS does not prompt on first run.
 
-No Homebrew, or on Windows? See [other install options](#other-ways-to-install) below.
+### Windows
+
+No package manager yet — grab the prebuilt `.zip` below.
+
+### Prebuilt binary — macOS, Linux, or Windows
+
+Grab the archive for your platform from the [Releases](https://github.com/treyperrone/warren/releases) page — `warren_<version>_<os>_<arch>.tar.gz`, or `.zip` on Windows — and unpack the `warren` binary onto your `PATH`:
+
+```sh
+tar xzf warren_*_darwin_arm64.tar.gz
+sudo mv warren /usr/local/bin/        # or anywhere on PATH
+```
+
+`checksums.txt` in the same release verifies the download (`sha256sum -c checksums.txt`). If you download through a browser on macOS, Gatekeeper quarantines the file — clear it with `xattr -d com.apple.quarantine warren`. A `curl`/`scp` transfer or a Homebrew install never sets that attribute.
+
+### From source — any platform
+
+```sh
+go install github.com/treyperrone/warren@latest
+```
+
+`go install` drops the binary in `$(go env GOPATH)/bin` (usually `~/go/bin`), which is not on `PATH` by default — so `warren` right after installing gives `command not found`. Run it once as `~/go/bin/warren` and it prints the exact line to add for your shell, then stops mentioning it once the directory is on `PATH`.
 
 ## Why "warren"
 
@@ -54,29 +75,6 @@ Which version is recorded in `internal/plugin/version.txt` and printed by `warre
 ```
 
 A scheduled workflow watches for new plugin releases and opens a PR rebuilding from the new tag, so "embedded" does not quietly become "frozen".
-
-## Other ways to install
-
-The Homebrew tap covers macOS and Linux — see the top of this README if you skipped it. warren ships as a **cask** (`brew install --cask warren` is the explicit form; the bare name resolves to it), which strips the quarantine flag on install, so macOS does not prompt on first run.
-
-### Prebuilt binary (any platform, including Windows)
-
-Grab the archive for your platform from the [Releases](https://github.com/treyperrone/warren/releases) page — `warren_<version>_<os>_<arch>.tar.gz`, or `.zip` on Windows — and unpack the `warren` binary onto your `PATH`:
-
-```sh
-tar xzf warren_*_darwin_arm64.tar.gz
-sudo mv warren /usr/local/bin/        # or anywhere on PATH
-```
-
-`checksums.txt` in the same release verifies the download (`sha256sum -c checksums.txt`). If you download through a browser on macOS, Gatekeeper quarantines the file — clear it with `xattr -d com.apple.quarantine warren`. A `curl`/`scp` transfer or a Homebrew install never sets that attribute.
-
-### From source
-
-```sh
-go install github.com/treyperrone/warren@latest
-```
-
-`go install` drops the binary in `$(go env GOPATH)/bin` (usually `~/go/bin`), which is not on `PATH` by default — so `warren` right after installing gives `command not found`. Run it once as `~/go/bin/warren` and it prints the exact line to add for your shell, then stops mentioning it once the directory is on `PATH`.
 
 ## Usage
 
