@@ -258,12 +258,29 @@ func parseArgs() invocation {
 		// The `--` is conventional and worth accepting, but not worth requiring: it exists to
 		// stop a wrapper eating the wrapped command's flags, and nothing here parses flags
 		// after "exec" anyway.
-		if len(argv) > 0 && argv[0] == "--" {
+		explicitDashDash := len(argv) > 0 && argv[0] == "--"
+		if explicitDashDash {
 			argv = argv[1:]
 		}
 		if len(argv) == 0 {
 			fmt.Fprintf(os.Stderr, "exec needs a command to run, e.g. warren exec -- aws s3 ls\n\n%s", usage)
 			os.Exit(2)
+		}
+		// Once -- was given, everything after it is the literal command, unexamined — that is
+		// the whole point of typing it, and a command that happens to start with a dash (rare,
+		// but -- exists precisely to allow it) must not be second-guessed here.
+		if !explicitDashDash {
+			if argv[0] == "--help" || argv[0] == "-h" {
+				fmt.Print(usage)
+				os.Exit(0)
+			}
+			if strings.HasPrefix(argv[0], "-") {
+				// Otherwise this becomes the literal command to run: picked, authenticated
+				// against, and only then failed by exec.LookPath with a message that never
+				// mentions the actual mistake — a flag typed where a command was expected.
+				fmt.Fprintf(os.Stderr, "%q looks like a flag, not a command; use warren exec -- %s\n", argv[0], strings.Join(argv, " "))
+				os.Exit(2)
+			}
 		}
 		return invocation{mode: modeExec, argv: argv}
 
