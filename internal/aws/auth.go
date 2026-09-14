@@ -504,7 +504,7 @@ func (r *tokenRecord) canRefresh() bool {
 // as "nothing cached" — the same wrong conclusion a truncated read would produce, and the
 // reason writeRecord writes atomically in the first place.
 func readFileRetrying(path string) ([]byte, error) {
-	const attempts = 5
+	const attempts = 40
 	var lastErr error
 	for i := 0; i < attempts; i++ {
 		data, err := os.ReadFile(path)
@@ -513,7 +513,7 @@ func readFileRetrying(path string) ([]byte, error) {
 		}
 		lastErr = err
 		if i < attempts-1 {
-			time.Sleep(10 * time.Millisecond)
+			time.Sleep(20 * time.Millisecond)
 		}
 	}
 	return nil, lastErr
@@ -805,13 +805,13 @@ func writeRecord(rec *tokenRecord) {
 // rename is worse than a delayed one: the write is lost outright rather than merely late, so
 // this is worth a few retries where a plain os.WriteFile never needed any.
 func renameReplacingExisting(oldpath, newpath string) {
-	const attempts = 5
+	const attempts = 40
 	for i := 0; i < attempts; i++ {
 		if os.Rename(oldpath, newpath) == nil {
 			return
 		}
 		if i < attempts-1 {
-			time.Sleep(10 * time.Millisecond)
+			time.Sleep(20 * time.Millisecond)
 		}
 	}
 }

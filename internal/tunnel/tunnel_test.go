@@ -445,7 +445,7 @@ func TestRenameReplacingExistingRetries(t *testing.T) {
 	renameReplacingExisting(src, filepath.Join(dir, "does-not-exist", "dest"))
 	elapsed := time.Since(start)
 
-	const wantMinimum = 4 * 10 * time.Millisecond // 5 attempts, 4 waits between them
+	const wantMinimum = 39 * 20 * time.Millisecond // 40 attempts, 39 waits between them
 	if elapsed < wantMinimum {
 		t.Errorf("gave up after %s, want at least %s — looks like it did not retry", elapsed, wantMinimum)
 	}
@@ -462,7 +462,7 @@ func TestReadFileRetryingRetries(t *testing.T) {
 	if err == nil {
 		t.Fatal("readFileRetrying = nil error, want one for a file that never exists")
 	}
-	const wantMinimum = 4 * 10 * time.Millisecond
+	const wantMinimum = 39 * 20 * time.Millisecond
 	if elapsed < wantMinimum {
 		t.Errorf("gave up after %s, want at least %s — looks like it did not retry", elapsed, wantMinimum)
 	}
