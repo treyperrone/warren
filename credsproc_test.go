@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -10,27 +11,44 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aws/smithy-go"
+
 	awsint "github.com/treyperrone/warren/internal/aws"
 	"github.com/treyperrone/warren/internal/testenv"
 )
 
 // credsErrorMessage is what turns an AWS error into the line warren creds prints on stderr —
-// deterministic and network-free, unlike runCreds itself.
+// deterministic and network-free, unlike runCreds itself. SilentToken collapses to
+// ErrLoginRequired; GetRoleCredentials wraps the raw SSO error (`get role credentials: %w`),
+// so the table includes those wrapped smithy codes — otherwise a NeedsReauth regression on
+// that path would still pass the ErrLoginRequired case.
 func TestCredsErrorMessage(t *testing.T) {
+	wrapRole := func(err error) error {
+		return fmt.Errorf("get role credentials: %w", err)
+	}
+	reauth := "needs a sign-in — run: warren login corp"
 	cases := []struct {
-		name string
-		err  error
-		want string
+		name       string
+		err        error
+		want       string
+		wantAbsent string
 	}{
-		{"login required", awsint.ErrLoginRequired, "needs a sign-in — run: warren login corp"},
-		{"timeout", context.DeadlineExceeded, "timed out reaching AWS"},
-		{"other", errors.New("boom"), "warren creds: boom"},
+		{"login required", awsint.ErrLoginRequired, reauth, ""},
+		{"get-role UnauthorizedException", wrapRole(&smithy.GenericAPIError{Code: "UnauthorizedException"}), reauth, ""},
+		{"get-role ForbiddenException", wrapRole(&smithy.GenericAPIError{Code: "ForbiddenException"}), reauth, ""},
+		{"get-role ExpiredToken", wrapRole(&smithy.GenericAPIError{Code: "ExpiredToken", Message: "token expired"}), reauth, ""},
+		{"timeout", context.DeadlineExceeded, "timed out reaching AWS", reauth},
+		{"other", errors.New("boom"), "warren creds: boom", reauth},
+		{"AccessDenied is not reauth", wrapRole(&smithy.GenericAPIError{Code: "AccessDenied", Message: "not authorized"}), "warren creds:", reauth},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			got := credsErrorMessage("corp", c.err)
 			if !strings.Contains(got, c.want) {
 				t.Errorf("credsErrorMessage(%v) = %q, want it to contain %q", c.err, got, c.want)
+			}
+			if c.wantAbsent != "" && strings.Contains(got, c.wantAbsent) {
+				t.Errorf("credsErrorMessage(%v) = %q, should not contain %q", c.err, got, c.wantAbsent)
 			}
 		})
 	}
