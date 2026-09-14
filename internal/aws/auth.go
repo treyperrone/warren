@@ -497,6 +497,28 @@ func (r *tokenRecord) canRefresh() bool {
 		live(r.RegistrationExpiresAt)
 }
 
+// readFileRetrying is os.ReadFile with a few retries — the read-side counterpart to
+// renameReplacingExisting's write-side retries. A concurrent writeRecord replacing this exact
+// file (another warren process, or the AWS CLI) can leave a brief window on Windows where the
+// file is momentarily gone or locked mid-swap; without a retry, that single unlucky poll reads
+// as "nothing cached" — the same wrong conclusion a truncated read would produce, and the
+// reason writeRecord writes atomically in the first place.
+func readFileRetrying(path string) ([]byte, error) {
+	const attempts = 5
+	var lastErr error
+	for i := 0; i < attempts; i++ {
+		data, err := os.ReadFile(path)
+		if err == nil {
+			return data, nil
+		}
+		lastErr = err
+		if i < attempts-1 {
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	return nil, lastErr
+}
+
 // cachedRecord returns the best cached record for a start URL: a live access token if one
 // exists, otherwise a refreshable record. Unlike a plain expiry filter, an expired record
 // is still worth returning — its refresh token is what saves us a browser round trip.
@@ -510,7 +532,7 @@ func cachedRecord(startURL string) *tokenRecord {
 		if !strings.HasSuffix(e.Name(), ".json") {
 			continue
 		}
-		data, err := os.ReadFile(filepath.Join(ssoCacheDir(), e.Name()))
+		data, err := readFileRetrying(filepath.Join(ssoCacheDir(), e.Name()))
 		if err != nil {
 			continue
 		}
@@ -771,7 +793,27 @@ func writeRecord(rec *tokenRecord) {
 	if tmp.Close() != nil {
 		return
 	}
-	_ = os.Rename(tmp.Name(), filepath.Join(dir, name))
+	renameReplacingExisting(tmp.Name(), filepath.Join(dir, name))
+}
+
+// renameReplacingExisting is os.Rename with a few retries: POSIX rename onto an existing
+// destination is a single atomic swap, but Windows's MoveFileEx has to delete-then-create
+// under the hood, which a concurrent reader (this cache file has several: the AWS CLI, and
+// under load a second warren process refreshing the same start URL — see the re-read in
+// SilentToken) or antivirus scanning it can transiently contend with, failing the rename
+// outright rather than just racing a reader for which state it sees. A silently-dropped
+// rename is worse than a delayed one: the write is lost outright rather than merely late, so
+// this is worth a few retries where a plain os.WriteFile never needed any.
+func renameReplacingExisting(oldpath, newpath string) {
+	const attempts = 5
+	for i := 0; i < attempts; i++ {
+		if os.Rename(oldpath, newpath) == nil {
+			return
+		}
+		if i < attempts-1 {
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
 }
 
 func hashString(s string) uint32 {

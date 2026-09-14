@@ -430,6 +430,44 @@ func TestSaveWritesAtomically(t *testing.T) {
 	}
 }
 
+// Windows's MoveFileEx onto an existing destination isn't the single atomic swap POSIX rename
+// is, and can transiently fail under contention from a second warren process. This proves
+// renameReplacingExisting retries rather than giving up on the first failure, using a
+// destination directory that doesn't exist as a stand-in for "doomed no matter how many times
+// we try," since that is reliably reproducible on any OS, unlike the real Windows race.
+func TestRenameReplacingExistingRetries(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src")
+	if err := os.WriteFile(src, []byte("x"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	renameReplacingExisting(src, filepath.Join(dir, "does-not-exist", "dest"))
+	elapsed := time.Since(start)
+
+	const wantMinimum = 4 * 10 * time.Millisecond // 5 attempts, 4 waits between them
+	if elapsed < wantMinimum {
+		t.Errorf("gave up after %s, want at least %s — looks like it did not retry", elapsed, wantMinimum)
+	}
+	if _, err := os.Stat(src); err != nil {
+		t.Errorf("source file gone after a rename that never succeeded: %v", err)
+	}
+}
+
+func TestReadFileRetryingRetries(t *testing.T) {
+	start := time.Now()
+	_, err := readFileRetrying(filepath.Join(t.TempDir(), "never-existed"))
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("readFileRetrying = nil error, want one for a file that never exists")
+	}
+	const wantMinimum = 4 * 10 * time.Millisecond
+	if elapsed < wantMinimum {
+		t.Errorf("gave up after %s, want at least %s — looks like it did not retry", elapsed, wantMinimum)
+	}
+}
+
 // Tunnels must outlive warren, which is what the Quit row promises. ctrl-c sends SIGINT to the whole
 // foreground process group, so a plugin sharing warren's group died with it — see internal/procgroup.
 func TestBackgroundPluginIsDetachedFromWarrensProcessGroup(t *testing.T) {
