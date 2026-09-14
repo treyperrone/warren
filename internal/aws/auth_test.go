@@ -348,6 +348,84 @@ func TestWriteRecordLeavesNoTempFile(t *testing.T) {
 	}
 }
 
+// Windows's MoveFileEx onto an existing destination isn't the single atomic swap POSIX rename
+// is, and can transiently fail under contention from a concurrent reader — this proves
+// renameReplacingExisting retries rather than giving up on the first failure, using a
+// destination directory that doesn't exist as a stand-in for "doomed no matter how many times
+// we try," since that is reliably reproducible on any OS, unlike the real Windows race.
+func TestRenameReplacingExistingRetries(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src")
+	if err := os.WriteFile(src, []byte("x"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	renameReplacingExisting(src, filepath.Join(dir, "does-not-exist", "dest"))
+	elapsed := time.Since(start)
+
+	const wantMinimum = 4 * 10 * time.Millisecond // 5 attempts, 4 waits between them
+	if elapsed < wantMinimum {
+		t.Errorf("gave up after %s, want at least %s — looks like it did not retry", elapsed, wantMinimum)
+	}
+	if _, err := os.Stat(src); err != nil {
+		t.Errorf("source file gone after a rename that never succeeded: %v", err)
+	}
+}
+
+// The ordinary case must still behave exactly like a plain os.Rename.
+func TestRenameReplacingExistingSucceedsOnTheFirstTry(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src")
+	dest := filepath.Join(dir, "dest")
+	if err := os.WriteFile(src, []byte("content"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dest, []byte("stale"), 0600); err != nil {
+		t.Fatal(err) // renaming onto an existing destination is the case that matters here
+	}
+
+	renameReplacingExisting(src, dest)
+
+	got, err := os.ReadFile(dest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "content" {
+		t.Errorf("dest = %q, want the renamed content", got)
+	}
+	if _, err := os.Stat(src); !os.IsNotExist(err) {
+		t.Errorf("source still exists after a successful rename: err = %v", err)
+	}
+}
+
+func TestReadFileRetryingRetries(t *testing.T) {
+	start := time.Now()
+	_, err := readFileRetrying(filepath.Join(t.TempDir(), "never-existed"))
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("readFileRetrying = nil error, want one for a file that never exists")
+	}
+	const wantMinimum = 4 * 10 * time.Millisecond
+	if elapsed < wantMinimum {
+		t.Errorf("gave up after %s, want at least %s — looks like it did not retry", elapsed, wantMinimum)
+	}
+}
+
+func TestReadFileRetryingSucceedsOnTheFirstTry(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "f")
+	if err := os.WriteFile(path, []byte("hello"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := readFileRetrying(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "hello" {
+		t.Errorf("got %q, want %q", got, "hello")
+	}
+}
+
 // The bug: two readers/writers of the same cache file (the AWS CLI, or a second warren
 // process) can both try to refresh a start URL near expiry. The loser's refresh token is
 // already rotated out from under it, so AWS rejects it with the same InvalidGrantException a

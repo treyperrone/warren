@@ -152,7 +152,7 @@ func NewManager() *Manager {
 // is unreadable/corrupt — a crash mid-write is the ordinary way to produce the latter, and it
 // must read as "nothing persisted" rather than propagate a parse error nobody would act on.
 func readEntries(file string) []persistEntry {
-	data, err := os.ReadFile(file)
+	data, err := readFileRetrying(file)
 	if err != nil {
 		return nil
 	}
@@ -161,6 +161,29 @@ func readEntries(file string) []persistEntry {
 		return nil
 	}
 	return entries
+}
+
+// readFileRetrying is os.ReadFile with a few retries — the read-side counterpart to
+// renameReplacingExisting's write-side retries, below. A second warren process's save()
+// replacing this exact file can leave a brief window on Windows where it is momentarily gone
+// or locked mid-swap (MoveFileEx onto an existing destination isn't the single atomic swap
+// POSIX rename is); without a retry, that single unlucky poll reads as "no tunnels" — the same
+// wrong conclusion a truncated read would produce, and the reason save() writes atomically in
+// the first place.
+func readFileRetrying(path string) ([]byte, error) {
+	const attempts = 5
+	var lastErr error
+	for i := 0; i < attempts; i++ {
+		data, err := os.ReadFile(path)
+		if err == nil {
+			return data, nil
+		}
+		lastErr = err
+		if i < attempts-1 {
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	return nil, lastErr
 }
 
 func (m *Manager) load() {
@@ -258,7 +281,26 @@ func writeFileAtomic(path string, data []byte, perm os.FileMode) {
 	if tmp.Close() != nil {
 		return
 	}
-	_ = os.Rename(tmp.Name(), path)
+	renameReplacingExisting(tmp.Name(), path)
+}
+
+// renameReplacingExisting is os.Rename with a few retries: POSIX rename onto an existing
+// destination is a single atomic swap, but Windows's MoveFileEx has to delete-then-create
+// under the hood, which a concurrent reader (a second warren process, mid-load or mid-save)
+// can transiently contend with, failing the rename outright rather than just racing a reader
+// for which state it sees. A silently-dropped rename is worse than a delayed one: the write is
+// lost outright rather than merely late, so this is worth a few retries where a plain
+// os.WriteFile never needed any.
+func renameReplacingExisting(oldpath, newpath string) {
+	const attempts = 5
+	for i := 0; i < attempts; i++ {
+		if os.Rename(oldpath, newpath) == nil {
+			return
+		}
+		if i < attempts-1 {
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
 }
 
 func (m *Manager) Add(t *Tunnel) {
