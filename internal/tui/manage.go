@@ -19,8 +19,9 @@ import (
 const favInlineMax = 4
 
 const (
-	methodFavList      = "= favorites list"
-	methodRemoveProfil = "= remove profile"
+	methodFavList       = "= favorites list"
+	methodRemoveProfil  = "= remove profile"
+	methodRemoveSession = "= remove sso session"
 )
 
 // buildFavoritesList is the dedicated favorites screen: every bookmark, plus the removal
@@ -209,4 +210,116 @@ func (m *Model) profileConfirmView() string {
 	return m.banner() + m.noticeLine() + m.list.View() + "\n\n" +
 		styleDim.MarginLeft(2).Render("lines to be removed:") + "\n" +
 		styleErr.MarginLeft(4).Render(strings.TrimRight(m.profileRemoveBlock, "\n")) + "\n\n" + m.footer()
+}
+
+// ---- SSO session removal (cascades to every profile that names it, and any favorite
+// bookmarked through it) -----------------------------------------------------------------
+
+// buildSessionRemoveList offers every configured sso-session for removal. Leaving an org
+// behind today means deleting a session's profiles one at a time and then hand-editing
+// ~/.aws/config for the [sso-session] block itself — this is the one-operation version.
+func (m *Model) buildSessionRemoveList() {
+	var items []list.Item
+	for _, s := range m.ssoSessions {
+		items = append(items, item{
+			title: "✕ SSO: " + s.Name,
+			desc:  s.StartURL + " — enter previews everything that would be removed",
+			value: s.Name,
+		})
+	}
+	m.list.Title = "Remove an SSO session  •  Esc=back"
+	m.list.SetStatusBarItemName("session", "sessions")
+	m.setListItems(items)
+	m.list.Select(0)
+}
+
+func (m *Model) selectSessionRemove(name string) tea.Cmd {
+	block, err := awsint.SSOSessionBlockText(name)
+	if err != nil {
+		m.err = err
+		return nil
+	}
+	var startURL string
+	for _, s := range m.ssoSessions {
+		if s.Name == name {
+			startURL = s.StartURL
+			break
+		}
+	}
+	m.sessionRemoveName = name
+	m.sessionRemoveBlock = block
+	m.sessionRemoveProfiles = awsint.ProfilesForSession(m.profiles, name)
+	m.sessionRemoveFavorites = nil
+	for _, f := range browser.Favorites() {
+		if f.StartURL == startURL {
+			m.sessionRemoveFavorites = append(m.sessionRemoveFavorites, f)
+		}
+	}
+	m.buildSessionConfirmList()
+	m.screen = screenSSOSessionConfirm
+	return nil
+}
+
+// buildSessionConfirmList states the blast radius up front — a session removal cascades to
+// every profile that names it and any favorite bookmarked through it, so the count belongs
+// on the title, not buried in the preview below.
+func (m *Model) buildSessionConfirmList() {
+	m.list.Title = fmt.Sprintf("Remove [sso-session %s] + %d profile(s) + %d favorite(s)?  •  a .warren.bak backup is taken first",
+		m.sessionRemoveName, len(m.sessionRemoveProfiles), len(m.sessionRemoveFavorites))
+	m.list.SetStatusBarItemName("option", "options")
+	m.setListItems([]list.Item{
+		item{title: "Keep it", desc: "change nothing", value: "keep"},
+		item{title: "Remove it", desc: "delete the session, its profiles, and its favorites", value: "remove"},
+	})
+	m.list.Select(0)
+}
+
+func (m *Model) selectSessionConfirm(val string) tea.Cmd {
+	if val != "remove" {
+		m.buildSessionRemoveList()
+		m.screen = screenSSOSessionRemove
+		return nil
+	}
+	for _, p := range m.sessionRemoveProfiles {
+		if err := awsint.RemoveProfileBlock(p.Name); err != nil {
+			m.err = err
+			return nil
+		}
+	}
+	if err := awsint.RemoveSSOSessionBlock(m.sessionRemoveName); err != nil {
+		m.err = err
+		return nil
+	}
+	for _, f := range m.sessionRemoveFavorites {
+		if err := browser.RemoveFavorite(f); err != nil {
+			m.err = err
+			return nil
+		}
+	}
+	m.notice = fmt.Sprintf("removed [sso-session %s], %d profile(s) and %d favorite(s) — backup at ~/.aws/config.warren.bak",
+		m.sessionRemoveName, len(m.sessionRemoveProfiles), len(m.sessionRemoveFavorites))
+	if sessions, profiles, err := awsint.ParseConfig(); err == nil {
+		m.ssoSessions, m.profiles = sessions, profiles
+	}
+	m.buildMethodList()
+	m.screen = screenMethod
+	return nil
+}
+
+// sessionConfirmView pins the doomed config-file lines, plus the favorites that will also
+// go, under the keep/remove list. Favorites live in warren's own JSON rather than
+// ~/.aws/config, so they are named rather than shown as file lines.
+func (m *Model) sessionConfirmView() string {
+	out := m.banner() + m.noticeLine() + m.list.View() + "\n\n" +
+		styleDim.MarginLeft(2).Render("lines to be removed:") + "\n" +
+		styleErr.MarginLeft(4).Render(strings.TrimRight(m.sessionRemoveBlock, "\n"))
+	if len(m.sessionRemoveFavorites) > 0 {
+		var names []string
+		for _, f := range m.sessionRemoveFavorites {
+			names = append(names, f.Nickname)
+		}
+		out += "\n\n" + styleDim.MarginLeft(2).Render("favorites to be removed:") + "\n" +
+			styleErr.MarginLeft(4).Render(strings.Join(names, ", "))
+	}
+	return out + "\n\n" + m.footer()
 }
