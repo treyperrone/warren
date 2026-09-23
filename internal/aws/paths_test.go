@@ -265,6 +265,66 @@ func TestRemoveProfileKeepsNextBlocksComment(t *testing.T) {
 	}
 }
 
+func TestRemoveSSOSessionBlockLeavesSiblingsAlone(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("AWS_CONFIG_FILE", "")
+	if err := os.MkdirAll(filepath.Join(home, ".aws"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	content := "[sso-session doomed]\nsso_start_url = https://doomed.awsapps.com/start\nsso_region = us-east-1\n\n" +
+		"# added by warren\n[sso-session survivor]\nsso_start_url = https://survivor.awsapps.com/start\nsso_region = us-east-1\n\n" +
+		"[profile unrelated]\nregion = us-west-2\n"
+	if err := os.WriteFile(filepath.Join(home, ".aws", "config"), []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	block, err := SSOSessionBlockText("doomed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(block, "[sso-session doomed]") {
+		t.Errorf("preview missing the doomed header:\n%s", block)
+	}
+
+	if err := RemoveSSOSessionBlock("doomed"); err != nil {
+		t.Fatal(err)
+	}
+	after, _ := os.ReadFile(filepath.Join(home, ".aws", "config"))
+	if strings.Contains(string(after), "doomed") {
+		t.Errorf("doomed session survived:\n%s", after)
+	}
+	if !strings.Contains(string(after), "# added by warren\n[sso-session survivor]") {
+		t.Errorf("the surviving session lost its ownership comment:\n%s", after)
+	}
+	if !strings.Contains(string(after), "[profile unrelated]") {
+		t.Errorf("unrelated profile block was removed:\n%s", after)
+	}
+
+	if _, err := SSOSessionBlockText("doomed"); err == nil {
+		t.Error("expected an error previewing a session that no longer exists")
+	}
+	if err := RemoveSSOSessionBlock("doomed"); err == nil {
+		t.Error("expected an error removing a session that no longer exists")
+	}
+}
+
+func TestProfilesForSession(t *testing.T) {
+	profiles := []ProfileConfig{
+		{Name: "a", SSOSession: "lab"},
+		{Name: "b", SSOSession: "prod"},
+		{Name: "c", SSOSession: "lab"},
+	}
+	got := ProfilesForSession(profiles, "lab")
+	if len(got) != 2 || got[0].Name != "a" || got[1].Name != "c" {
+		t.Errorf("ProfilesForSession(lab) = %+v, want a and c", got)
+	}
+	if got := ProfilesForSession(profiles, "nonexistent"); got != nil {
+		t.Errorf("ProfilesForSession(nonexistent) = %+v, want nil", got)
+	}
+}
+
 // Empty values and "default" must never reach a credential_process line or a header.
 func TestAddCredentialProcessProfileRejectsEmptyAndDefault(t *testing.T) {
 	home := t.TempDir()
