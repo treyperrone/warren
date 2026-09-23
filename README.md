@@ -137,7 +137,9 @@ A 300-account Identity Center has maybe five destinations you actually live in. 
 
 Favorites can carry a whole **connection**, not just credentials: when a shell, SSH tunnel, or RDP tunnel starts, the tunnel manager offers **☆ Favorite this connection**. Selecting that pinned row later replays everything — sign-in if needed, role credentials, find the instance, start the tunnel. The instance is remembered by its **Name tag and re-resolved against what is running at launch**, never by instance id, so favorites survive ranges that rebuild their hosts; zero or ambiguous matches drop to the instance list with the reason shown. RDP tunnels also now **open your RDP client themselves** — `mstsc` on Windows, Windows App on macOS (via a generated `.rdp` file), `xfreerdp`/`remmina` on Linux when installed — with the old "point your client at localhost:PORT" line as the fallback when none is found. The connection is labelled with the instance's Name tag and the local port, so the client's window and bookmark read `web-01 (localhost-13389)` rather than `localhost-13389` — the name tells you which host, the port which tunnel. Clients open **in a window** by default (1600×1000, smart-sized so dragging the window rescales the desktop) rather than taking over the display; the **⚙ RDP sessions open in…** row on the method screen toggles that to full screen, stored as `rdp_screen` in `~/.warren_config.json`. The star also mints a CLI nickname (`corp-lab-adminrole`), so `warren exec corp-lab-adminrole -- aws s3 ls` and `warren shell corp-lab-adminrole` work with no picker and no saved AWS profile — children still read from the auto-renewing loopback endpoint, so nothing goes stale at the hour mark. Favorites live in `~/.warren_config.json`; unstar from the same action screen row. Past four bookmarks the method screen collapses them into a single **★ Favorites (N)** row — Enter, Enter still connects the first — leading to a dedicated screen that also carries the removal flow. Anywhere a favorite row renders, **x removes it** — the row says so. Picking RDP on a box that reports as Linux warns once on the row (and pauses a favorite replay); proceeding records that the box runs xrdp — keyed by account + Name tag, repave-proof — and the warning never returns for it.
 
-Bad `[profile]` blocks can be removed without hand-editing: **✕ Remove an AWS profile** on the method screen previews the exact lines that would be deleted, takes a `.warren.bak` backup, and removes only that block — every other byte of `~/.aws/config` survives verbatim. This is the one deliberate exception to warren's append-only rule, kept safe by being textual surgery rather than a parse-and-rewrite.
+Bad `[profile]` blocks can be removed without hand-editing: **✕ Remove an AWS profile** on the method screen previews the exact lines that would be deleted, takes a `.warren.bak` backup, and removes only that block — every other byte of `~/.aws/config` survives verbatim. This is one of two deliberate exceptions to warren's append-only rule, kept safe by being textual surgery rather than a parse-and-rewrite.
+
+Retiring a whole SSO session — leaving an org, say — is the other: **✕ Remove an SSO session** on the method screen deletes the `[sso-session]` block, every `[profile]` that names it, and any favorite bookmarked through it, in one confirmed step. The preview names all of it (blocks and favorite nicknames) before anything is touched, and the same `.warren.bak` backup is taken first.
 
 ### Profiles that never go stale (`warren creds`)
 
@@ -162,10 +164,11 @@ The running version is also shown in the TUI's header bar, next to the name.
 | `enter` | select |
 | `n` | new connection (main screen) |
 | `p` | switch auth (main screen) |
+| `m` | jump to the main screen (tunnel manager) — works on every screen |
 | `r` | re-authenticate — shown on any list when the background renewal has given up on the SSO session |
 | `?` | about — version, keys, and where to report a problem; works on every screen |
-| `q` | quit — active tunnels keep running |
-| `ctrl+c` | quit |
+| `q` | quit — asks first; active tunnels keep running |
+| `ctrl+c` | quit immediately, no confirmation |
 
 `?` is advertised at the right-hand end of the banner, so you do not have to know it in advance. On a terminal too short to hold it, it scrolls with the arrow keys or the mouse wheel and always keeps the way out on screen. Note that scrolling your *terminal* back will not reveal it — warren runs in the alternate screen buffer, which has no scrollback, so the scrolling has to be warren's own. It shows the running warren and plugin versions plus your platform — exactly what a bug report needs — and it is reachable from wherever you happen to be rather than only from the main screen.
 
