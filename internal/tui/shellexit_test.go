@@ -34,14 +34,26 @@ func TestEscOnMainScreenDoesNotQuit(t *testing.T) {
 	}
 }
 
-// q is the advertised way out and stays that way; the list title says so.
-func TestQOnMainScreenStillQuits(t *testing.T) {
+// q is the advertised way out, and still gets there — through the confirm screen rather than
+// quitting outright, same as everywhere else now.
+func TestQOnMainScreenAsksBeforeQuitting(t *testing.T) {
 	m := mainScreenModel(t)
 
 	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
 
-	if !isQuit(t, cmd) {
-		t.Error("q no longer quits from the tunnel manager")
+	if isQuit(t, cmd) {
+		t.Fatal("q quit directly from the tunnel manager instead of asking first")
+	}
+	if m.screen != screenQuitConfirm {
+		t.Fatalf("screen = %v, want screenQuitConfirm", m.screen)
+	}
+	if m.quitReturn != screenMain {
+		t.Errorf("quitReturn = %v, want screenMain", m.quitReturn)
+	}
+
+	m.quitList.Select(1) // "Quit"
+	if !isQuit(t, m.selectQuitConfirm()) {
+		t.Error("confirming Quit from the tunnel manager's ask did not quit")
 	}
 }
 

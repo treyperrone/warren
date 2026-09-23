@@ -75,6 +75,14 @@ type ProfileConfig struct {
 	// the same device flow, so login can serve it by synthesizing a session config.
 	SSOStartURL string
 	SSORegion   string
+	// CredsSession is the --session name embedded in a `credential_process = warren creds
+	// ...` command line (AddCredentialProcessProfile's own format), when this profile is one
+	// of warren's own. Deliberately separate from SSOSession: LoginSession gates the
+	// interactive device-auth flow on SSOSession being set, and a credential_process profile
+	// is correctly excluded from that (warren creds handles its own auth). CredsSession
+	// exists only so ProfilesForSession can still find these profiles for cascade removal —
+	// the profile type `warren setup`/favorites actually create day to day.
+	CredsSession string
 }
 
 // LoginSession resolves the sso-session a sign-in for this profile should run against, or
@@ -175,10 +183,11 @@ func ParseConfig() ([]SSOSessionConfig, []ProfileConfig, error) {
 			name := strings.TrimSpace(strings.TrimPrefix(curHeader, "profile ")) // same trailing-space gap as sso-session, above
 			if name != "default" {
 				profiles = append(profiles, ProfileConfig{
-					Name:        name,
-					SSOSession:  cur["sso_session"],
-					SSOStartURL: cur["sso_start_url"],
-					SSORegion:   cur["sso_region"],
+					Name:         name,
+					SSOSession:   cur["sso_session"],
+					SSOStartURL:  cur["sso_start_url"],
+					SSORegion:    cur["sso_region"],
+					CredsSession: credsProcessSession(cur["credential_process"]),
 				})
 			}
 		}
@@ -199,6 +208,21 @@ func ParseConfig() ([]SSOSessionConfig, []ProfileConfig, error) {
 	}
 	flush()
 	return sessions, profiles, nil
+}
+
+// credsProcessSession extracts the --session value from a credential_process line in
+// AddCredentialProcessProfile's own format ("warren creds --session X --account Y --role
+// Z"). validSessionName already forbids spaces and shell metacharacters in a session name at
+// write time, so splitting on whitespace is exact for anything warren itself wrote; anything
+// else (a hand-written credential_process, a different tool's) yields "", same as absent.
+func credsProcessSession(cmdline string) string {
+	fields := strings.Fields(cmdline)
+	for i, f := range fields {
+		if f == "--session" && i+1 < len(fields) {
+			return fields[i+1]
+		}
+	}
+	return ""
 }
 
 // validSessionName reports whether name is safe to write inside an [sso-session <name>] header.
@@ -397,7 +421,7 @@ func removeBlock(path, header, describe string) error {
 func ProfilesForSession(profiles []ProfileConfig, sessionName string) []ProfileConfig {
 	var out []ProfileConfig
 	for _, p := range profiles {
-		if p.SSOSession == sessionName {
+		if p.SSOSession == sessionName || p.CredsSession == sessionName {
 			out = append(out, p)
 		}
 	}

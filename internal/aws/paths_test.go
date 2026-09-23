@@ -315,13 +315,30 @@ func TestProfilesForSession(t *testing.T) {
 		{Name: "a", SSOSession: "lab"},
 		{Name: "b", SSOSession: "prod"},
 		{Name: "c", SSOSession: "lab"},
+		// warren's own credential_process profiles never set SSOSession (see LoginSession) —
+		// CredsSession is how these are still found for cascade removal.
+		{Name: "d", CredsSession: "lab"},
 	}
 	got := ProfilesForSession(profiles, "lab")
-	if len(got) != 2 || got[0].Name != "a" || got[1].Name != "c" {
-		t.Errorf("ProfilesForSession(lab) = %+v, want a and c", got)
+	if len(got) != 3 || got[0].Name != "a" || got[1].Name != "c" || got[2].Name != "d" {
+		t.Errorf("ProfilesForSession(lab) = %+v, want a, c and d", got)
 	}
 	if got := ProfilesForSession(profiles, "nonexistent"); got != nil {
 		t.Errorf("ProfilesForSession(nonexistent) = %+v, want nil", got)
+	}
+}
+
+func TestCredsProcessSession(t *testing.T) {
+	cases := map[string]string{
+		"warren creds --session lab --account 111111111111 --role Admin": "lab",
+		"warren creds --account 111111111111 --role Admin":               "", // hand-edited, no --session
+		"":                  "",
+		"aws configure sso": "", // some other tool's line entirely
+	}
+	for cmdline, want := range cases {
+		if got := credsProcessSession(cmdline); got != want {
+			t.Errorf("credsProcessSession(%q) = %q, want %q", cmdline, got, want)
+		}
 	}
 }
 
