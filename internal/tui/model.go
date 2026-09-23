@@ -41,26 +41,29 @@ const (
 	screenMain                   // main tunnel manager
 	// screenSetup is last so that screenMethod stays the zero value: a Model that somehow
 	// reaches Update without New() should fall into the normal picker, not the config writer.
-	screenSetup          // first run — no sso-session and no profile in ~/.aws/config
-	screenRegion         // region picker, opened from the setup form
-	screenAction         // what to do with the credentials just resolved
-	screenBuildService   // command builder: pick a service
-	screenBuildTask      // command builder: pick a task within that service
-	screenBuildParams    // command builder: fill in parameters and run
-	screenAbout          // version, keys, and where to report a problem
-	screenBrowser        // which browser SSO sign-in opens in (the ⚙ setting)
-	screenBrowserProfile // which profile inside that browser
-	screenLoginBrowser   // the same choice, asked inline because a sign-in is needed NOW
-	screenLoginProfile   // profile step of the inline ask
-	screenLoginRemember  // "just this once" vs "always" after an inline pick
-	screenS3Buckets      // S3 browser: pick a bucket
-	screenS3Objects      // S3 browser: one delimiter level of a bucket
-	screenS3Upload       // S3 browser: path box that accepts a dragged file
-	screenFavorites      // all favorites, when too many to inline on the method screen
-	screenFavoriteRemove // pick favorites to delete
-	screenProfileRemove  // pick an AWS profile to remove from ~/.aws/config
-	screenProfileConfirm // the exact doomed lines + keep/remove
-	screenSessionActions // what to do with an active tunnel: reconnect / favorite / disconnect
+	screenSetup             // first run — no sso-session and no profile in ~/.aws/config
+	screenRegion            // region picker, opened from the setup form
+	screenAction            // what to do with the credentials just resolved
+	screenBuildService      // command builder: pick a service
+	screenBuildTask         // command builder: pick a task within that service
+	screenBuildParams       // command builder: fill in parameters and run
+	screenAbout             // version, keys, and where to report a problem
+	screenBrowser           // which browser SSO sign-in opens in (the ⚙ setting)
+	screenBrowserProfile    // which profile inside that browser
+	screenLoginBrowser      // the same choice, asked inline because a sign-in is needed NOW
+	screenLoginProfile      // profile step of the inline ask
+	screenLoginRemember     // "just this once" vs "always" after an inline pick
+	screenS3Buckets         // S3 browser: pick a bucket
+	screenS3Objects         // S3 browser: one delimiter level of a bucket
+	screenS3Upload          // S3 browser: path box that accepts a dragged file
+	screenFavorites         // all favorites, when too many to inline on the method screen
+	screenFavoriteRemove    // pick favorites to delete
+	screenProfileRemove     // pick an AWS profile to remove from ~/.aws/config
+	screenProfileConfirm    // the exact doomed lines + keep/remove
+	screenSessionActions    // what to do with an active tunnel: reconnect / favorite / disconnect
+	screenSSOSessionRemove  // pick an sso-session to remove, cascading to its profiles + favorites
+	screenSSOSessionConfirm // the exact doomed lines/favorites + keep/remove
+	screenQuitConfirm       // "quit warren?" — every interactive quit routes through here
 )
 
 // resumeKind is what a successful re-authentication should do once it has rebuilt
@@ -240,6 +243,20 @@ type Model struct {
 	profileRemoveName  string
 	profileRemoveBlock string
 
+	// sso-session removal in flight: the session, its exact block text, and every profile
+	// and favorite the removal will cascade to — computed once on selection so the confirm
+	// screen and the actual removal act on the same snapshot.
+	sessionRemoveName      string
+	sessionRemoveBlock     string
+	sessionRemoveProfiles  []awsint.ProfileConfig
+	sessionRemoveFavorites []browser.Favorite
+
+	// quitReturn is the screen to restore to on "keep going"; quitList is a dedicated small
+	// list widget for the confirm screen so the underlying screen's own m.list (items,
+	// selection, filter) is never touched by asking.
+	quitReturn screen
+	quitList   list.Model
+
 	// liveSess is the thread-safe mirror of awsSess for transfer goroutines: stored on the
 	// event loop, loaded from S3 credential providers mid-transfer, so a download that
 	// crosses the hour mark picks up the background renewal instead of dying on the keys
@@ -341,6 +358,20 @@ func New(ctx context.Context) (*Model, error) {
 	// accounts, knowing a search narrowed to 3 is the difference between trusting the
 	// list and re-reading it.
 	l.SetShowStatusBar(true)
+	// bubbles/list's own keymap binds both "q" and "esc" straight to tea.Quit, independent
+	// of warren's own quit handling below — left enabled, an unhandled q/esc on any screen
+	// warren does not explicitly intercept falls through to this and quits instantly, with
+	// no confirmation. requestQuit is the only path to quit from here on.
+	l.DisableQuitKeybindings()
+
+	// A dedicated, minimal list for the quit-confirm screen: two rows that are never worth
+	// searching, so filtering is off entirely — it would otherwise read filter/quit key
+	// state off the wrong widget wherever this model checks m.list's state instead.
+	ql := list.New(nil, list.NewDefaultDelegate(), 0, 0)
+	ql.SetShowHelp(false)
+	ql.SetShowStatusBar(false)
+	ql.SetFilteringEnabled(false)
+	ql.DisableQuitKeybindings()
 
 	m := &Model{
 		ctx:         ctx,
@@ -349,6 +380,7 @@ func New(ctx context.Context) (*Model, error) {
 		manager:     tunnel.NewManager(),
 		spin:        sp,
 		list:        l,
+		quitList:    ql,
 	}
 
 	// Nothing configured at all. Previously this was a dead end — a missing ~/.aws/config
@@ -509,6 +541,20 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					return m, nil
 				}
 			}
+		}
+		// m jumps straight to the tunnel manager from anywhere — the fastest useful place to
+		// land after a laptop wakes up with an old session sitting open, rather than walking
+		// back through however many screens deep the flow happened to be.
+		if msg.String() == "m" && m.screen != screenMain && m.screen != screenQuitConfirm {
+			m.buildMainList()
+			m.screen = screenMain
+			return m, nil
+		}
+		// q asks before quitting, from every screen the footer advertises it on. screenMain
+		// handles its own "q" below (same requestQuit, just inside updateMain, which also owns
+		// "n"/"p" there); screenQuitConfirm obviously doesn't need to ask about itself.
+		if msg.String() == "q" && m.screen != screenMain && m.screen != screenQuitConfirm {
+			return m, m.requestQuit()
 		}
 		// screen-specific key handling
 		switch m.screen {
@@ -946,12 +992,17 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, cmd
 	}
 
-	// delegate to list widget
+	// delegate to list widget — the quit-confirm screen owns a separate one, so the screen
+	// it interrupted is never touched by asking.
 	if !m.loading {
 		if km, ok := msg.(tea.KeyMsg); ok && km.String() == "enter" {
 			return m, m.handleSelect()
 		}
 		var cmd tea.Cmd
+		if m.screen == screenQuitConfirm {
+			m.quitList, cmd = m.quitList.Update(msg)
+			return m, cmd
+		}
 		m.list, cmd = m.list.Update(msg)
 		return m, cmd
 	}
@@ -1050,7 +1101,7 @@ func (m *Model) goBack() tea.Cmd {
 	case screenS3Upload:
 		m.buildS3ObjectList()
 		m.screen = screenS3Objects
-	case screenFavorites, screenProfileRemove:
+	case screenFavorites, screenProfileRemove, screenSSOSessionRemove:
 		m.buildMethodList()
 		m.screen = screenMethod
 	case screenFavoriteRemove:
@@ -1059,6 +1110,12 @@ func (m *Model) goBack() tea.Cmd {
 	case screenProfileConfirm:
 		m.buildProfileRemoveList()
 		m.screen = screenProfileRemove
+	case screenSSOSessionConfirm:
+		m.buildSessionRemoveList()
+		m.screen = screenSSOSessionRemove
+	case screenQuitConfirm:
+		// The underlying screen's own m.list was never touched by asking — nothing to rebuild.
+		m.screen = m.quitReturn
 	case screenBuildService:
 		m.buildActionList()
 		m.screen = screenAction
@@ -1084,7 +1141,60 @@ func (m *Model) goBack() tea.Cmd {
 	return nil
 }
 
+// ---- quit confirmation ------------------------------------------------------
+
+// requestQuit is the only path to quitting warren from an interactive screen: every call
+// site that used to `return tea.Quit` now returns this instead, so a stray q or esc can
+// never end the program without the user seeing what is about to happen. ctrl+c (always an
+// instant force-quit) and the non-interactive `warren creds`/`warren exec` exit paths are
+// the deliberate exceptions — see their own call sites.
+func (m *Model) requestQuit() tea.Cmd {
+	m.quitReturn = m.screen
+	m.buildQuitConfirmList()
+	m.screen = screenQuitConfirm
+	return nil
+}
+
+// buildQuitConfirmList names what is actually at stake — background tunnels are the one
+// thing that survives a quit, so say so, but never block it: it is background work, not a
+// warning that quitting will fail or lose anything.
+func (m *Model) buildQuitConfirmList() {
+	title := "Quit warren?"
+	if n := len(m.manager.Active()); n > 0 {
+		title += fmt.Sprintf("  •  %d tunnel(s) will keep running in the background", n)
+	}
+	m.quitList.Title = title
+	m.quitList.SetItems([]list.Item{
+		item{title: "Keep going", desc: "stay right here", value: "keep"},
+		item{title: "Quit", desc: "exit warren", value: "confirmquit"},
+	})
+	m.quitList.Select(0)
+}
+
+// selectQuitConfirm reads m.quitList, not m.list — the underlying screen's own list is
+// never touched by asking, so "keep going" needs no rebuild to restore it.
+func (m *Model) selectQuitConfirm() tea.Cmd {
+	selected, ok := m.quitList.SelectedItem().(item)
+	if !ok || selected.value != "confirmquit" {
+		m.screen = m.quitReturn
+		return nil
+	}
+	return tea.Quit
+}
+
+// quitConfirmView renders the dedicated quit list alone — no banner clutter is needed for a
+// two-row yes/no.
+func (m *Model) quitConfirmView() string {
+	return m.banner() + m.quitList.View() + "\n\n" + m.footer()
+}
+
 func (m *Model) handleSelect() tea.Cmd {
+	// The quit-confirm screen reads its own dedicated list, not m.list — the underlying
+	// screen's own selection must survive asking whether to quit.
+	if m.screen == screenQuitConfirm {
+		return m.selectQuitConfirm()
+	}
+
 	selected, ok := m.list.SelectedItem().(item)
 	if !ok {
 		return nil
@@ -1146,6 +1256,10 @@ func (m *Model) handleSelect() tea.Cmd {
 		return m.selectProfileRemove(selected.value)
 	case screenProfileConfirm:
 		return m.selectProfileConfirm(selected.value)
+	case screenSSOSessionRemove:
+		return m.selectSessionRemove(selected.value)
+	case screenSSOSessionConfirm:
+		return m.selectSessionConfirm(selected.value)
 	}
 	return nil
 }
@@ -1154,7 +1268,7 @@ func (m *Model) handleSelect() tea.Cmd {
 
 func (m *Model) selectMethod(val string) tea.Cmd {
 	if val == "" {
-		return tea.Quit
+		return m.requestQuit()
 	}
 	if val == methodAddSession {
 		return m.StartSetup()
@@ -1181,6 +1295,11 @@ func (m *Model) selectMethod(val string) tea.Cmd {
 	if val == methodRemoveProfil {
 		m.buildProfileRemoveList()
 		m.screen = screenProfileRemove
+		return nil
+	}
+	if val == methodRemoveSession {
+		m.buildSessionRemoveList()
+		m.screen = screenSSOSessionRemove
 		return nil
 	}
 	// profile
@@ -1416,7 +1535,7 @@ func (m *Model) selectConnType(val string) tea.Cmd {
 		m.connType = tunnel.KindRDP
 		return m.startRDP()
 	case "quit":
-		return tea.Quit
+		return m.requestQuit()
 	}
 	return nil
 }
@@ -1717,15 +1836,16 @@ func (m *Model) updateMain(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.buildMethodList()
 		return m, nil
 	case "q":
-		return m, tea.Quit
+		return m, m.requestQuit()
 	case "esc":
 		// esc goes back, as it does on every other screen — it must not quit.
 		//
 		// This screen is where an interactive session returns to, and a terminal being handed
 		// back from a raw-mode child emits escape sequences as it is restored. Read as a
 		// keypress, a single one of those used to end the program, which looks exactly like
-		// "exiting the remote shell killed the tool". q and ctrl+c still quit, and the README
-		// always described esc as going back.
+		// "exiting the remote shell killed the tool". q now asks for confirmation rather than
+		// quitting outright, and ctrl+c still force-quits instantly, and the README always
+		// described esc as going back.
 		return m, m.goBack()
 	}
 	var cmd tea.Cmd
@@ -1762,7 +1882,7 @@ func (m *Model) handleMainSelect(val string) tea.Cmd {
 		m.loading = true
 		return m.fetchInstances()
 	case "quit":
-		return tea.Quit
+		return m.requestQuit()
 	default:
 		// A tunnel row. Enter used to kill it outright, which is a surprising amount of
 		// destruction for the default action — and no help at all when an RDP client window
@@ -2042,6 +2162,13 @@ func (m *Model) buildMethodList() {
 			value: methodRemoveProfil,
 		})
 	}
+	if len(m.ssoSessions) > 0 {
+		items = append(items, item{
+			title: "✕ Remove an SSO session",
+			desc:  "delete a session, every profile that names it, and its favorites — preview first, backup taken",
+			value: methodRemoveSession,
+		})
+	}
 
 	m.list.Title = "Select authentication method"
 	m.list.SetStatusBarItemName("method", "methods")
@@ -2242,6 +2369,12 @@ func (m *Model) View() string {
 	}
 	if m.screen == screenProfileConfirm {
 		return m.profileConfirmView()
+	}
+	if m.screen == screenSSOSessionConfirm {
+		return m.sessionConfirmView()
+	}
+	if m.screen == screenQuitConfirm {
+		return m.quitConfirmView()
 	}
 	if m.screen == screenAbout {
 		m.resizeAbout()

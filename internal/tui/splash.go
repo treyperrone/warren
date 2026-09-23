@@ -121,4 +121,5 @@ func (m *Model) resizeList() {
 		h = 3
 	}
 	m.list.SetSize(m.width, h)
+	m.quitList.SetSize(m.width, h)
 }

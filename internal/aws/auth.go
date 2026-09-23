@@ -75,6 +75,14 @@ type ProfileConfig struct {
 	// the same device flow, so login can serve it by synthesizing a session config.
 	SSOStartURL string
 	SSORegion   string
+	// CredsSession is the --session name embedded in a `credential_process = warren creds
+	// ...` command line (AddCredentialProcessProfile's own format), when this profile is one
+	// of warren's own. Deliberately separate from SSOSession: LoginSession gates the
+	// interactive device-auth flow on SSOSession being set, and a credential_process profile
+	// is correctly excluded from that (warren creds handles its own auth). CredsSession
+	// exists only so ProfilesForSession can still find these profiles for cascade removal —
+	// the profile type `warren setup`/favorites actually create day to day.
+	CredsSession string
 }
 
 // LoginSession resolves the sso-session a sign-in for this profile should run against, or
@@ -175,10 +183,11 @@ func ParseConfig() ([]SSOSessionConfig, []ProfileConfig, error) {
 			name := strings.TrimSpace(strings.TrimPrefix(curHeader, "profile ")) // same trailing-space gap as sso-session, above
 			if name != "default" {
 				profiles = append(profiles, ProfileConfig{
-					Name:        name,
-					SSOSession:  cur["sso_session"],
-					SSOStartURL: cur["sso_start_url"],
-					SSORegion:   cur["sso_region"],
+					Name:         name,
+					SSOSession:   cur["sso_session"],
+					SSOStartURL:  cur["sso_start_url"],
+					SSORegion:    cur["sso_region"],
+					CredsSession: credsProcessSession(cur["credential_process"]),
 				})
 			}
 		}
@@ -199,6 +208,21 @@ func ParseConfig() ([]SSOSessionConfig, []ProfileConfig, error) {
 	}
 	flush()
 	return sessions, profiles, nil
+}
+
+// credsProcessSession extracts the --session value from a credential_process line in
+// AddCredentialProcessProfile's own format ("warren creds --session X --account Y --role
+// Z"). validSessionName already forbids spaces and shell metacharacters in a session name at
+// write time, so splitting on whitespace is exact for anything warren itself wrote; anything
+// else (a hand-written credential_process, a different tool's) yields "", same as absent.
+func credsProcessSession(cmdline string) string {
+	fields := strings.Fields(cmdline)
+	for i, f := range fields {
+		if f == "--session" && i+1 < len(fields) {
+			return fields[i+1]
+		}
+	}
+	return ""
 }
 
 // validSessionName reports whether name is safe to write inside an [sso-session <name>] header.
@@ -334,35 +358,52 @@ func AddCredentialProcessProfile(name, sessionName, accountID, role string) erro
 // header through the last line before the next section — so a confirm screen can show the
 // user precisely what is about to leave the file, not a summary of it.
 func ProfileBlockText(name string) (string, error) {
-	data, err := os.ReadFile(ConfigPath())
+	return blockText(ConfigPath(), "[profile "+name+"]", "profile "+name)
+}
+
+// SSOSessionBlockText is ProfileBlockText's counterpart for an [sso-session name] block.
+func SSOSessionBlockText(name string) (string, error) {
+	return blockText(ConfigPath(), "[sso-session "+name+"]", "sso-session "+name)
+}
+
+func blockText(path, header, describe string) (string, error) {
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return "", fmt.Errorf("reading ~/.aws/config: %w", err)
 	}
-	kept, removed := splitProfileBlocks(string(data), name)
+	_, removed := splitBlock(string(data), header)
 	if removed == "" {
-		return "", fmt.Errorf("no [profile %s] block in ~/.aws/config", name)
+		return "", fmt.Errorf("no [%s] block in ~/.aws/config", describe)
 	}
-	_ = kept
 	return removed, nil
 }
 
 // RemoveProfileBlock deletes every [profile name] section from ~/.aws/config.
 //
-// This is the one deliberate exception to "warren only ever appends to this file", and it
-// keeps the spirit of the rule by being textual surgery, not a parse-and-rewrite: every
+// This is one of two deliberate exceptions to "warren only ever appends to this file", and
+// it keeps the spirit of the rule by being textual surgery, not a parse-and-rewrite: every
 // byte outside the removed section — comments, ordering, keys warren has never heard of —
 // survives verbatim, because ParseConfig is lossy and round-tripping through it is exactly
 // the failure mode the append-only rule exists to prevent. A .warren.bak copy is taken
 // first, same as every other touch of this file.
 func RemoveProfileBlock(name string) error {
-	path := ConfigPath()
+	return removeBlock(ConfigPath(), "[profile "+name+"]", "profile "+name)
+}
+
+// RemoveSSOSessionBlock is RemoveProfileBlock's counterpart for an [sso-session name]
+// block — the other deliberate exception to append-only.
+func RemoveSSOSessionBlock(name string) error {
+	return removeBlock(ConfigPath(), "[sso-session "+name+"]", "sso-session "+name)
+}
+
+func removeBlock(path, header, describe string) error {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return fmt.Errorf("reading ~/.aws/config: %w", err)
 	}
-	kept, removed := splitProfileBlocks(string(data), name)
+	kept, removed := splitBlock(string(data), header)
 	if removed == "" {
-		return fmt.Errorf("no [profile %s] block in ~/.aws/config", name)
+		return fmt.Errorf("no [%s] block in ~/.aws/config", describe)
 	}
 
 	if err := os.WriteFile(path+".warren.bak", data, 0o600); err != nil {
@@ -374,13 +415,25 @@ func RemoveProfileBlock(name string) error {
 	return nil
 }
 
-// splitProfileBlocks partitions the file into what stays and what goes for one profile
-// name. A section runs from its header to the line before the next [header]. A "# added by
+// ProfilesForSession returns the subset of profiles that sign in via the named sso-session —
+// the profiles a session removal would orphan, and so the ones that should be removed
+// alongside it.
+func ProfilesForSession(profiles []ProfileConfig, sessionName string) []ProfileConfig {
+	var out []ProfileConfig
+	for _, p := range profiles {
+		if p.SSOSession == sessionName || p.CredsSession == sessionName {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// splitBlock partitions the file into what stays and what goes for one "[header]" section.
+// A section runs from its header to the line before the next [header]. A "# added by
 // warren" comment sitting directly above the header goes with its block — it describes
 // nothing else — while every other comment stays, because ownership of those is unknowable.
-func splitProfileBlocks(text, name string) (kept, removed string) {
+func splitBlock(text, header string) (kept, removed string) {
 	lines := strings.SplitAfter(text, "\n")
-	header := "[profile " + name + "]"
 	var keep, gone []string
 	removing := false
 	const warrenComment = "# added by warren"
@@ -413,7 +466,8 @@ func splitProfileBlocks(text, name string) (kept, removed string) {
 }
 
 // appendConfigBlock backs up whatever exists, then strictly appends. Together with
-// RemoveProfileBlock's surgical delete, these are the only two writers of ~/.aws/config.
+// removeBlock's surgical delete (RemoveProfileBlock, RemoveSSOSessionBlock), these are the
+// only writers of ~/.aws/config.
 func appendConfigBlock(path, block string) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return fmt.Errorf("creating ~/.aws: %w", err)

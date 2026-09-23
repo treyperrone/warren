@@ -33,6 +33,12 @@ var (
 // Ordering is priority — footer drops from the END when the terminal is too narrow, so the
 // keys most worth knowing survive longest.
 func (m *Model) footerHints() []keyHint {
+	// The quit-confirm screen is a two-row yes/no on its own dedicated list — the usual
+	// search/navigation/quit hints below don't apply, and "q"->quit on this screen itself
+	// would be a strange thing to advertise.
+	if m.screen == screenQuitConfirm {
+		return []keyHint{{"enter", "confirm"}, {"esc", "keep going"}}
+	}
 	// Typing a search: the list owns the keyboard and the usual keys mean other things.
 	if m.list.SettingFilter() {
 		return []keyHint{{"enter", "apply search"}, {"esc", "cancel search"}}
@@ -74,6 +80,8 @@ func (m *Model) footerHints() []keyHint {
 		add("enter", "remove")
 	case screenProfileConfirm:
 		add("enter", "confirm")
+	case screenSSOSessionConfirm:
+		add("enter", "confirm")
 	case screenMethod:
 		if sel.value == methodRDPScreen {
 			add("enter", "toggle")
@@ -93,6 +101,11 @@ func (m *Model) footerHints() []keyHint {
 	// session — the same condition credRefreshNote reports in the header.
 	if errors.Is(m.credRefreshErr, awsint.ErrLoginRequired) && m.canReauth() {
 		add("r", "re-authenticate")
+	}
+
+	// Not worth advertising from the screen it would be a no-op on.
+	if m.screen != screenMain {
+		add("m", "main screen")
 	}
 
 	add("/", "search")

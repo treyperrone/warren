@@ -685,6 +685,75 @@ func TestProfileRemoveFlow(t *testing.T) {
 	}
 }
 
+// SSO session removal: the confirm preview names the session's profiles and favorites, and
+// removing it cascades to all three — the crlab-departure scenario of "hundreds of profiles
+// behind one session" done as one operation instead of one profile at a time.
+func TestSessionRemoveFlow(t *testing.T) {
+	m := modelWithSSOSession(t)
+	if err := awsint.AddCredentialProcessProfile("crlab-web", "corp", "111111111111", "Admin"); err != nil {
+		t.Fatal(err)
+	}
+	if err := awsint.AddCredentialProcessProfile("crlab-db", "corp", "111111111111", "ReadOnly"); err != nil {
+		t.Fatal(err)
+	}
+	sessions, profiles, _ := awsint.ParseConfig()
+	m.ssoSessions, m.profiles = sessions, profiles
+	if err := browser.AddFavorite(browser.Favorite{
+		Nickname: "crlab-fav", StartURL: "https://corp.awsapps.com/start",
+		AccountID: "111111111111", AccountName: "crlab", Role: "Admin",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	m.buildMethodList()
+	if _, ok := findItem(m, methodRemoveSession); !ok {
+		t.Fatal("no remove-session row despite a session existing")
+	}
+	m.selectMethod(methodRemoveSession)
+	if m.screen != screenSSOSessionRemove {
+		t.Fatalf("screen = %v", m.screen)
+	}
+
+	m.selectSessionRemove("corp")
+	if m.screen != screenSSOSessionConfirm || !strings.Contains(m.sessionRemoveBlock, "[sso-session corp]") {
+		t.Fatalf("confirm: screen=%v block=%q", m.screen, m.sessionRemoveBlock)
+	}
+	if len(m.sessionRemoveProfiles) != 2 {
+		t.Fatalf("sessionRemoveProfiles = %+v, want 2", m.sessionRemoveProfiles)
+	}
+	if len(m.sessionRemoveFavorites) != 1 || m.sessionRemoveFavorites[0].Nickname != "crlab-fav" {
+		t.Fatalf("sessionRemoveFavorites = %+v, want crlab-fav", m.sessionRemoveFavorites)
+	}
+	if !strings.Contains(m.list.Title, "2 profile(s)") || !strings.Contains(m.list.Title, "1 favorite(s)") {
+		t.Errorf("confirm title = %q, want it to name the counts", m.list.Title)
+	}
+	if first := m.list.Items()[0].(item); first.value != "keep" {
+		t.Errorf("first confirm row = %+v — Enter-through must be safe", first)
+	}
+
+	// Keep: nothing changes.
+	m.selectSessionConfirm("keep")
+	if len(m.profiles) != 2 || len(browser.Favorites()) != 1 {
+		t.Error("keep removed something")
+	}
+
+	// Remove: the session and everything it cascades to are gone, and the picker reloads.
+	m.screen = screenSSOSessionConfirm
+	m.selectSessionConfirm("remove")
+	if len(m.ssoSessions) != 0 || len(m.profiles) != 0 {
+		t.Errorf("after removal: sessions=%+v profiles=%+v", m.ssoSessions, m.profiles)
+	}
+	if len(browser.Favorites()) != 0 {
+		t.Errorf("favorite survived session removal: %+v", browser.Favorites())
+	}
+	if m.screen != screenMethod {
+		t.Fatalf("screen = %v, want method with nothing left to remove", m.screen)
+	}
+	if _, ok := findItem(m, methodRemoveSession); ok {
+		t.Error("remove-session row offered with no sessions")
+	}
+}
+
 // x on a highlighted inline favorite deletes it — the fix for "I have a bad favorite and
 // no TUI way to remove it" when the count is under the collapse threshold and the manage
 // screen therefore does not exist.
