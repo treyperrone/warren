@@ -120,6 +120,24 @@ func (m *Model) resizeList() {
 	if h < 3 {
 		h = 3
 	}
+	// The confirm screens are always exactly two rows (Keep/Remove, Keep going/Quit) —
+	// giving them the full screen wastes it on blank padding and, worse, pushes the trailing
+	// preview text (and on the profile/session screens, the title naming exactly what is
+	// about to be deleted) off the top of a real terminal, scrolled out of view on anything
+	// shorter than ~50 rows. A small fixed height leaves that room instead.
+	confirmScreen := m.screen == screenProfileConfirm || m.screen == screenSSOSessionConfirm || m.screen == screenQuitConfirm
+	if confirmScreen {
+		// Title + status bar + two 2-line items + chrome — enough for both rows to render
+		// without paginating, which would hide "Remove it"/"Quit" behind a page dot on the
+		// one screen where that row must never be a surprise.
+		h = 12
+	}
+	// Pagination only ever applies with more items than fit; these confirm lists are always
+	// exactly two, so the paginator row is pure waste — worse, it can round down to "1 fits,
+	// 1 doesn't" and hide the destructive option entirely. Restored for every other screen,
+	// where a long account/instance list genuinely needs it.
+	m.list.SetShowPagination(!confirmScreen)
+	m.quitList.SetShowPagination(!confirmScreen)
 	m.list.SetSize(m.width, h)
 	m.quitList.SetSize(m.width, h)
 }

@@ -415,6 +415,43 @@ func removeBlock(path, header, describe string) error {
 	return nil
 }
 
+// RemoveSSOSessionCascade removes an [sso-session] block and every named [profile] block from
+// ~/.aws/config in one write, backed up once, before any of it is touched.
+//
+// Doing this as repeated RemoveProfileBlock/RemoveSSOSessionBlock calls would work — each is
+// its own safe surgical delete — but each also takes its OWN backup first, so the last call
+// in the sequence overwrites .warren.bak with the state right before *it* ran. By the time a
+// multi-step cascade finishes, recovery only reaches the final step: the profiles removed by
+// earlier calls are gone from the backup too, not just the live file. One backup, one write.
+func RemoveSSOSessionCascade(sessionName string, profileNames []string) error {
+	path := ConfigPath()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("reading ~/.aws/config: %w", err)
+	}
+	text := string(data)
+	for _, name := range profileNames {
+		kept, removed := splitBlock(text, "[profile "+name+"]")
+		if removed == "" {
+			return fmt.Errorf("no [profile %s] block in ~/.aws/config", name)
+		}
+		text = kept
+	}
+	kept, removed := splitBlock(text, "[sso-session "+sessionName+"]")
+	if removed == "" {
+		return fmt.Errorf("no [sso-session %s] block in ~/.aws/config", sessionName)
+	}
+	text = kept
+
+	if err := os.WriteFile(path+".warren.bak", data, 0o600); err != nil {
+		return fmt.Errorf("backing up ~/.aws/config: %w", err)
+	}
+	if err := os.WriteFile(path, []byte(text), 0o600); err != nil {
+		return fmt.Errorf("writing ~/.aws/config: %w", err)
+	}
+	return nil
+}
+
 // ProfilesForSession returns the subset of profiles that sign in via the named sso-session —
 // the profiles a session removal would orphan, and so the ones that should be removed
 // alongside it.

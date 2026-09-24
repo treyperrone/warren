@@ -310,6 +310,52 @@ func TestRemoveSSOSessionBlockLeavesSiblingsAlone(t *testing.T) {
 	}
 }
 
+// The bug this guards: three separate RemoveProfileBlock/RemoveSSOSessionBlock calls in a row
+// each take their OWN backup, so the last call overwrites .warren.bak with the state right
+// before *it* ran — losing the earlier profiles from the backup too, not just the live file.
+// RemoveSSOSessionCascade must back up exactly once, before any of the three removals, so the
+// backup can restore the whole pre-cascade file, not just the last step.
+func TestRemoveSSOSessionCascadeBacksUpOnce(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("AWS_CONFIG_FILE", "")
+	if err := os.MkdirAll(filepath.Join(home, ".aws"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	original := "[sso-session crlab]\nsso_start_url = https://crlab.awsapps.com/start\nsso_region = us-east-1\n\n" +
+		"# added by warren\n[profile crlab-web]\ncredential_process = warren creds --session crlab --account 111111111111 --role Admin\n\n" +
+		"# added by warren\n[profile crlab-db]\ncredential_process = warren creds --session crlab --account 111111111111 --role ReadOnly\n"
+	cfg := filepath.Join(home, ".aws", "config")
+	if err := os.WriteFile(cfg, []byte(original), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := RemoveSSOSessionCascade("crlab", []string{"crlab-web", "crlab-db"}); err != nil {
+		t.Fatal(err)
+	}
+
+	after, _ := os.ReadFile(cfg)
+	if strings.TrimSpace(string(after)) != "" {
+		t.Errorf("live config not fully emptied:\n%s", after)
+	}
+
+	backup, err := os.ReadFile(cfg + ".warren.bak")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(backup) != original {
+		t.Errorf("backup = %q, want the full pre-cascade file %q — recovery must reach every removed block, not just the last one", backup, original)
+	}
+
+	if err := RemoveSSOSessionCascade("crlab", []string{"nonexistent"}); err == nil {
+		t.Error("expected an error for a profile that does not exist")
+	}
+	if err := RemoveSSOSessionCascade("nonexistent", nil); err == nil {
+		t.Error("expected an error for a session that does not exist")
+	}
+}
+
 func TestProfilesForSession(t *testing.T) {
 	profiles := []ProfileConfig{
 		{Name: "a", SSOSession: "lab"},
