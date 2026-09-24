@@ -280,13 +280,11 @@ func (m *Model) selectSessionConfirm(val string) tea.Cmd {
 		m.screen = screenSSOSessionRemove
 		return nil
 	}
-	for _, p := range m.sessionRemoveProfiles {
-		if err := awsint.RemoveProfileBlock(p.Name); err != nil {
-			m.err = err
-			return nil
-		}
+	profileNames := make([]string, len(m.sessionRemoveProfiles))
+	for i, p := range m.sessionRemoveProfiles {
+		profileNames[i] = p.Name
 	}
-	if err := awsint.RemoveSSOSessionBlock(m.sessionRemoveName); err != nil {
+	if err := awsint.RemoveSSOSessionCascade(m.sessionRemoveName, profileNames); err != nil {
 		m.err = err
 		return nil
 	}
