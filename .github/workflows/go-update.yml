@@ -91,4 +91,4 @@ jobs:
 
             Release notes: https://go.dev/doc/devel/release#go${{ steps.latest.outputs.latest }}
 
-            Shipped binaries keep the old stdlib until the next release is tagged.
+            Merging this publishes the next patch release automatically (auto-release.yml), unless a feature landed since the last tag. In that case auto-release fails and says so.

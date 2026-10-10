@@ -1,0 +1,86 @@
+name: auto-release
+
+# Publishes a patch release (v1.5.0 -> v1.5.1) when a change to go.mod's `go` line lands on main.
+#
+# A Go patch bump fixes the stdlib inside warren's binaries, but users only get that fix once a
+# release rebuilds them. Merging the go-update PR and then tagging by hand is a step that gets
+# forgotten. With this workflow, merging that PR is the whole job.
+#
+# It cuts a patch release only when everything since the last tag is patch-safe. If a feature
+# landed since the last tag, a patch tag would mislabel it, so the run fails instead and the
+# failure email says to cut the minor release by hand.
+
+on:
+  push:
+    branches: [main]
+    paths: [go.mod]
+
+permissions:
+  contents: write # push the tag
+  actions: write # dispatch release.yml
+
+concurrency:
+  group: auto-release
+  cancel-in-progress: false
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: did the Go version change?
+        id: go
+        run: |
+          set -euo pipefail
+          goline() { git show "$1:go.mod" 2>/dev/null | sed -n 's/^go \([0-9.]*\)$/\1/p'; }
+          before="$(goline "${{ github.event.before }}" || true)"
+          after="$(goline HEAD)"
+          echo "go: '$before' -> '$after'"
+          if [ -n "$before" ] && [ "$before" != "$after" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "go directive unchanged; module-only bumps do not release on their own"
+          fi
+          echo "version=$after" >> "$GITHUB_OUTPUT"
+
+      - name: pick the next patch tag
+        id: next
+        if: steps.go.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          last="$(git describe --tags --abbrev=0 --match 'v[0-9]*.[0-9]*.[0-9]*')"
+          # Conventional-commit types that cannot carry a feature. This repo's feature commits are
+          # often unprefixed ("Remove an SSO session in one step, ..."), so this is an allowlist,
+          # never a "block feat:" denylist.
+          blockers="$(git log --format=%s "$last..HEAD" | grep -Ev '^(build|fix|test|ci|chore|docs)(\(.+\))?!?: ' || true)"
+          if [ -n "$blockers" ]; then
+            echo "::error::Go moved to ${{ steps.go.outputs.version }}, but these commits since $last may be features, so a patch tag would mislabel them. Cut the next minor release by hand:"
+            printf '%s\n' "$blockers"
+            exit 1
+          fi
+          IFS=. read -r major minor patch <<<"${last#v}"
+          next="v$major.$minor.$((patch + 1))"
+          echo "$last -> $next"
+          echo "tag=$next" >> "$GITHUB_OUTPUT"
+
+      - name: tag and release
+        if: steps.go.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.next.outputs.tag }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898283+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$TAG" -m "$TAG: Go ${{ steps.go.outputs.version }}"
+          git push origin "$TAG"
+          # A tag pushed with GITHUB_TOKEN does not fire release.yml's tag trigger (GitHub blocks
+          # token-triggered runs to prevent loops), but workflow_dispatch is exempt. Dispatching
+          # on the tag ref makes github.ref refs/tags/$TAG, so release.yml publishes for real
+          # instead of doing a snapshot dry run.
+          gh workflow run release.yml --ref "$TAG"
+          echo "dispatched release.yml for $TAG"
