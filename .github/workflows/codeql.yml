@@ -28,15 +28,15 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      - uses: github/codeql-action/init@v3
+      - uses: github/codeql-action/init@v4
         with:
           languages: go
           # security-and-quality is a superset of the default security-only suite. It is noisier,
           # but this is a small codebase that brokers AWS credentials, so the trade is worth it.
           queries: security-and-quality
 
-      - uses: github/codeql-action/autobuild@v3
+      - uses: github/codeql-action/autobuild@v4
 
-      - uses: github/codeql-action/analyze@v3
+      - uses: github/codeql-action/analyze@v4
         with:
           category: "/language:go"
