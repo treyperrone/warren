@@ -1,0 +1,94 @@
+name: go-update
+
+# Opens a PR bumping go.mod's `go` directive to the newest patch release of the Go minor it is
+# already on (1.26.6 -> 1.26.9, never 1.26 -> 1.27).
+#
+# Dependabot keeps modules current but never touches the `go` line, and every workflow here builds
+# with the toolchain that line names. So stdlib fixes sat unshipped until security-scan turned red:
+# Go 1.26.9 fixed nine net/http, crypto/tls and net/textproto vulns that warren reaches, and the
+# first sign of it was a failed scheduled run. This turns that alarm into a ready PR, usually
+# before govulncheck's database even lists the vulns.
+#
+# Patch releases only: Go patches carry security and bug fixes, no language or API changes. A new
+# minor deserves a human reading the release notes, so it is left for a person to do.
+#
+# A PR opened with GITHUB_TOKEN does not trigger ci.yml, so this runs the same build, test and
+# govulncheck steps itself before opening it. A green run here means the bump is ready to merge.
+
+on:
+  schedule:
+    - cron: "29 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: find the latest patch of the current Go minor
+        id: latest
+        run: |
+          set -euo pipefail
+          current="$(sed -n 's/^go \([0-9.]*\)$/\1/p' go.mod)"
+          minor="$(cut -d. -f1,2 <<<"$current")"
+          # go.dev/dl lists only the stable releases still supported, newest first.
+          latest="$(curl -fsSL 'https://go.dev/dl/?mode=json' \
+                     | jq -r --arg m "go$minor." '[.[].version | select(startswith($m))][0] // empty')"
+          latest="${latest#go}"
+          if [ -z "$latest" ]; then
+            # Go supports only the two newest minors, so this means the current one is out of
+            # support. Fail loudly: that needs a minor bump, which is a human's call.
+            echo "::error::Go $minor is no longer listed as supported on go.dev/dl, so move to a newer minor by hand"
+            exit 1
+          fi
+          echo "current=$current" >> "$GITHUB_OUTPUT"
+          echo "latest=$latest"   >> "$GITHUB_OUTPUT"
+          if [ "$latest" = "$current" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "already on $current"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "$current -> $latest"
+          fi
+
+      - name: bump go.mod
+        if: steps.latest.outputs.changed == 'true'
+        run: go mod edit -go=${{ steps.latest.outputs.latest }}
+
+      # Set up only after the edit, so the checks below run on the new toolchain.
+      - uses: actions/setup-go@v7
+        if: steps.latest.outputs.changed == 'true'
+        with:
+          go-version-file: go.mod
+
+      - name: build, test and govulncheck on the new toolchain
+        if: steps.latest.outputs.changed == 'true'
+        run: |
+          go build ./...
+          go test ./... -count=1
+          go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
+          govulncheck ./...
+
+      - name: open a pull request
+        if: steps.latest.outputs.changed == 'true'
+        uses: peter-evans/create-pull-request@v8
+        with:
+          branch: go/${{ steps.latest.outputs.latest }}
+          title: "build: Go ${{ steps.latest.outputs.latest }}"
+          commit-message: |
+            build: Go ${{ steps.latest.outputs.latest }}
+
+            Previous: ${{ steps.latest.outputs.current }}
+          body: |
+            Go **${{ steps.latest.outputs.latest }}** is out (was `${{ steps.latest.outputs.current }}`). It is a patch release, so it carries security and bug fixes only.
+
+            Already passed on the new toolchain: `go build`, `go test`, `govulncheck`.
+
+            Release notes: https://go.dev/doc/devel/release#go${{ steps.latest.outputs.latest }}
+
+            Shipped binaries keep the old stdlib until the next release is tagged.
