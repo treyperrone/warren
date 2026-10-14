@@ -1,10 +1,12 @@
 name: auto-release
 
-# Publishes a patch release (v1.5.0 -> v1.5.1) when a change to go.mod's `go` line lands on main.
+# Publishes a patch release (v1.5.0 -> v1.5.1) when either of these changes lands on main:
+#   - go.mod's `go` line (a go-update PR: a Go patch with stdlib fixes)
+#   - internal/plugin/version.txt (a plugin-update PR: rebuilt session-manager-plugin binaries)
 #
-# A Go patch bump fixes the stdlib inside warren's binaries, but users only get that fix once a
-# release rebuilds them. Merging the go-update PR and then tagging by hand is a step that gets
-# forgotten. With this workflow, merging that PR is the whole job.
+# Both change what ships inside warren's binaries, but users only get the change once a release
+# rebuilds them. Merging the PR and then tagging by hand is a step that gets forgotten. With this
+# workflow, merging the PR is the whole job.
 #
 # It cuts a patch release only when everything since the last tag is patch-safe. If a feature
 # landed since the last tag, a patch tag would mislabel it, so the run fails instead and the
@@ -13,7 +15,7 @@ name: auto-release
 on:
   push:
     branches: [main]
-    paths: [go.mod]
+    paths: [go.mod, internal/plugin/version.txt]
 
 permissions:
   contents: write # push the tag
@@ -31,34 +33,42 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: did the Go version change?
-        id: go
+      - name: did the Go version or the embedded plugin change?
+        id: change
         run: |
           set -euo pipefail
+          before_sha="${{ github.event.before }}"
           goline() { git show "$1:go.mod" 2>/dev/null | sed -n 's/^go \([0-9.]*\)$/\1/p'; }
-          before="$(goline "${{ github.event.before }}" || true)"
-          after="$(goline HEAD)"
-          echo "go: '$before' -> '$after'"
-          if [ -n "$before" ] && [ "$before" != "$after" ]; then
+          plugin() { git show "$1:internal/plugin/version.txt" 2>/dev/null | tr -d '[:space:]'; }
+          go_before="$(goline "$before_sha" || true)"; go_after="$(goline HEAD)"
+          pl_before="$(plugin "$before_sha" || true)"; pl_after="$(plugin HEAD)"
+          echo "go:     '$go_before' -> '$go_after'"
+          echo "plugin: '$pl_before' -> '$pl_after'"
+          reasons=()
+          if [ -n "$go_before" ] && [ "$go_before" != "$go_after" ]; then reasons+=("Go $go_after"); fi
+          if [ -n "$pl_before" ] && [ "$pl_before" != "$pl_after" ]; then reasons+=("session-manager-plugin $pl_after"); fi
+          if [ ${#reasons[@]} -gt 0 ]; then
             echo "changed=true" >> "$GITHUB_OUTPUT"
+            reason="$(printf '%s, ' "${reasons[@]}")"; reason="${reason%, }"
+            echo "reason=$reason" >> "$GITHUB_OUTPUT"
+            echo "releasing for: $reason"
           else
             echo "changed=false" >> "$GITHUB_OUTPUT"
-            echo "go directive unchanged; module-only bumps do not release on their own"
+            echo "neither changed; module-only bumps do not release on their own"
           fi
-          echo "version=$after" >> "$GITHUB_OUTPUT"
 
       - name: pick the next patch tag
         id: next
-        if: steps.go.outputs.changed == 'true'
+        if: steps.change.outputs.changed == 'true'
         run: |
           set -euo pipefail
           last="$(git describe --tags --abbrev=0 --match 'v[0-9]*.[0-9]*.[0-9]*')"
-          # Conventional-commit types that cannot carry a feature. This repo's feature commits are
-          # often unprefixed ("Remove an SSO session in one step, ..."), so this is an allowlist,
-          # never a "block feat:" denylist.
-          blockers="$(git log --format=%s "$last..HEAD" | grep -Ev '^(build|fix|test|ci|chore|docs)(\(.+\))?!?: ' || true)"
+          # Commit types that cannot carry a feature (`plugin:` is plugin-update's PR title). This
+          # repo's feature commits are often unprefixed ("Remove an SSO session in one step, ..."),
+          # so this is an allowlist, never a "block feat:" denylist.
+          blockers="$(git log --format=%s "$last..HEAD" | grep -Ev '^(build|fix|test|ci|chore|docs|plugin)(\(.+\))?!?: ' || true)"
           if [ -n "$blockers" ]; then
-            echo "::error::Go moved to ${{ steps.go.outputs.version }}, but these commits since $last may be features, so a patch tag would mislabel them. Cut the next minor release by hand:"
+            echo "::error::${{ steps.change.outputs.reason }} changed, but these commits since $last may be features, so a patch tag would mislabel them. Cut the next minor release by hand:"
             printf '%s\n' "$blockers"
             exit 1
           fi
@@ -68,7 +78,7 @@ jobs:
           echo "tag=$next" >> "$GITHUB_OUTPUT"
 
       - name: tag and release
-        if: steps.go.outputs.changed == 'true'
+        if: steps.change.outputs.changed == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.next.outputs.tag }}
@@ -76,7 +86,7 @@ jobs:
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898283+github-actions[bot]@users.noreply.github.com"
-          git tag -a "$TAG" -m "$TAG: Go ${{ steps.go.outputs.version }}"
+          git tag -a "$TAG" -m "$TAG: ${{ steps.change.outputs.reason }}"
           git push origin "$TAG"
           # A tag pushed with GITHUB_TOKEN does not fire release.yml's tag trigger (GitHub blocks
           # token-triggered runs to prevent loops), but workflow_dispatch is exempt. Dispatching

@@ -104,6 +104,9 @@ jobs:
             - each asset is the correct binary format for its target
             - `go build ./...` and `go test ./...`
 
+            Merging this publishes the next patch release automatically (auto-release.yml), unless a
+            feature landed since the last tag. In that case auto-release fails and says so.
+
             Worth a look before merging:
 
             - the release notes at https://github.com/aws/session-manager-plugin/releases
