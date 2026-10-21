@@ -16,6 +16,9 @@ on:
   push:
     branches: [main]
     paths: [go.mod, internal/plugin/version.txt]
+  # go-update.yml dispatches this after merging its own PR, because a merge made with
+  # GITHUB_TOKEN does not fire the push trigger above.
+  workflow_dispatch:
 
 permissions:
   contents: write # push the tag
@@ -38,6 +41,9 @@ jobs:
         run: |
           set -euo pipefail
           before_sha="${{ github.event.before }}"
+          # A dispatch has no "before", so compare with the parent. Every merge here is a squash,
+          # so the parent is main as it was before the merge.
+          [ -n "$before_sha" ] || before_sha="$(git rev-parse HEAD^)"
           goline() { git show "$1:go.mod" 2>/dev/null | sed -n 's/^go \([0-9.]*\)$/\1/p'; }
           plugin() { git show "$1:internal/plugin/version.txt" 2>/dev/null | tr -d '[:space:]'; }
           go_before="$(goline "$before_sha" || true)"; go_after="$(goline HEAD)"
@@ -63,6 +69,11 @@ jobs:
         run: |
           set -euo pipefail
           last="$(git describe --tags --abbrev=0 --match 'v[0-9]*.[0-9]*.[0-9]*')"
+          # A repeated dispatch must not cut an empty release on top of one already made.
+          if [ "$(git rev-parse "$last^{commit}")" = "$(git rev-parse HEAD)" ]; then
+            echo "::notice::HEAD is already released as $last; nothing to do"
+            exit 0
+          fi
           # Commit types that cannot carry a feature (`plugin:` is plugin-update's PR title). This
           # repo's feature commits are often unprefixed ("Remove an SSO session in one step, ..."),
           # so this is an allowlist, never a "block feat:" denylist.
@@ -78,7 +89,7 @@ jobs:
           echo "tag=$next" >> "$GITHUB_OUTPUT"
 
       - name: tag and release
-        if: steps.change.outputs.changed == 'true'
+        if: steps.next.outputs.tag != ''
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.next.outputs.tag }}

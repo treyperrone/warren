@@ -13,7 +13,14 @@ name: go-update
 # minor deserves a human reading the release notes, so it is left for a person to do.
 #
 # A PR opened with GITHUB_TOKEN does not trigger ci.yml, so this runs the same build, test and
-# govulncheck steps itself before opening it. A green run here means the bump is ready to merge.
+# govulncheck steps itself before opening it, then merges the PR itself. The PR exists for the
+# record, not for review. A Go patch carries only security and bug fixes, and waiting on a human
+# is what kept security-scan red for a day over GO-2026-6809 while the fix PR sat ready.
+# (plugin-update stays manual: its diff is binaries nobody can review, but somebody should still
+# see that a bump happened.)
+#
+# A merge made with GITHUB_TOKEN does not fire push triggers either, so after merging this
+# dispatches auto-release.yml itself, which publishes the patch release.
 
 on:
   schedule:
@@ -23,6 +30,7 @@ on:
 permissions:
   contents: write
   pull-requests: write
+  actions: write # dispatch auto-release.yml
 
 jobs:
   check:
@@ -75,6 +83,7 @@ jobs:
           govulncheck ./...
 
       - name: open a pull request
+        id: pr
         if: steps.latest.outputs.changed == 'true'
         uses: peter-evans/create-pull-request@v8
         with:
@@ -91,4 +100,15 @@ jobs:
 
             Release notes: https://go.dev/doc/devel/release#go${{ steps.latest.outputs.latest }}
 
-            Merging this publishes the next patch release automatically (auto-release.yml), unless a feature landed since the last tag. In that case auto-release fails and says so.
+            This workflow merges this PR itself, then auto-release.yml publishes the next patch release. If a feature landed since the last tag, auto-release fails instead and says so.
+
+      - name: merge it and release
+        if: steps.latest.outputs.changed == 'true' && steps.pr.outputs.pull-request-number != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ steps.pr.outputs.pull-request-number }}
+        run: |
+          set -euo pipefail
+          gh pr merge "$PR" --squash --delete-branch
+          gh workflow run auto-release.yml --ref main
+          echo "merged #$PR and dispatched auto-release"
